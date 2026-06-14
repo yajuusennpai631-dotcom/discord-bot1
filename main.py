@@ -10,22 +10,20 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 
 intents = discord.Intents.default()
 intents.message_content = True
+intents.members = True  # 💡 ロール付与のためにメンバー管理のインテンツを有効化
 
 bot = commands.Bot(
     command_prefix="!",
     intents=intents
 )
 
-# 💡 特定のサーバーへの固定を解除しました（色々なサーバーで動かすため）
-# GUILD_ID や guild = discord.Object(...) のコードは削除しています
-
-# 💡 【Volume対応に書き換え】JSONファイルの保存先パスを自動で切り替えます
+# 💡 JSONファイルの保存先パスを自動切り替え（Volume対応）
 if os.path.exists("/app/data"):
-    JSON_FILE = "/app/data/allowed_users.json"  # 🚀 Railway本番（Volume内）に保存
+    JSON_FILE = "/app/data/allowed_users.json"
 else:
-    JSON_FILE = "allowed_users.json"             # 💻 あなたのPCでのテスト用保存
+    JSON_FILE = "allowed_users.json"
 
-# 💡 JSONからすべてのデータを読み込む関数（サーバーIDごとの構造に対応）
+# 💡 JSONからすべてのデータを読み込む関数
 def load_data():
     if os.path.exists(JSON_FILE):
         try:
@@ -52,25 +50,64 @@ def get_guild_config(all_data, guild_id_str):
             "from_channel": None,
             "to_channel": None,
             "announce_channel": None,
-            "announce_role": None
+            "announce_role": None,
+            "verify_channel": None,  # 💡 追加：認証チャンネルID
+            "verify_role": None      # 💡 追加：認証付与ロールID
         }
     return all_data[guild_id_str]
 
+# 💡 【新機能】認証ボタンを処理するクラス
+class VerifyButtonView(discord.ui.View):
+    def __init__(self):
+        # ボット再起動後もボタンが動き続けるようにタイムアウトをNone（無制限）にします
+        super().__init__(timeout=None)
+
+    # custom_id を固定することで、ボットが再起動してもボタンが反応し続けます
+    @discord.ui.button(label="認証する", style=discord.ButtonStyle.success, custom_id="persistent_verify_button")
+    async def verify(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild_id_str = str(interaction.guild.id)
+        all_data = load_data()
+        guild_config = get_guild_config(all_data, guild_id_str)
+        
+        role_id = guild_config.get("verify_role")
+        if not role_id:
+            await interaction.response.send_message("サーバー側で認証用ロールが設定されていません。管理者に連絡してください。", ephemeral=True)
+            return
+
+        role = interaction.guild.get_role(role_id)
+        if not role:
+            await interaction.response.send_message("設定されている認証ロールが見つかりませんでした。管理者に連絡してください。", ephemeral=True)
+            return
+
+        # すでにロールを持っているかチェック
+        if role in interaction.user.roles:
+            await interaction.response.send_message("あなたはすでに認証されています！", ephemeral=True)
+            return
+
+        try:
+            # メンバーにロールを付与
+            await interaction.user.add_roles(role)
+            await interaction.response.send_message(f"認証に成功しました！ {role.mention} ロールを付与しました。", ephemeral=True)
+        except discord.Forbidden:
+            await interaction.response.send_message("ボットの権限が足りないためロールを付与できませんでした。ボットの役職を付与したいロールより上に配置してください。", ephemeral=True)
+        except Exception as e:
+            await interaction.response.send_message(f"エラーが発生しました: {e}", ephemeral=True)
+
 @bot.event
 async def on_ready():
-    # 💡 guild=guild の指定を外すことで、ボットが入っているすべてのサーバーでコマンドが使えるようになります（グローバル同期）
-    # ⚠️ 反映までに最長で1時間ほどかかる場合があります
+    # 💡 ボットが起動したときに、認証ボタンが常に反応できるように登録（常駐化）
+    bot.add_view(VerifyButtonView())
+    
     synced = await bot.tree.sync()
     print(f"{len(synced)} commands synced (Global)")
     print(f"Logged in as {bot.user}")
 
-# 💡 メッセージが送信されたときに自動で実行されるイベント
+# 💡 メッセージ送信時に実行されるイベント
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot or not message.guild:
         return
 
-    # 💡 発言があったサーバーのIDを取得して、そのサーバーの設定を読み込む
     guild_id_str = str(message.guild.id)
     all_data = load_data()
     guild_config = get_guild_config(all_data, guild_id_str)
@@ -85,7 +122,7 @@ async def on_message(message: discord.Message):
 
     await bot.process_commands(message)
 
-# 💡 再起動の確認プロンプト（ボタン）を表示するクラス
+# 💡 再起動の確認プロンプトを表示するクラス
 class RestartConfirmView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=60)
@@ -105,185 +142,112 @@ class RestartConfirmView(discord.ui.View):
         await interaction.response.send_message("再起動をキャンセルしました。", ephemeral=True)
         self.stop()
 
-# 💡 再起動コマンド（管理者のみ）
-@bot.tree.command(
-    name="restart",
-    description="ボットを再起動します（確認プロンプトを表示）"
-)
+# コマンド群
+@bot.tree.command(name="restart", description="ボットを再起動します（確認プロンプトを表示）")
 async def restart(interaction: discord.Interaction):
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("この管理コマンドはサーバーの管理者のみ実行できます。", ephemeral=True)
         return
-        
     view = RestartConfirmView()
     await interaction.response.send_message("本当にボットを再起動しますか？", view=view, ephemeral=True)
 
-# 💡 転送元のチャンネルと転送先のチャンネルをコマンドで指定する（管理者のみ）
-@bot.tree.command(
-    name="set_forward",
-    description="アドミンのメッセージ転送元と転送先のチャンネルを設定します"
-)
-async def set_forward(
-    interaction: discord.Interaction, 
-    from_channel: discord.TextChannel, 
-    to_channel: discord.TextChannel
-):
+@bot.tree.command(name="set_forward", description="アドミンのメッセージ転送元と転送先のチャンネルを設定します")
+async def set_forward(interaction: discord.Interaction, from_channel: discord.TextChannel, to_channel: discord.TextChannel):
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("この管理コマンドはサーバーの管理者のみ実行できます。", ephemeral=True)
         return
-        
     guild_id_str = str(interaction.guild.id)
     all_data = load_data()
     guild_config = get_guild_config(all_data, guild_id_str)
-    
     guild_config["from_channel"] = from_channel.id
     guild_config["to_channel"] = to_channel.id
     save_data(all_data)
-    
-    await interaction.response.send_message(
-        f"転送設定を完了しました！\n"
-        f"【転送元】{from_channel.mention}\n"
-        f"【転送先】{to_channel.mention}", 
-        ephemeral=True
-    )
+    await interaction.response.send_message(f"転送設定を完了しました！\n【転送元】{from_channel.mention}\n【転送先】{to_channel.mention}", ephemeral=True)
 
-# 💡 転送設定を解除（リセット）するコマンド（管理者のみ）
-@bot.tree.command(
-    name="reset_forward",
-    description="チャンネルの転送設定を解除します"
-)
+@bot.tree.command(name="reset_forward", description="チャンネルの転送設定を解除します")
 async def reset_forward(interaction: discord.Interaction):
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("この管理コマンドはサーバーの管理者のみ実行できます。", ephemeral=True)
         return
-        
     guild_id_str = str(interaction.guild.id)
     all_data = load_data()
     guild_config = get_guild_config(all_data, guild_id_str)
-    
     guild_config["from_channel"] = None
     guild_config["to_channel"] = None
     save_data(all_data)
-    
     await interaction.response.send_message("チャンネルの転送設定をリセットしました。", ephemeral=True)
 
-# 💡 お知らせチャンネルと通知対象のロールを設定する（管理者のみ）
-@bot.tree.command(
-    name="set_announcement",
-    description="お知らせチャンネルと通知するロールを設定します"
-)
-async def set_announcement(
-    interaction: discord.Interaction, 
-    channel: discord.TextChannel, 
-    role: discord.Role
-):
+@bot.tree.command(name="set_announcement", description="お知らせチャンネルと通知するロールを設定します")
+async def set_announcement(interaction: discord.Interaction, channel: discord.TextChannel, role: discord.Role):
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("この管理コマンドはサーバーの管理者のみ実行できます。", ephemeral=True)
         return
-        
     guild_id_str = str(interaction.guild.id)
     all_data = load_data()
     guild_config = get_guild_config(all_data, guild_id_str)
-    
     guild_config["announce_channel"] = channel.id
     guild_config["announce_role"] = role.id
     save_data(all_data)
-    
-    await interaction.response.send_message(
-        f"お知らせ設定を完了しました！\n"
-        f"【送信先】{channel.mention}\n"
-        f"【対象ロール】{role.mention}", 
-        ephemeral=True
-    )
+    await interaction.response.send_message(f"お知らせ設定を完了しました！\n【送信先】{channel.mention}\n【対象ロール】{role.mention}", ephemeral=True)
 
-# 💡 設定されたチャンネルにロールメンション付きでお知らせを送信する（管理者のみ）
-@bot.tree.command(
-    name="send_announcement",
-    description="設定されたチャンネルにロールメンション付きでお知らせを送信します"
-)
+@bot.tree.command(name="send_announcement", description="設定されたチャンネルにロールメンション付きでお知らせを送信します")
 async def send_announcement(interaction: discord.Interaction, message: str):
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("この管理コマンドはサーバーの管理者のみ実行できます。", ephemeral=True)
         return
-        
     guild_id_str = str(interaction.guild.id)
     all_data = load_data()
     guild_config = get_guild_config(all_data, guild_id_str)
-    
     channel_id = guild_config.get("announce_channel")
     role_id = guild_config.get("announce_role")
-    
     if not channel_id or not role_id:
-        await interaction.response.send_message("お知らせチャンネル、またはロールが設定されていません。先に `/set_announcement` を実行してください。", ephemeral=True)
+        await interaction.response.send_message("お知らせチャンネル、またはロールが設定されていません。", ephemeral=True)
         return
-        
     target_channel = bot.get_channel(channel_id)
     target_role = interaction.guild.get_role(role_id)
-    
     if target_channel and target_role:
-        announcement_text = f"{target_role.mention}\n\n{message}"
-        await target_channel.send(announcement_text)
+        await target_channel.send(f"{target_role.mention}\n\n{message}")
         await interaction.response.send_message("お知らせを送信しました！", ephemeral=True)
     else:
-        await interaction.response.send_message("チャンネルまたはロールが見つかりませんでした。再設定してください。", ephemeral=True)
+        await interaction.response.send_message("チャンネルまたはロールが見つかりませんでした。", ephemeral=True)
 
-@bot.tree.command(
-    name="hello",
-    description="あいさつするコマンド"
-)
+@bot.tree.command(name="hello", description="あいさつするコマンド")
 async def hello(interaction: discord.Interaction):
     await interaction.response.send_message(f"{interaction.user.mention} さん、おはよう")
 
-@bot.tree.command(
-    name="say",
-    description="ボットに匿名で発言させます"
-)
+@bot.tree.command(name="say", description="ボットに匿名で発言させます")
 async def say(interaction: discord.Interaction, message: str):
     guild_id_str = str(interaction.guild.id)
     all_data = load_data()
     guild_config = get_guild_config(all_data, guild_id_str)
     allowed_users = guild_config.get("allowed_users", [])
-
     if interaction.user.id not in allowed_users and not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("このコマンドを実行する権限がありません。", ephemeral=True)
         return
-
     await interaction.channel.send(message)
     await interaction.response.send_message("メッセージを匿名で送信しました。", ephemeral=True)
 
-@bot.tree.command(
-    name="allow_user",
-    description="コマンドの使用を許可するユーザーを追加します"
-)
+@bot.tree.command(name="allow_user", description="コマンドの使用を許可するユーザーを追加します")
 async def allow_user(interaction: discord.Interaction, user: discord.User):
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("この管理コマンドはサーバーの管理者のみ実行できます。", ephemeral=True)
         return
-        
     guild_id_str = str(interaction.guild.id)
     all_data = load_data()
     guild_config = get_guild_config(all_data, guild_id_str)
-    
-    # リスト形式で保存されているので、重複を避けて追加
     if user.id not in guild_config["allowed_users"]:
         guild_config["allowed_users"].append(user.id)
     save_data(all_data)
-    
     await interaction.response.send_message(f"{user.mention} を許可リストに追加しました。", ephemeral=True)
 
-@bot.tree.command(
-    name="deny_user",
-    description="コマンドの使用許可リストからユーザーを削除します"
-)
+@bot.tree.command(name="deny_user", description="コマンドの使用許可リストからユーザーを削除します")
 async def deny_user(interaction: discord.Interaction, user: discord.User):
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("この管理コマンドはサーバーの管理者のみ実行できます。", ephemeral=True)
         return
-        
     guild_id_str = str(interaction.guild.id)
     all_data = load_data()
     guild_config = get_guild_config(all_data, guild_id_str)
-    
     if user.id in guild_config["allowed_users"]:
         guild_config["allowed_users"].remove(user.id)
         save_data(all_data)
@@ -291,27 +255,74 @@ async def deny_user(interaction: discord.Interaction, user: discord.User):
     else:
         await interaction.response.send_message(f"{user.mention} は元々許可リストに登録されていません。", ephemeral=True)
 
-@bot.tree.command(
-    name="list_users",
-    description="コマンドの使用を許可されているユーザーの一覧を表示します"
-)
+@bot.tree.command(name="list_users", description="コマンドの使用を許可されているユーザーの一覧を表示します")
 async def list_users(interaction: discord.Interaction):
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("この管理コマンドはサーバーの管理者のみ実行できます。", ephemeral=True)
         return
-        
     guild_id_str = str(interaction.guild.id)
     all_data = load_data()
     guild_config = get_guild_config(all_data, guild_id_str)
     allowed_users = guild_config.get("allowed_users", [])
-        
     if not allowed_users:
-        await interaction.response.send_message("現在、許可リストに登録されているユーザーはいません。\n※管理者は登録なしで使えます。", ephemeral=True)
+        await interaction.response.send_message("現在、許可リストに登録されているユーザーはいません。", ephemeral=True)
+        return
+    user_mentions = [f"・<@{user_id}>" for user_id in allowed_users]
+    await interaction.response.send_message("【コマンド使用許可ユーザー一覧】\n" + "\n".join(user_mentions), ephemeral=True)
+
+
+# 💡 【新機能】認証用ロールを設定するコマンド（管理者のみ）
+@bot.tree.command(name="set_verify_role", description="認証ボタンを押したときに付与するロールを設定します")
+async def set_verify_role(interaction: discord.Interaction, role: discord.Role):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("この管理コマンドはサーバーの管理者のみ実行できます。", ephemeral=True)
+        return
+    guild_id_str = str(interaction.guild.id)
+    all_data = load_data()
+    guild_config = get_guild_config(all_data, guild_id_str)
+    guild_config["verify_role"] = role.id
+    save_data(all_data)
+    await interaction.response.send_message(f"認証用ロールを {role.mention} に設定しました！", ephemeral=True)
+
+# 💡 【新機能】認証ボタンを設置するチャンネルを設定するコマンド（管理者のみ）
+@bot.tree.command(name="set_verify_channel", description="認証パネル（ボタン）を送信するチャンネルを設定します")
+async def set_verify_channel(interaction: discord.Interaction, channel: discord.TextChannel):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("この管理コマンドはサーバーの管理者のみ実行できます。", ephemeral=True)
+        return
+    guild_id_str = str(interaction.guild.id)
+    all_data = load_data()
+    guild_config = get_guild_config(all_data, guild_id_str)
+    guild_config["verify_channel"] = channel.id
+    save_data(all_data)
+    await interaction.response.send_message(f"認証チャンネルを {channel.mention} に設定しました！", ephemeral=True)
+
+# 💡 【新機能】設定したチャンネルに認証ボタンパネルを送信するコマンド（管理者のみ）
+@bot.tree.command(name="send_verify_button", description="設定されたチャンネルに認証ボタン付きのパネルメッセージを送信します")
+async def send_verify_button(interaction: discord.Interaction, title: str = "サーバー認証", description: str = "下のボタンを押すと認証が完了し、全てのチャンネルが閲覧可能になります。"):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("この管理コマンドはサーバーの管理者のみ実行できます。", ephemeral=True)
+        return
+    guild_id_str = str(interaction.guild.id)
+    all_data = load_data()
+    guild_config = get_guild_config(all_data, guild_id_str)
+    
+    channel_id = guild_config.get("verify_channel")
+    if not channel_id:
+        await interaction.response.send_message("認証チャンネルが設定されていません。先に `/set_verify_channel` を実行してください。", ephemeral=True)
         return
         
-    user_mentions = [f"・<@{user_id}>" for user_id in allowed_users]
-    list_text = "【コマンド使用許可ユーザー一覧】\n" + "\n".join(user_mentions)
+    target_channel = bot.get_channel(channel_id)
+    if not target_channel:
+        await interaction.response.send_message("設定されたチャンネルが見つかりませんでした。再設定してください。", ephemeral=True)
+        return
+
+    # 見栄えの良い埋め込み（Embed）を作成
+    embed = discord.Embed(title=title, description=description, color=discord.Color.green())
+    view = VerifyButtonView()
     
-    await interaction.response.send_message(list_text, ephemeral=True)
+    # ターゲットのチャンネルに送信
+    await target_channel.send(embed=embed, view=view)
+    await interaction.response.send_message(f"{target_channel.mention} に認証ボタンを設置しました！", ephemeral=True)
 
 bot.run(TOKEN)
