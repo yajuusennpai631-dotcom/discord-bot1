@@ -6,6 +6,8 @@ from discord.ext import commands
 import json
 import sys
 import asyncio
+import urllib.request
+import urllib.parse
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 
@@ -62,8 +64,17 @@ def get_guild_config(all_data, guild_id_str):
         }
     return all_data[guild_id_str]
 
+def get_user_app_data(all_data, user_id_str):
+    if "user_apps" not in all_data:
+        all_data["user_apps"] = {}
+    if user_id_str not in all_data["user_apps"]:
+        all_data["user_apps"][user_id_str] = {
+            "memos": [],
+            "bookmarks": []
+        }
+    return all_data["user_apps"][user_id_str]
+
 def create_user_list_embed(allowed_users):
-    """許可リストのEmbedを生成する共通ヘルパー関数"""
     embed = discord.Embed(
         title="👥 アドミンコマンド使用許可ユーザー一覧", 
         description="現在、以下のユーザーに管理者用コマンドの使用権限が与えられています。\n※サーバー管理者は登録なしで最初からすべてのコマンドを使用できます。",
@@ -78,6 +89,51 @@ def create_user_list_embed(allowed_users):
         embed.set_footer(text=f"現在の登録者数: {len(allowed_users)}名")
     return embed
 
+user_app_config = {
+    "contexts": discord.app_commands.AppCommandContext(guild=True, dm=True, private_channel=True),
+    "integration_types": discord.app_commands.AppInstallationType(guild_install=True, user_install=True)
+}
+
+async def is_owner_check(interaction: discord.Interaction) -> bool:
+    if interaction.client.owner_id is None:
+        app_info = await interaction.client.application_info()
+        interaction.client.owner_id = app_info.owner.id
+    
+    if interaction.user.id != interaction.client.owner_id:
+        await interaction.response.send_message("❌ このコマンドはアプリの所有者（あなた）専用の特権機能です。", ephemeral=True)
+        return False
+    return True
+
+
+# --- 選択してメモを削除するためのコンポーネント ---
+class MemoDeleteSelect(discord.ui.Select):
+    def __init__(self, memos):
+        options = []
+        for i, memo in enumerate(memos):
+            short_memo = memo if len(memo) <= 50 else memo[:47] + "..."
+            options.append(discord.SelectOption(label=f"{i+1}. {short_memo}", value=str(i)))
+            if i >= 24: # Discordの仕様上、最大25個まで
+                break
+        super().__init__(placeholder="❌ 削除するメモを1つ選択してください...", options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        all_data = load_data()
+        user_data = get_user_app_data(all_data, str(interaction.user.id))
+        memos = user_data.get("memos", [])
+        
+        idx = int(self.values[0])
+        if idx < len(memos):
+            removed_memo = memos.pop(idx)
+            save_data(all_data)
+            await interaction.response.send_message(f"🗑️ メモを削除しました:\n`{removed_memo}`", ephemeral=True)
+        else:
+            await interaction.response.send_message("❌ エラー: メモの削除に失敗しました。", ephemeral=True)
+
+class MemoDeleteView(discord.ui.View):
+    def __init__(self, memos):
+        super().__init__(timeout=180)
+        self.add_item(MemoDeleteSelect(memos))
+
 
 class UserManageView(discord.ui.View):
     def __init__(self):
@@ -85,6 +141,9 @@ class UserManageView(discord.ui.View):
 
     @discord.ui.select(cls=discord.ui.UserSelect, placeholder="👤 許可ユーザーを追加する...", custom_id="manage_add_user")
     async def add_user_callback(self, interaction: discord.Interaction, select: discord.ui.UserSelect):
+        if not interaction.guild:
+            await interaction.response.send_message("❌ この操作はサーバー内でのみ実行できます。", ephemeral=True)
+            return
         if not interaction.user.guild_permissions.administrator:
             await interaction.response.send_message("この操作は管理者のみ実行できます。", ephemeral=True)
             return
@@ -106,6 +165,9 @@ class UserManageView(discord.ui.View):
 
     @discord.ui.select(cls=discord.ui.UserSelect, placeholder="❌ 許可ユーザーを削除する...", custom_id="manage_remove_user")
     async def remove_user_callback(self, interaction: discord.Interaction, select: discord.ui.UserSelect):
+        if not interaction.guild:
+            await interaction.response.send_message("❌ この操作はサーバー内でのみ実行できます。", ephemeral=True)
+            return
         if not interaction.user.guild_permissions.administrator:
             await interaction.response.send_message("この操作は管理者のみ実行できます。", ephemeral=True)
             return
@@ -129,45 +191,31 @@ class UserManageView(discord.ui.View):
 class DynamicRoleView(discord.ui.View):
     def __init__(self, roles):
         super().__init__(timeout=None)
-        
-        styles = [
-            discord.ButtonStyle.primary,
-            discord.ButtonStyle.success,
-            discord.ButtonStyle.secondary,
-            discord.ButtonStyle.danger
-        ]
-        
+        styles = [discord.ButtonStyle.primary, discord.ButtonStyle.success, discord.ButtonStyle.secondary, discord.ButtonStyle.danger]
         for i, role in enumerate(roles):
-            style = styles[i % len(styles)]
-            button = discord.ui.Button(
-                label=role.name, 
-                style=style, 
-                custom_id=f"dynamic_role_{role.id}"
-            )
+            button = discord.ui.Button(label=role.name, style=styles[i % len(styles)], custom_id=f"dynamic_role_{role.id}")
             button.callback = self.create_callback(role.id)
             self.add_item(button)
 
     def create_callback(self, role_id):
         async def button_callback(interaction: discord.Interaction):
             guild = interaction.guild
+            if not guild: return
             role = guild.get_role(role_id)
-            
-            if not role:
-                await interaction.response.send_message("このロールはサーバー上に存在しません。", ephemeral=True)
-                return
+            if not role: return
 
             if role in interaction.user.roles:
                 try:
                     await interaction.user.remove_roles(role)
                     await interaction.response.send_message(f"❌ {role.name} ロールを外しました。", ephemeral=True)
                 except discord.Forbidden:
-                    await interaction.response.send_message("ボットの権限が足りないためロールを削除できません。役職の順位を確認してください。", ephemeral=True)
+                    await interaction.response.send_message("権限が足りません。", ephemeral=True)
             else:
                 try:
                     await interaction.user.add_roles(role)
                     await interaction.response.send_message(f"✅ {role.name} ロールを付与しました！", ephemeral=True)
                 except discord.Forbidden:
-                    await interaction.response.send_message("ボットの権限が足りないためロールを付与できません。ボットの役職を対象のロールより上に配置してください。", ephemeral=True)
+                    await interaction.response.send_message("権限が足りません。", ephemeral=True)
         return button_callback
 
 
@@ -177,80 +225,57 @@ class VerifyButtonView(discord.ui.View):
 
     @discord.ui.button(label="認証する", style=discord.ButtonStyle.success, custom_id="persistent_verify_button")
     async def verify(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.guild: return
         guild_id_str = str(interaction.guild.id)
         all_data = load_data()
         guild_config = get_guild_config(all_data, guild_id_str)
-        
         role_id = guild_config.get("verify_role")
-        if not role_id:
-            await interaction.response.send_message("サーバー側で認証用ロールが設定されていません。管理者に連絡してください。", ephemeral=True)
-            return
-
+        if not role_id: return
         role = interaction.guild.get_role(role_id)
-        if not role:
-            await interaction.response.send_message("設定されている認証ロールが見つかりませんでした。管理者に連絡してください。", ephemeral=True)
-            return
+        if not role: return
 
         if role in interaction.user.roles:
-            await interaction.response.send_message("あなたはすでに認証されています！", ephemeral=True)
+            await interaction.response.send_message("すでに認証されています！", ephemeral=True)
             return
-
         try:
             await interaction.user.add_roles(role)
-            await interaction.response.send_message(f"認証に成功しました！ {role.mention} ロールを付与しました。", ephemeral=True)
-        except discord.Forbidden:
-            await interaction.response.send_message("ボットの権限が足りないためロールを付与できませんでした。ボットの役職を付与したいロールより上に配置してください。", ephemeral=True)
+            await interaction.response.send_message(f"認証に成功しました！", ephemeral=True)
         except Exception as e:
-            await interaction.response.send_message(f"エラーが発生しました: {e}", ephemeral=True)
+            await interaction.response.send_message(f"エラー: {e}", ephemeral=True)
 
 
 @bot.event
 async def on_ready():
     bot.add_view(VerifyButtonView())
-    
     all_data = load_data()
     for guild_id_str, config in all_data.items():
+        if guild_id_str == "user_apps": continue
         panel_roles = config.get("panel_roles", [])
         if panel_roles:
             guild = bot.get_guild(int(guild_id_str))
             if guild:
                 roles = [guild.get_role(rid) for rid in panel_roles if guild.get_role(rid)]
-                if roles:
-                    bot.add_view(DynamicRoleView(roles))
-
+                if roles: bot.add_view(DynamicRoleView(roles))
     try:
-        synced = await bot.tree.sync()
-        print(f"✅ {len(synced)} commands synced (Global)")
+        await bot.tree.sync()
+        print("✅ 全コマンドの同期完了")
     except Exception as e:
-        print(f"❌ コマンド同期エラー: {e}")
-    print(f"🤖 Logged in as {bot.user}")
+        print(f"❌ 同期エラー: {e}")
 
 
-# 💡 【重要修正】メッセージ転送のサーバー間混線を完全に防止しました
 @bot.event
 async def on_message(message: discord.Message):
-    if message.author.bot or not message.guild:
-        return
-
-    # メッセージが送信された「現在のサーバー」のIDをもとに設定を取得
+    if message.author.bot or not message.guild: return
     guild_id_str = str(message.guild.id)
     all_data = load_data()
-    
-    # 該当サーバーの設定が存在する場合のみ処理する（他サーバーの設定との混線を防ぐ）
     if guild_id_str in all_data:
         guild_config = all_data[guild_id_str]
         from_id = guild_config.get("from_channel")
         to_id = guild_config.get("to_channel")
-
-        # 送信されたチャンネルが、そのサーバーで設定された転送元と一致するかチェック
         if from_id and to_id and message.channel.id == from_id:
-            # 転送できるのはサーバーの管理者（Administrator）のみ
             if message.author.guild_permissions.administrator:
-                # 転送先チャンネルを「現在のサーバー内」から取得
                 to_channel = message.guild.get_channel(to_id)
-                if to_channel:
-                    await to_channel.send(message.content)
-
+                if to_channel: await to_channel.send(message.content)
     await bot.process_commands(message)
 
 
@@ -260,246 +285,320 @@ class RestartConfirmView(discord.ui.View):
 
     @discord.ui.button(label="はい (再起動)", style=discord.ButtonStyle.danger)
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("この操作は管理者のみ実行できます。", ephemeral=True)
-            return
-            
-        await interaction.response.send_message("ボットを安全に終了します。再起動をお待ちください...", ephemeral=True)
+        await interaction.response.send_message("終了します...", ephemeral=True)
         await bot.close()
-        await asyncio.sleep(1)
         sys.exit(0)
 
-    @discord.ui.button(label="いいえ (キャンセル)", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="いいえ", style=discord.ButtonStyle.secondary)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_message("再起動をキャンセルしました。", ephemeral=True)
+        await interaction.response.send_message("キャンセルしました。", ephemeral=True)
         self.stop()
 
 
-# ==================== コマンドの定義 ====================
+# ==================== 🌟 【マイアプリ専用特権機能グループ】 ====================
 
-@bot.tree.command(name="hello", description="あいさつするコマンド")
-async def hello(interaction: discord.Interaction):
-    await interaction.response.send_message(f"{interaction.user.mention} さん、おはよう")
-
-@bot.tree.command(name="list_users", description="使用許可リストの確認、および追加・削除を画面上で行います")
-@discord.app_commands.default_permissions(administrator=True)
-async def list_users(interaction: discord.Interaction):
-    guild_id_str = str(interaction.guild.id)
+@bot.tree.command(name="my_memo", description="【マイアプリ専用】メモの追加・一覧表示・選択削除を行います", **user_app_config)
+@discord.app_commands.choices(action=[
+    discord.app_commands.Choice(name="➕ メモを追加する", value="add"),
+    discord.app_commands.Choice(name="📋 一覧を表示する", value="list"),
+    discord.app_commands.Choice(name="❌ 選択して削除する", value="delete"),
+    discord.app_commands.Choice(name="🧹 全て消去する", value="clear")
+])
+async def my_memo(interaction: discord.Interaction, action: discord.app_commands.Choice[str], content: str = None):
+    if not await is_owner_check(interaction): return
     all_data = load_data()
-    guild_config = get_guild_config(all_data, guild_id_str)
-    allowed_users = guild_config.get("allowed_users", [])
+    user_data = get_user_app_data(all_data, str(interaction.user.id))
+    act = action.value
+
+    if act == "add":
+        if not content:
+            await interaction.response.send_message("❌ 保存する内容を入力してください。", ephemeral=True)
+            return
+        user_data["memos"].append(content)
+        save_data(all_data)
+        await interaction.response.send_message(f"📝 メモを保存しました:\n`{content}`", ephemeral=True)
+
+    elif act == "list":
+        memos = user_data.get("memos", [])
+        embed = discord.Embed(title="📝 あなたの専用メモ一覧", color=discord.Color.gold())
+        embed.description = "\n".join([f"**{i+1}.** {m}" for i, m in enumerate(memos)]) if memos else "保存されているメモはありません。"
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    elif act == "delete":
+        memos = user_data.get("memos", [])
+        if not memos:
+            await interaction.response.send_message("ℹ️ 削除できるメモがありません。", ephemeral=True)
+            return
+        view = MemoDeleteView(memos)
+        await interaction.response.send_message("以下のメニューから削除したいメモを選んでください：", view=view, ephemeral=True)
+
+    elif act == "clear":
+        user_data["memos"] = []
+        save_data(all_data)
+        await interaction.response.send_message("🧹 全てのメモを消去しました。", ephemeral=True)
+
+
+@bot.tree.command(name="my_search", description="【マイアプリ専用】各種検索エンジンやWikipediaで検索をかけます", **user_app_config)
+@discord.app_commands.choices(engine=[
+    discord.app_commands.Choice(name="🌐 Google (ググる)", value="google"),
+    discord.app_commands.Choice(name="📺 YouTube (動画検索)", value="youtube"),
+    discord.app_commands.Choice(name="🐙 GitHub (コード検索)", value="github"),
+    discord.app_commands.Choice(name="🐦 X / Twitter (リアルタイム)", value="x"),
+    discord.app_commands.Choice(name="📖 Wikipedia (概要埋め込み)", value="wiki")
+])
+async def my_search(interaction: discord.Interaction, engine: discord.app_commands.Choice[str], query: str):
+    if not await is_owner_check(interaction): return
+    eng = engine.value
+
+    # ウィキペディアの場合のみ、今まで通りDiscord内部に概要を埋め込み表示
+    if eng == "wiki":
+        await interaction.response.defer(ephemeral=True)
+        try:
+            encoded_query = urllib.parse.quote(query)
+            url = f"https://ja.wikipedia.org/api/rest_v1/page/summary/{encoded_query}"
+            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req, timeout=5) as response:
+                data = json.loads(response.read().decode('utf-8'))
+                embed = discord.Embed(title=f"🔍 Wiki検索結果: {data.get('title', query)}", description=data.get('extract', '概要なし'), color=discord.Color.blue())
+                if "content_urls" in data: embed.url = data["content_urls"]["desktop"]["page"]
+                if "thumbnail" in data: embed.set_thumbnail(url=data["thumbnail"]["source"])
+                await interaction.followup.send(embed=embed, ephemeral=True)
+        except:
+            await interaction.followup.send(f"❌ Wikipediaで「{query}」が見つかりませんでした。", ephemeral=True)
     
-    embed = create_user_list_embed(allowed_users)
-    view = UserManageView()
+    # それ以外の検索エンジンは検索結果の直通URLを綺麗に生成して提供
+    else:
+        encoded_query = urllib.parse.quote_plus(query)
+        urls = {
+            "google": f"https://www.google.com/search?q={encoded_query}",
+            "youtube": f"https://www.youtube.com/results?search_query={encoded_query}",
+            "github": f"https://github.com/search?q={encoded_query}",
+            "x": f"https://x.com/search?q={encoded_query}"
+        }
+        embed = discord.Embed(
+            title=f"🔍 検索リンク生成 ({engine.name})",
+            description=f"「**{query}**」の検索リンクを用意しました。\n下のリンクをクリックして開いてください。\n\n🔗 **[ここをクリックして検索結果を開く]({urls[eng]})**",
+            color=discord.Color.green()
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+@bot.tree.command(name="my_clip", description="【マイアプリ専用】大事なテキストやリンクをクリップしてストックします", **user_app_config)
+@discord.app_commands.choices(action=[
+    discord.app_commands.Choice(name="📌 クリップを追加する", value="add"),
+    discord.app_commands.Choice(name="📋 一覧を表示する", value="list"),
+    discord.app_commands.Choice(name="🧹 全て消去する", value="clear")
+])
+async def my_clip(interaction: discord.Interaction, action: discord.app_commands.Choice[str], content: str = None):
+    if not await is_owner_check(interaction): return
+    all_data = load_data()
+    user_data = get_user_app_data(all_data, str(interaction.user.id))
+    act = action.value
+
+    if act == "add":
+        if not content:
+            await interaction.response.send_message("❌ 内容を入力してください。", ephemeral=True)
+            return
+        user_data["bookmarks"].append(content)
+        save_data(all_data)
+        await interaction.response.send_message(f"📌 「あとで読む」にストックしました！", ephemeral=True)
+    elif act == "list":
+        bks = user_data.get("bookmarks", [])
+        embed = discord.Embed(title="📌 あとで読む・クリップ一覧", color=discord.Color.magenta())
+        embed.description = "\n".join([f"• {b}" for b in bks]) if bks else "ストックはありません。"
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+    elif act == "clear":
+        user_data["bookmarks"] = []
+        save_data(all_data)
+        await interaction.response.send_message("🧹 全て消去しました。", ephemeral=True)
 
 
-# 🔴 管理系コマンド（管理者のみ表示）
+@bot.tree.command(name="my_scan", description="【マイアプリ専用】滞在中のサーバー情報、または指定ユーザーの裏データを即座に暴きます", **user_app_config)
+async def my_scan(interaction: discord.Interaction, target_user: discord.User = None):
+    if not await is_owner_check(interaction): return
+    embed = discord.Embed(title="🧬 即時データスキャン結果", color=discord.Color.teal())
 
-@bot.tree.command(name="create_channel", description="新しいテキストチャンネルを作成します")
-@discord.app_commands.default_permissions(administrator=True)
-async def create_channel(
-    interaction: discord.Interaction, 
-    name: str, 
-    category: discord.CategoryChannel = None
-):
+    if target_user:
+        embed.set_thumbnail(url=target_user.display_avatar.url)
+        embed.add_field(name="👤 ユーザー名", value=f"{target_user.name} ({target_user.mention})", inline=True)
+        embed.add_field(name="🆔 ID", value=f"`{target_user.id}`", inline=True)
+        embed.add_field(name="📅 作成日", value=discord.utils.format_dt(target_user.created_at, style="F"), inline=False)
+        if interaction.guild:
+            m = interaction.guild.get_member(target_user.id)
+            if m and m.joined_at:
+                embed.add_field(name="📥 鯖参加日", value=discord.utils.format_dt(m.joined_at, style="F"), inline=False)
+                roles = [r.mention for r in m.roles if r != interaction.guild.default_role]
+                embed.add_field(name="🏷️ ロール", value=" ".join(roles) if roles else "なし", inline=False)
+    else:
+        if not interaction.guild:
+            await interaction.response.send_message("❌ サーバー内で実行してください。", ephemeral=True)
+            return
+        g = interaction.guild
+        if g.icon: embed.set_thumbnail(url=g.icon.url)
+        embed.add_field(name="🏰 サーバー名", value=g.name, inline=True)
+        embed.add_field(name="🆔 鯖ID", value=f"`{g.id}`", inline=True)
+        embed.add_field(name="👑 オーナー", value=f"<@{g.owner_id}>", inline=True)
+        embed.add_field(name="👥 人数", value=f"{g.member_count} 人", inline=True)
+        embed.add_field(name="🚀 ブースト", value=f"Level {g.premium_tier} ({g.premium_subscription_count}回)", inline=True)
+        embed.add_field(name="📅 作成日", value=discord.utils.format_dt(g.created_at, style="F"), inline=False)
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="my_scan_channels", description="【マイアプリ専用】今いる鯖の全チャンネル構造と隠し設定・個別権限をフルスキャンします", **user_app_config)
+async def my_scan_channels(interaction: discord.Interaction):
+    if not await is_owner_check(interaction): return
+    if not interaction.guild:
+        await interaction.response.send_message("❌ サーバー内で実行してください。", ephemeral=True)
+        return
     await interaction.response.defer(ephemeral=True)
-    guild = interaction.guild
+    g = interaction.guild
+    report = [f"📊 **{g.name} チャンネルレポート**", f"カテゴリー: {len(g.categories)} | テキスト: {len(g.text_channels)} | ボイス: {len(g.voice_channels)}\n", "🔒 **特殊権限・隠し設定チャンネル:**"]
+    
+    count = 0
+    for ch in g.channels:
+        if isinstance(ch, discord.CategoryChannel): continue
+        if ch.overwrites:
+            roles = []
+            for target, ow in ch.overwrites.items():
+                if isinstance(target, discord.Role):
+                    if ow.view_channel is False or ow.read_messages is False: roles.append(f"⛔ {target.name}")
+                    elif ow.view_channel is True or ow.read_messages is True: roles.append(f"👁️ {target.name}")
+            if roles:
+                count += 1
+                report.append(f"• {ch.mention} ➜ {', '.join(roles[:3])}")
+    if count == 0: report.append("特殊設定されたチャンネルはありません。")
+    full_rep = "\n".join(report)
+    await interaction.followup.send(embed=discord.Embed(title="🔍 フルスキャン結果", description=full_rep[:1950], color=discord.Color.red()), ephemeral=True)
 
+
+# ==================== ⚙️ 【サーバー管理コマンドグループ】 ====================
+
+@bot.tree.command(name="server_list_users", description="【鯖管理】使用許可リストの確認・編集を画面上で行います", **user_app_config)
+async def server_list_users(interaction: discord.Interaction):
+    if not interaction.guild or not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ 管理者権限が必要です。", ephemeral=True)
+        return
+    g_id = str(interaction.guild.id)
+    all_data = load_data()
+    config = get_guild_config(all_data, g_id)
+    embed = create_user_list_embed(config.get("allowed_users", []))
+    await interaction.response.send_message(embed=embed, view=UserManageView(), ephemeral=True)
+
+@bot.tree.command(name="server_create_channel", description="【鯖管理】新しいテキストチャンネルを作成します", **user_app_config)
+async def server_create_channel(interaction: discord.Interaction, name: str, category: discord.CategoryChannel = None):
+    if not interaction.guild or not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ 権限がありません。", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
     try:
-        new_channel = await guild.create_text_channel(name=name, category=category)
-        category_msg = f"（カテゴリー: {category.name}）" if category else ""
-        await interaction.followup.send(f"✅ 新しいテキストチャンネル {new_channel.mention} を作成しました！{category_msg}", ephemeral=True)
-    except discord.Forbidden:
-        await interaction.followup.send("❌ ボットの権限が足りないため、チャンネルを作成できませんでした。ボットに『チャンネルの管理』権限が与えられているか確認してください。", ephemeral=True)
+        new_ch = await interaction.guild.create_text_channel(name=name, category=category)
+        await interaction.followup.send(f"✅ チャンネル {new_ch.mention} を作成しました！", ephemeral=True)
     except Exception as e:
-        await interaction.followup.send(f"❌ チャンネルの作成中にエラーが発生しました: {e}", ephemeral=True)
+        await interaction.followup.send(f"❌ 作成失敗: {e}", ephemeral=True)
 
-
-@bot.tree.command(name="create_role_panel", description="このチャンネルの権限を持つロールの選択パネルを自動生成します")
-@discord.app_commands.default_permissions(administrator=True)
-async def create_role_panel(
-    interaction: discord.Interaction, 
-    title: str = "🏷️ ロール役職の選択", 
-    description: str = "下のボタンを押すことで、自由にロールを付け外しできます。\nもう一度押すと外すことができます。",
-    image_file: discord.Attachment = None
-):
+@bot.tree.command(name="server_role_panel", description="【鯖管理】このチャンネルの閲覧権限を持つロールの選択パネルを自動生成します", **user_app_config)
+async def server_role_panel(interaction: discord.Interaction, title: str = "🏷️ ロール役職の選択", description: str = "下のボタンを押すことで、自由にロールを付け外しできます。", image_file: discord.Attachment = None):
+    if not interaction.guild or not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ 権限がありません。", ephemeral=True)
+        return
     await interaction.response.defer(ephemeral=True)
-    channel = interaction.channel
-    guild = interaction.guild
-    
-    detected_roles = []
-    for target, overwrite in channel.overwrites.items():
-        if isinstance(target, discord.Role) and target != guild.default_role:
-            if overwrite.view_channel is True or overwrite.read_messages is True:
-                detected_roles.append(target)
-                
-    detected_roles.sort(key=lambda r: r.position, reverse=True)
-
-    if not detected_roles:
-        await interaction.followup.send("⚠️ このチャンネルの『権限の追加』に個別登録されているロールが見つかりませんでした。先にチャンネル設定の「権限」から、選択肢にしたいロールを追加（閲覧を許可など）してください。", ephemeral=True)
+    ch = interaction.channel
+    g = interaction.guild
+    roles = [t for t, ow in ch.overwrites.items() if isinstance(t, discord.Role) and t != g.default_role and (ow.view_channel is True or ow.read_messages is True)]
+    roles.sort(key=lambda r: r.position, reverse=True)
+    if not roles:
+        await interaction.followup.send("⚠️ 対象のロールが見つかりません。", ephemeral=True)
         return
-
-    if len(detected_roles) > 25:
-        await interaction.followup.send("⚠️ Discordの仕様上、一度に設置できるボタンは25個までです。ロールの数を減らしてください。", ephemeral=True)
-        return
-
-    guild_id_str = str(guild.id)
     all_data = load_data()
-    guild_config = get_guild_config(all_data, guild_id_str)
-    guild_config["panel_roles"] = [r.id for r in detected_roles]
+    get_guild_config(all_data, str(g.id))["panel_roles"] = [r.id for r in roles]
     save_data(all_data)
-
     embed = discord.Embed(title=title, description=description, color=discord.Color.blurple())
-    if image_file:
-        embed.set_image(url=image_file.url)
-        
-    view = DynamicRoleView(detected_roles)
-    
-    await channel.send(embed=embed, view=view)
-    await interaction.followup.send(f"✅ {len(detected_roles)}個のロールを含むパネルを綺麗に作成しました！", ephemeral=True)
+    if image_file: embed.set_image(url=image_file.url)
+    await ch.send(embed=embed, view=DynamicRoleView(roles))
+    await interaction.followup.send(f"✅ パネルを設置しました！", ephemeral=True)
 
-
-@bot.tree.command(name="say", description="ボットに匿名で発言させます")
-@discord.app_commands.default_permissions(administrator=True)
-async def say(interaction: discord.Interaction, message: str):
-    guild_id_str = str(interaction.guild.id)
+@bot.tree.command(name="server_forward_setup", description="【鯖管理】転送元と転送先のチャンネルを設定します", **user_app_config)
+async def server_forward_setup(interaction: discord.Interaction, from_channel: discord.TextChannel, to_channel: discord.TextChannel):
+    if not interaction.guild or not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ 権限がありません。", ephemeral=True)
+        return
     all_data = load_data()
-    guild_config = get_guild_config(all_data, guild_id_str)
-    allowed_users = guild_config.get("allowed_users", [])
-    if interaction.user.id not in allowed_users and not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("このコマンドを実行する権限がありません。", ephemeral=True)
+    cfg = get_guild_config(all_data, str(interaction.guild.id))
+    cfg["from_channel"], cfg["to_channel"] = from_channel.id, to_channel.id
+    save_data(all_data)
+    await interaction.response.send_message("🔄 転送設定を保存しました！", ephemeral=True)
+
+@bot.tree.command(name="server_forward_reset", description="【鯖管理】チャンネルの転送設定を解除します", **user_app_config)
+async def server_forward_reset(interaction: discord.Interaction):
+    if not interaction.guild or not interaction.user.guild_permissions.administrator: return
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(interaction.guild.id))
+    cfg["from_channel"], cfg["to_channel"] = None, None
+    save_data(all_data)
+    await interaction.response.send_message("🔄 転送設定を解除しました。", ephemeral=True)
+
+@bot.tree.command(name="server_announce_setup", description="【鯖管理】お知らせ用のチャンネルとロールを設定します", **user_app_config)
+async def server_announce_setup(interaction: discord.Interaction, channel: discord.TextChannel, role: discord.Role):
+    if not interaction.guild or not interaction.user.guild_permissions.administrator: return
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(interaction.guild.id))
+    cfg["announce_channel"], cfg["announce_role"] = channel.id, role.id
+    save_data(all_data)
+    await interaction.response.send_message("📢 お知らせ設定を保存しました！", ephemeral=True)
+
+@bot.tree.command(name="server_announce_send", description="【鯖管理】設定されたチャンネルにロールメンション付きでお知らせを送信します", **user_app_config)
+async def server_announce_send(interaction: discord.Interaction, message: str):
+    if not interaction.guild or not interaction.user.guild_permissions.administrator: return
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(interaction.guild.id))
+    ch, r = bot.get_channel(cfg.get("announce_channel")), interaction.guild.get_role(cfg.get("announce_role", 0))
+    if ch and r:
+        await ch.send(f"{r.mention}\n\n{message}")
+        await interaction.response.send_message("📢 お知らせを送信しました。", ephemeral=True)
+    else:
+        await interaction.response.send_message("❌ 設定が不完全です。", ephemeral=True)
+
+@bot.tree.command(name="server_verify_setup", description="【鯖管理】認証用ロールと送信チャンネルを設定します", **user_app_config)
+async def server_verify_setup(interaction: discord.Interaction, channel: discord.TextChannel, role: discord.Role):
+    if not interaction.guild or not interaction.user.guild_permissions.administrator: return
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(interaction.guild.id))
+    cfg["verify_channel"], cfg["verify_role"] = channel.id, role.id
+    save_data(all_data)
+    await interaction.response.send_message("🛡️ 認証設定を保存しました！", ephemeral=True)
+
+@bot.tree.command(name="server_verify_btn", description="【鯖管理】設定されたチャンネルに認証用ボタンパネルを送信します", **user_app_config)
+async def server_verify_btn(interaction: discord.Interaction, title: str = "サーバー認証", description: str = "ボタンを押すと認証が完了します。", image_file: discord.Attachment = None):
+    if not interaction.guild or not interaction.user.guild_permissions.administrator: return
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(interaction.guild.id))
+    ch = bot.get_channel(cfg.get("verify_channel"))
+    if not ch:
+        await interaction.response.send_message("❌ 先に設定を完了してください。", ephemeral=True)
+        return
+    embed = discord.Embed(title=title, description=description, color=discord.Color.green())
+    if image_file: embed.set_image(url=image_file.url)
+    await ch.send(embed=embed, view=VerifyButtonView())
+    await interaction.response.send_message("🛡️ 認証パネルを設置しました！", ephemeral=True)
+
+@bot.tree.command(name="server_say", description="ボットに匿名で発言させます", **user_app_config)
+async def server_say(interaction: discord.Interaction, message: str):
+    if not interaction.guild: return
+    all_data = load_data()
+    allowed = get_guild_config(all_data, str(interaction.guild.id)).get("allowed_users", [])
+    if interaction.user.id not in allowed and not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ 権限がありません。", ephemeral=True)
         return
     await interaction.channel.send(message)
-    await interaction.response.send_message("メッセージを匿名で送信しました。", ephemeral=True)
+    await interaction.response.send_message("送信しました。", ephemeral=True)
 
-@bot.tree.command(name="restart", description="ボットを再起動します（確認プロンプトを表示）")
-@discord.app_commands.default_permissions(administrator=True)
-async def restart(interaction: discord.Interaction):
-    view = RestartConfirmView()
-    await interaction.response.send_message("本当にボットを再起動しますか？", view=view, ephemeral=True)
-
-@bot.tree.command(name="set_forward", description="アドミンのメッセージ転送元と転送先のチャンネルを設定します")
-@discord.app_commands.default_permissions(administrator=True)
-async def set_forward(interaction: discord.Interaction, from_channel: discord.TextChannel, to_channel: discord.TextChannel):
-    guild_id_str = str(interaction.guild.id)
-    all_data = load_data()
-    guild_config = get_guild_config(all_data, guild_id_str)
-    guild_config["from_channel"] = from_channel.id
-    guild_config["to_channel"] = to_channel.id
-    save_data(all_data)
-    await interaction.response.send_message(f"転送設定を完了しました！\n【転送元】{from_channel.mention}\n【転送先】{to_channel.mention}", ephemeral=True)
-
-@bot.tree.command(name="reset_forward", description="チャンネルの転送設定を解除します")
-@discord.app_commands.default_permissions(administrator=True)
-async def reset_forward(interaction: discord.Interaction):
-    guild_id_str = str(interaction.guild.id)
-    all_data = load_data()
-    guild_config = get_guild_config(all_data, guild_id_str)
-    guild_config["from_channel"] = None
-    guild_config["to_channel"] = None
-    save_data(all_data)
-    await interaction.response.send_message("チャンネルの転送設定をリセットしました。", ephemeral=True)
-
-@bot.tree.command(name="set_announcement", description="お知らせチャンネルと通知するロールを設定します")
-@discord.app_commands.default_permissions(administrator=True)
-async def set_announcement(interaction: discord.Interaction, channel: discord.TextChannel, role: discord.Role):
-    guild_id_str = str(interaction.guild.id)
-    all_data = load_data()
-    guild_config = get_guild_config(all_data, guild_id_str)
-    guild_config["announce_channel"] = channel.id
-    guild_config["announce_role"] = role.id
-    save_data(all_data)
-    await interaction.response.send_message(f"お知らせ設定を完了しました！\n【送信先】{channel.mention}\n【対象ロール】{role.mention}", ephemeral=True)
-
-@bot.tree.command(name="reset_announcement", description="お知らせチャンネルとロールの設定を解除します")
-@discord.app_commands.default_permissions(administrator=True)
-async def reset_announcement(interaction: discord.Interaction):
-    guild_id_str = str(interaction.guild.id)
-    all_data = load_data()
-    guild_config = get_guild_config(all_data, guild_id_str)
-    guild_config["announce_channel"] = None
-    guild_config["announce_role"] = None
-    save_data(all_data)
-    await interaction.response.send_message("お知らせ設定（チャンネル・ロール）をリセットしました。", ephemeral=True)
-
-@bot.tree.command(name="send_announcement", description="設定されたチャンネルにロールメンション付きでお知らせを送信します")
-@discord.app_commands.default_permissions(administrator=True)
-async def send_announcement(interaction: discord.Interaction, message: str):
-    guild_id_str = str(interaction.guild.id)
-    all_data = load_data()
-    guild_config = get_guild_config(all_data, guild_id_str)
-    channel_id = guild_config.get("announce_channel")
-    role_id = guild_config.get("announce_role")
-    if not channel_id or not role_id:
-        await interaction.response.send_message("お知らせチャンネル、またはロールが設定されていません。先に `/set_announcement` を実行してください。", ephemeral=True)
-        return
-    target_channel = bot.get_channel(channel_id)
-    target_role = interaction.guild.get_role(role_id)
-    if target_channel and target_role:
-        await target_channel.send(f"{target_role.mention}\n\n{message}")
-        await interaction.response.send_message("お知らせを送信しました！", ephemeral=True)
-    else:
-        await interaction.response.send_message("チャンネルまたはロールが見つかりませんでした。再設定してください。", ephemeral=True)
-
-@bot.tree.command(name="set_verify_role", description="認証ボタンを押したときに付与するロールを設定します")
-@discord.app_commands.default_permissions(administrator=True)
-async def set_verify_role(interaction: discord.Interaction, role: discord.Role):
-    guild_id_str = str(interaction.guild.id)
-    all_data = load_data()
-    guild_config = get_guild_config(all_data, guild_id_str)
-    guild_config["verify_role"] = role.id
-    save_data(all_data)
-    await interaction.response.send_message(f"認証用ロールを {role.mention} に設定しました！", ephemeral=True)
-
-@bot.tree.command(name="set_verify_channel", description="認証パネル（ボタン）を送信するチャンネルを設定します")
-@discord.app_commands.default_permissions(administrator=True)
-async def set_verify_channel(interaction: discord.Interaction, channel: discord.TextChannel):
-    guild_id_str = str(interaction.guild.id)
-    all_data = load_data()
-    guild_config = get_guild_config(all_data, guild_id_str)
-    guild_config["verify_channel"] = channel.id
-    save_data(all_data)
-    await interaction.response.send_message(f"認証チャンネルを {channel.mention} に設定しました！", ephemeral=True)
-
-@bot.tree.command(name="send_verify_button", description="設定されたチャンネルに認証ボタン付きのパネルメッセージを送信します")
-@discord.app_commands.default_permissions(administrator=True)
-async def send_verify_button(
-    interaction: discord.Interaction, 
-    title: str = "サーバー認証", 
-    description: str = "下のボタンを押すと認証が完了し、全てのチャンネルが閲覧可能になります。",
-    image_file: discord.Attachment = None
-):
-    guild_id_str = str(interaction.guild.id)
-    all_data = load_data()
-    guild_config = get_guild_config(all_data, guild_id_str)
-    
-    channel_id = guild_config.get("verify_channel")
-    if not channel_id:
-        await interaction.response.send_message("認証チャンネルが設定されていません。先に `/set_verify_channel` を実行してください。", ephemeral=True)
-        return
-        
-    target_channel = bot.get_channel(channel_id)
-    if not target_channel:
-        await interaction.response.send_message("設定されたチャンネルが見つかりませんでした。再設定してください。", ephemeral=True)
-        return
-
-    embed = discord.Embed(title=title, description=description, color=discord.Color.green())
-    if image_file:
-        embed.set_image(url=image_file.url)
-
-    view = VerifyButtonView()
-    
-    try:
-        await target_channel.send(embed=embed, view=view)
-        await interaction.response.send_message(f"{target_channel.mention} に認証ボタンを設置しました！", ephemeral=True)
-    except Exception as e:
-        await interaction.response.send_message(f"メッセージの送信に失敗しました。エラー: {e}", ephemeral=True)
+@bot.tree.command(name="server_restart", description="ボットを再起動します（管理者用）", **user_app_config)
+async def server_restart(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.administrator: return
+    await interaction.response.send_message("本当に再起動しますか？", view=RestartConfirmView(), ephemeral=True)
 
 try:
     bot.run(TOKEN)
-except discord.errors.LoginFailure:
-    print("❌ エラー: Discordトークンが無効です。")
 except Exception as e:
-    print(f"❌ ボット起動中に予期せぬエラーが発生しました: {e}")
+    print(f"❌ エラー: {e}")
