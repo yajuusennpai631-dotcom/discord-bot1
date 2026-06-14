@@ -19,8 +19,11 @@ bot = commands.Bot(
 # 💡 特定のサーバーへの固定を解除しました（色々なサーバーで動かすため）
 # GUILD_ID や guild = discord.Object(...) のコードは削除しています
 
-# 💡 JSONファイルの保存先パス
-JSON_FILE = "allowed_users.json"
+# 💡 【Volume対応に書き換え】JSONファイルの保存先パスを自動で切り替えます
+if os.path.exists("/app/data"):
+    JSON_FILE = "/app/data/allowed_users.json"  # 🚀 Railway本番（Volume内）に保存
+else:
+    JSON_FILE = "allowed_users.json"             # 💻 あなたのPCでのテスト用保存
 
 # 💡 JSONからすべてのデータを読み込む関数（サーバーIDごとの構造に対応）
 def load_data():
