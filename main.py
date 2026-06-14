@@ -89,8 +89,9 @@ def create_user_list_embed(allowed_users):
         embed.set_footer(text=f"現在の登録者数: {len(allowed_users)}名")
     return embed
 
+# 💡 ここを修正しました！ dm ➜ dm_channel に直しています
 user_app_config = {
-    "contexts": discord.app_commands.AppCommandContext(guild=True, dm=True, private_channel=True),
+    "contexts": discord.app_commands.AppCommandContext(guild=True, dm_channel=True, private_channel=True),
     "integration_types": discord.app_commands.AppInstallationType(guild_install=True, user_install=True)
 }
 
@@ -112,7 +113,7 @@ class MemoDeleteSelect(discord.ui.Select):
         for i, memo in enumerate(memos):
             short_memo = memo if len(memo) <= 50 else memo[:47] + "..."
             options.append(discord.SelectOption(label=f"{i+1}. {short_memo}", value=str(i)))
-            if i >= 24: # Discordの仕様上、最大25個まで
+            if i >= 24:
                 break
         super().__init__(placeholder="❌ 削除するメモを1つ選択してください...", options=options)
 
@@ -350,7 +351,6 @@ async def my_search(interaction: discord.Interaction, engine: discord.app_comman
     if not await is_owner_check(interaction): return
     eng = engine.value
 
-    # ウィキペディアの場合のみ、今まで通りDiscord内部に概要を埋め込み表示
     if eng == "wiki":
         await interaction.response.defer(ephemeral=True)
         try:
@@ -366,7 +366,6 @@ async def my_search(interaction: discord.Interaction, engine: discord.app_comman
         except:
             await interaction.followup.send(f"❌ Wikipediaで「{query}」が見つかりませんでした。", ephemeral=True)
     
-    # それ以外の検索エンジンは検索結果の直通URLを綺麗に生成して提供
     else:
         encoded_query = urllib.parse.quote_plus(query)
         urls = {
@@ -508,7 +507,7 @@ async def server_role_panel(interaction: discord.Interaction, title: str = "🏷
     roles = [t for t, ow in ch.overwrites.items() if isinstance(t, discord.Role) and t != g.default_role and (ow.view_channel is True or ow.read_messages is True)]
     roles.sort(key=lambda r: r.position, reverse=True)
     if not roles:
-        await interaction.followup.send("⚠️ 対象のロールが見つかりません。", ephemeral=True)
+        await interaction.followup.send("⚠️ 対象のロールが見切つかりません。", ephemeral=True)
         return
     all_data = load_data()
     get_guild_config(all_data, str(g.id))["panel_roles"] = [r.id for r in roles]
