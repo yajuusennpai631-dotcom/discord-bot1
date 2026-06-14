@@ -7,7 +7,6 @@ import json
 import sys
 
 TOKEN = os.getenv("DISCORD_TOKEN")
-GUILD_ID = 1488795327069945970
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -17,70 +16,64 @@ bot = commands.Bot(
     intents=intents
 )
 
-guild = discord.Object(id=GUILD_ID)
+# 💡 特定のサーバーへの固定を解除しました（色々なサーバーで動かすため）
+# GUILD_ID や guild = discord.Object(...) のコードは削除しています
 
 # 💡 JSONファイルの保存先パス
 JSON_FILE = "allowed_users.json"
 
-# 💡 JSONからすべてのデータを読み込む関数
+# 💡 JSONからすべてのデータを読み込む関数（サーバーIDごとの構造に対応）
 def load_data():
-    default_data = {
-        "allowed_users": [], 
-        "from_channel": None, 
-        "to_channel": None,
-        "announce_channel": None,
-        "announce_role": None
-    }
     if os.path.exists(JSON_FILE):
         try:
             with open(JSON_FILE, "r", encoding="utf-8") as f:
                 return json.load(f)
         except Exception as e:
             print(f"JSON読み込みエラー: {e}")
-            return default_data
-    return default_data
+            return {}
+    return {}
 
 # 💡 JSONにすべてのデータを保存する関数
-def save_data():
+def save_data(data):
     try:
         with open(JSON_FILE, "w", encoding="utf-8") as f:
-            data = {
-                "allowed_users": list(allowed_users),
-                "from_channel": forward_config["from_channel"],
-                "to_channel": forward_config["to_channel"],
-                "announce_channel": announce_config["announce_channel"],
-                "announce_role": announce_config["announce_role"]
-            }
             json.dump(data, f, ensure_ascii=False, indent=4)
     except Exception as e:
         print(f"JSON保存エラー: {e}")
 
-# 💡 起動時にJSONからデータを読み込んでセットアップ
-saved_data = load_data()
-allowed_users = set(saved_data.get("allowed_users", []))
-forward_config = {
-    "from_channel": saved_data.get("from_channel"),
-    "to_channel": saved_data.get("to_channel")
-}
-announce_config = {
-    "announce_channel": saved_data.get("announce_channel"),
-    "announce_role": saved_data.get("announce_role")
-}
+# 💡 サーバーごとの初期設定テンプレートを作成するヘルパー関数
+def get_guild_config(all_data, guild_id_str):
+    if guild_id_str not in all_data:
+        all_data[guild_id_str] = {
+            "allowed_users": [],
+            "from_channel": None,
+            "to_channel": None,
+            "announce_channel": None,
+            "announce_role": None
+        }
+    return all_data[guild_id_str]
 
 @bot.event
 async def on_ready():
-    synced = await bot.tree.sync(guild=guild)
-    print(f"{len(synced)} commands synced")
+    # 💡 guild=guild の指定を外すことで、ボットが入っているすべてのサーバーでコマンドが使えるようになります（グローバル同期）
+    # ⚠️ 反映までに最長で1時間ほどかかる場合があります
+    synced = await bot.tree.sync()
+    print(f"{len(synced)} commands synced (Global)")
     print(f"Logged in as {bot.user}")
 
 # 💡 メッセージが送信されたときに自動で実行されるイベント
 @bot.event
 async def on_message(message: discord.Message):
-    if message.author.bot:
+    if message.author.bot or not message.guild:
         return
 
-    from_id = forward_config["from_channel"]
-    to_id = forward_config["to_channel"]
+    # 💡 発言があったサーバーのIDを取得して、そのサーバーの設定を読み込む
+    guild_id_str = str(message.guild.id)
+    all_data = load_data()
+    guild_config = get_guild_config(all_data, guild_id_str)
+
+    from_id = guild_config.get("from_channel")
+    to_id = guild_config.get("to_channel")
 
     if from_id and to_id and message.channel.id == from_id and message.author.guild_permissions.administrator:
         to_channel = bot.get_channel(to_id)
@@ -112,8 +105,7 @@ class RestartConfirmView(discord.ui.View):
 # 💡 再起動コマンド（管理者のみ）
 @bot.tree.command(
     name="restart",
-    description="ボットを再起動します（確認プロンプトを表示）",
-    guild=guild
+    description="ボットを再起動します（確認プロンプトを表示）"
 )
 async def restart(interaction: discord.Interaction):
     if not interaction.user.guild_permissions.administrator:
@@ -126,8 +118,7 @@ async def restart(interaction: discord.Interaction):
 # 💡 転送元のチャンネルと転送先のチャンネルをコマンドで指定する（管理者のみ）
 @bot.tree.command(
     name="set_forward",
-    description="アドミンのメッセージ転送元と転送先のチャンネルを設定します",
-    guild=guild
+    description="アドミンのメッセージ転送元と転送先のチャンネルを設定します"
 )
 async def set_forward(
     interaction: discord.Interaction, 
@@ -138,9 +129,13 @@ async def set_forward(
         await interaction.response.send_message("この管理コマンドはサーバーの管理者のみ実行できます。", ephemeral=True)
         return
         
-    forward_config["from_channel"] = from_channel.id
-    forward_config["to_channel"] = to_channel.id
-    save_data()
+    guild_id_str = str(interaction.guild.id)
+    all_data = load_data()
+    guild_config = get_guild_config(all_data, guild_id_str)
+    
+    guild_config["from_channel"] = from_channel.id
+    guild_config["to_channel"] = to_channel.id
+    save_data(all_data)
     
     await interaction.response.send_message(
         f"転送設定を完了しました！\n"
@@ -152,25 +147,27 @@ async def set_forward(
 # 💡 転送設定を解除（リセット）するコマンド（管理者のみ）
 @bot.tree.command(
     name="reset_forward",
-    description="チャンネルの転送設定を解除します",
-    guild=guild
+    description="チャンネルの転送設定を解除します"
 )
 async def reset_forward(interaction: discord.Interaction):
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("この管理コマンドはサーバーの管理者のみ実行できます。", ephemeral=True)
         return
         
-    forward_config["from_channel"] = None
-    forward_config["to_channel"] = None
-    save_data()
+    guild_id_str = str(interaction.guild.id)
+    all_data = load_data()
+    guild_config = get_guild_config(all_data, guild_id_str)
+    
+    guild_config["from_channel"] = None
+    guild_config["to_channel"] = None
+    save_data(all_data)
     
     await interaction.response.send_message("チャンネルの転送設定をリセットしました。", ephemeral=True)
 
 # 💡 お知らせチャンネルと通知対象のロールを設定する（管理者のみ）
 @bot.tree.command(
     name="set_announcement",
-    description="お知らせチャンネルと通知するロールを設定します",
-    guild=guild
+    description="お知らせチャンネルと通知するロールを設定します"
 )
 async def set_announcement(
     interaction: discord.Interaction, 
@@ -181,9 +178,13 @@ async def set_announcement(
         await interaction.response.send_message("この管理コマンドはサーバーの管理者のみ実行できます。", ephemeral=True)
         return
         
-    announce_config["announce_channel"] = channel.id
-    announce_config["announce_role"] = role.id
-    save_data()
+    guild_id_str = str(interaction.guild.id)
+    all_data = load_data()
+    guild_config = get_guild_config(all_data, guild_id_str)
+    
+    guild_config["announce_channel"] = channel.id
+    guild_config["announce_role"] = role.id
+    save_data(all_data)
     
     await interaction.response.send_message(
         f"お知らせ設定を完了しました！\n"
@@ -195,16 +196,19 @@ async def set_announcement(
 # 💡 設定されたチャンネルにロールメンション付きでお知らせを送信する（管理者のみ）
 @bot.tree.command(
     name="send_announcement",
-    description="設定されたチャンネルにロールメンション付きでお知らせを送信します",
-    guild=guild
+    description="設定されたチャンネルにロールメンション付きでお知らせを送信します"
 )
 async def send_announcement(interaction: discord.Interaction, message: str):
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("この管理コマンドはサーバーの管理者のみ実行できます。", ephemeral=True)
         return
         
-    channel_id = announce_config["announce_channel"]
-    role_id = announce_config["announce_role"]
+    guild_id_str = str(interaction.guild.id)
+    all_data = load_data()
+    guild_config = get_guild_config(all_data, guild_id_str)
+    
+    channel_id = guild_config.get("announce_channel")
+    role_id = guild_config.get("announce_role")
     
     if not channel_id or not role_id:
         await interaction.response.send_message("お知らせチャンネル、またはロールが設定されていません。先に `/set_announcement` を実行してください。", ephemeral=True)
@@ -222,18 +226,21 @@ async def send_announcement(interaction: discord.Interaction, message: str):
 
 @bot.tree.command(
     name="hello",
-    description="あいさつするコマンド",
-    guild=guild
+    description="あいさつするコマンド"
 )
 async def hello(interaction: discord.Interaction):
     await interaction.response.send_message(f"{interaction.user.mention} さん、おはよう")
 
 @bot.tree.command(
     name="say",
-    description="ボットに匿名で発言させます",
-    guild=guild
+    description="ボットに匿名で発言させます"
 )
 async def say(interaction: discord.Interaction, message: str):
+    guild_id_str = str(interaction.guild.id)
+    all_data = load_data()
+    guild_config = get_guild_config(all_data, guild_id_str)
+    allowed_users = guild_config.get("allowed_users", [])
+
     if interaction.user.id not in allowed_users and not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("このコマンドを実行する権限がありません。", ephemeral=True)
         return
@@ -243,52 +250,62 @@ async def say(interaction: discord.Interaction, message: str):
 
 @bot.tree.command(
     name="allow_user",
-    description="コマンドの使用を許可するユーザーを追加します",
-    guild=guild
+    description="コマンドの使用を許可するユーザーを追加します"
 )
 async def allow_user(interaction: discord.Interaction, user: discord.User):
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("この管理コマンドはサーバーの管理者のみ実行できます。", ephemeral=True)
         return
         
-    allowed_users.add(user.id)
-    save_data()
+    guild_id_str = str(interaction.guild.id)
+    all_data = load_data()
+    guild_config = get_guild_config(all_data, guild_id_str)
+    
+    # リスト形式で保存されているので、重複を避けて追加
+    if user.id not in guild_config["allowed_users"]:
+        guild_config["allowed_users"].append(user.id)
+    save_data(all_data)
+    
     await interaction.response.send_message(f"{user.mention} を許可リストに追加しました。", ephemeral=True)
 
 @bot.tree.command(
     name="deny_user",
-    description="コマンドの使用許可リストからユーザーを削除します",
-    guild=guild
+    description="コマンドの使用許可リストからユーザーを削除します"
 )
 async def deny_user(interaction: discord.Interaction, user: discord.User):
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("この管理コマンドはサーバーの管理者のみ実行できます。", ephemeral=True)
         return
         
-    if user.id in allowed_users:
-        allowed_users.remove(user.id)
-        save_data()
+    guild_id_str = str(interaction.guild.id)
+    all_data = load_data()
+    guild_config = get_guild_config(all_data, guild_id_str)
+    
+    if user.id in guild_config["allowed_users"]:
+        guild_config["allowed_users"].remove(user.id)
+        save_data(all_data)
         await interaction.response.send_message(f"{user.mention} を許可リストから削除しました。", ephemeral=True)
     else:
         await interaction.response.send_message(f"{user.mention} は元々許可リストに登録されていません。", ephemeral=True)
 
-# 💡 【新機能】許可されているユーザーを一覧表示するコマンド（管理者のみ）
 @bot.tree.command(
     name="list_users",
-    description="コマンドの使用を許可されているユーザーの一覧を表示します",
-    guild=guild
+    description="コマンドの使用を許可されているユーザーの一覧を表示します"
 )
 async def list_users(interaction: discord.Interaction):
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("この管理コマンドはサーバーの管理者のみ実行できます。", ephemeral=True)
         return
         
-    # リストが空っぽの場合
+    guild_id_str = str(interaction.guild.id)
+    all_data = load_data()
+    guild_config = get_guild_config(all_data, guild_id_str)
+    allowed_users = guild_config.get("allowed_users", [])
+        
     if not allowed_users:
         await interaction.response.send_message("現在、許可リストに登録されているユーザーはいません。\n※管理者は登録なしで使えます。", ephemeral=True)
         return
         
-    # 登録されているIDをメンションの形（<@ID>）に変換して箇条書きにする
     user_mentions = [f"・<@{user_id}>" for user_id in allowed_users]
     list_text = "【コマンド使用許可ユーザー一覧】\n" + "\n".join(user_mentions)
     
