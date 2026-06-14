@@ -1,7 +1,9 @@
+print("=== WINDOWS_TEST_0614 ===")
+
 import os
 import discord
 from discord.ext import commands
-
+# ...以下はそのまま...
 TOKEN = os.getenv("DISCORD_TOKEN")
 GUILD_ID = 1488795327069945970
 
