@@ -4,7 +4,7 @@ import os
 import discord
 from discord.ext import commands
 import json
-import sys  # 💡 システム終了を呼び出すために追加
+import sys
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 GUILD_ID = 1488795327069945970
@@ -89,10 +89,10 @@ async def on_message(message: discord.Message):
 
     await bot.process_commands(message)
 
-# 💡 【新機能】再起動の確認プロンプト（ボタン）を表示するクラス
+# 💡 再起動の確認プロンプト（ボタン）を表示するクラス
 class RestartConfirmView(discord.ui.View):
     def __init__(self):
-        super().__init__(timeout=60) # 60秒間操作がなければ無効化
+        super().__init__(timeout=60)
 
     @discord.ui.button(label="はい (再起動)", style=discord.ButtonStyle.danger)
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -101,7 +101,6 @@ class RestartConfirmView(discord.ui.View):
             return
             
         await interaction.response.send_message("ボットを終了します。Railwayによる自動再起動をお待ちください...", ephemeral=True)
-        # ボットをログアウトさせてプログラムを終了する
         await bot.close()
         sys.exit(0)
 
@@ -110,7 +109,7 @@ class RestartConfirmView(discord.ui.View):
         await interaction.response.send_message("再起動をキャンセルしました。", ephemeral=True)
         self.stop()
 
-# 💡 【新機能】再起動コマンド（管理者のみ）
+# 💡 再起動コマンド（管理者のみ）
 @bot.tree.command(
     name="restart",
     description="ボットを再起動します（確認プロンプトを表示）",
@@ -121,7 +120,6 @@ async def restart(interaction: discord.Interaction):
         await interaction.response.send_message("この管理コマンドはサーバーの管理者のみ実行できます。", ephemeral=True)
         return
         
-    # 確認ボタン付きのプロンプトを送信
     view = RestartConfirmView()
     await interaction.response.send_message("本当にボットを再起動しますか？", view=view, ephemeral=True)
 
@@ -273,5 +271,27 @@ async def deny_user(interaction: discord.Interaction, user: discord.User):
         await interaction.response.send_message(f"{user.mention} を許可リストから削除しました。", ephemeral=True)
     else:
         await interaction.response.send_message(f"{user.mention} は元々許可リストに登録されていません。", ephemeral=True)
+
+# 💡 【新機能】許可されているユーザーを一覧表示するコマンド（管理者のみ）
+@bot.tree.command(
+    name="list_users",
+    description="コマンドの使用を許可されているユーザーの一覧を表示します",
+    guild=guild
+)
+async def list_users(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("この管理コマンドはサーバーの管理者のみ実行できます。", ephemeral=True)
+        return
+        
+    # リストが空っぽの場合
+    if not allowed_users:
+        await interaction.response.send_message("現在、許可リストに登録されているユーザーはいません。\n※管理者は登録なしで使えます。", ephemeral=True)
+        return
+        
+    # 登録されているIDをメンションの形（<@ID>）に変換して箇条書きにする
+    user_mentions = [f"・<@{user_id}>" for user_id in allowed_users]
+    list_text = "【コマンド使用許可ユーザー一覧】\n" + "\n".join(user_mentions)
+    
+    await interaction.response.send_message(list_text, ephemeral=True)
 
 bot.run(TOKEN)
