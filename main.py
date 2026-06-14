@@ -5,10 +5,10 @@ import discord
 from discord.ext import commands
 import json
 import sys
+import asyncio
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 
-# 💡 トークンが空の場合に早期にログへ警告を出す
 if not TOKEN:
     print("❌ エラー: 環境変数 'DISCORD_TOKEN' が設定されていないか、読み込めていません！")
     sys.exit(1)
@@ -22,14 +22,11 @@ bot = commands.Bot(
     intents=intents
 )
 
-# 💡 JSONファイルの保存先パス（Volume対応）
 if os.path.exists("/app/data"):
     JSON_FILE = "/app/data/allowed_users.json"
 else:
-    # 念のため、ローカル環境やVolume未作成時の対策
     JSON_FILE = "allowed_users.json"
 
-# 💡 JSONからすべてのデータを読み込む関数（エラーハンドリング強化）
 def load_data():
     if os.path.exists(JSON_FILE):
         try:
@@ -40,10 +37,8 @@ def load_data():
             return {}
     return {}
 
-# 💡 JSONにすべてのデータを保存する関数（フォルダ自動作成＆エラーハンドリング強化）
 def save_data(data):
     try:
-        # 保存先フォルダ（/app/data など）が存在しない場合は自動作成
         dir_name = os.path.dirname(JSON_FILE)
         if dir_name and not os.path.exists(dir_name):
             os.makedirs(dir_name, exist_ok=True)
@@ -54,7 +49,6 @@ def save_data(data):
     except Exception as e:
         print(f"❌ JSON保存エラー (権限やパスの問題): {e}")
 
-# サーバーごとの初期設定テンプレートを作成するヘルパー関数
 def get_guild_config(all_data, guild_id_str):
     if guild_id_str not in all_data:
         all_data[guild_id_str] = {
@@ -68,7 +62,6 @@ def get_guild_config(all_data, guild_id_str):
         }
     return all_data[guild_id_str]
 
-# 認証ボタンを処理するクラス
 class VerifyButtonView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -130,7 +123,7 @@ async def on_message(message: discord.Message):
 
     await bot.process_commands(message)
 
-# 再起動の確認プロンプトを表示するクラス
+# 💡 再起動の確認プロンプト（より安全にクローズする形に修正）
 class RestartConfirmView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=60)
@@ -141,8 +134,13 @@ class RestartConfirmView(discord.ui.View):
             await interaction.response.send_message("この操作は管理者のみ実行できます。", ephemeral=True)
             return
             
-        await interaction.response.send_message("ボットを終了します。Railwayによる自動再起動をお待ちください...", ephemeral=True)
+        await interaction.response.send_message("ボットを安全に終了します。再起動をお待ちください...", ephemeral=True)
+        
+        # 💡 通信タスクを綺麗に片付けてから終了する安全なシークエンスに変更
         await bot.close()
+        
+        # わずかな猶予を持たせてからプロセスを終了
+        await asyncio.sleep(1)
         sys.exit(0)
 
     @discord.ui.button(label="いいえ (キャンセル)", style=discord.ButtonStyle.secondary)
@@ -321,10 +319,9 @@ async def send_verify_button(interaction: discord.Interaction, title: str = "サ
     await target_channel.send(embed=embed, view=view)
     await interaction.response.send_message(f"{target_channel.mention} に認証ボタンを設置しました！", ephemeral=True)
 
-# 💡 bot.runをtry-exceptで囲み、Discordへの接続エラーを明確にキャッチする
 try:
     bot.run(TOKEN)
 except discord.errors.LoginFailure:
-    print("❌ エラー: Discordトークンが無効です。Developer Portalのトークンと一致しているか確認してください。")
+    print("❌ エラー: Discordトークンが無効です。")
 except Exception as e:
     print(f"❌ ボット起動中に予期せぬエラーが発生しました: {e}")
