@@ -140,6 +140,7 @@ class RestartConfirmView(discord.ui.View):
 # ==================== コマンドの定義 ====================
 
 # 🟢 一般メンバーも見ていいコマンド
+
 @bot.tree.command(name="hello", description="あいさつするコマンド")
 async def hello(interaction: discord.Interaction):
     await interaction.response.send_message(f"{interaction.user.mention} さん、おはよう")
@@ -155,6 +156,19 @@ async def say(interaction: discord.Interaction, message: str):
         return
     await interaction.channel.send(message)
     await interaction.response.send_message("メッセージを匿名で送信しました。", ephemeral=True)
+
+# 💡 【権限変更】一般メンバーでも見えるようにし、文言をアドミンコマンド用に修正しました
+@bot.tree.command(name="list_users", description="アドミンコマンドの使用を許可されているユーザーの一覧を表示します")
+async def list_users(interaction: discord.Interaction):
+    guild_id_str = str(interaction.guild.id)
+    all_data = load_data()
+    guild_config = get_guild_config(all_data, guild_id_str)
+    allowed_users = guild_config.get("allowed_users", [])
+    if not allowed_users:
+        await interaction.response.send_message("現在、アドミンコマンドの使用許可リストに登録されているユーザーはいません。\n※サーバー管理者は登録なしで使えます。", ephemeral=True)
+        return
+    user_mentions = [f"・<@{user_id}>" for user_id in allowed_users]
+    await interaction.response.send_message("【アドミンコマンド使用許可ユーザー一覧】\n" + "\n".join(user_mentions), ephemeral=True)
 
 
 # 🔴 管理系コマンド（管理者のみ表示）
@@ -198,7 +212,6 @@ async def set_announcement(interaction: discord.Interaction, channel: discord.Te
     save_data(all_data)
     await interaction.response.send_message(f"お知らせ設定を完了しました！\n【送信先】{channel.mention}\n【対象ロール】{role.mention}", ephemeral=True)
 
-# 💡 【新機能】お知らせ設定を解除（リセット）するコマンド（管理者のみ）
 @bot.tree.command(name="reset_announcement", description="お知らせチャンネルとロールの設定を解除します")
 @discord.app_commands.default_permissions(administrator=True)
 async def reset_announcement(interaction: discord.Interaction):
@@ -252,19 +265,6 @@ async def deny_user(interaction: discord.Interaction, user: discord.User):
         await interaction.response.send_message(f"{user.mention} を許可リストから削除しました。", ephemeral=True)
     else:
         await interaction.response.send_message(f"{user.mention} は元々許可リストに登録されていません。", ephemeral=True)
-
-@bot.tree.command(name="list_users", description="コマンドの使用を許可されているユーザーの一覧を表示します")
-@discord.app_commands.default_permissions(administrator=True)
-async def list_users(interaction: discord.Interaction):
-    guild_id_str = str(interaction.guild.id)
-    all_data = load_data()
-    guild_config = get_guild_config(all_data, guild_id_str)
-    allowed_users = guild_config.get("allowed_users", [])
-    if not allowed_users:
-        await interaction.response.send_message("現在、許可リストに登録されているユーザーはいません。", ephemeral=True)
-        return
-    user_mentions = [f"・<@{user_id}>" for user_id in allowed_users]
-    await interaction.response.send_message("【コマンド使用許可ユーザー一覧】\n" + "\n".join(user_mentions), ephemeral=True)
 
 @bot.tree.command(name="set_verify_role", description="認証ボタンを押したときに付与するロールを設定します")
 @discord.app_commands.default_permissions(administrator=True)
