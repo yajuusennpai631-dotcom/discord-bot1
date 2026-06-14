@@ -593,13 +593,13 @@ async def server_restart(interaction: discord.Interaction):
     await interaction.response.send_message("本当に再起動しますか？", view=RestartConfirmView(), ephemeral=True)
 
 
-# --- 💡 ここで環境に応じて安全にユーザーアプリ設定を上書きします ---
+# --- 💡 環境（バージョン）に応じて安全にユーザーアプリ設定を上書き ---
 for cmd in [my_memo, my_search, my_clip, my_scan, my_scan_channels]:
     try:
         cmd.contexts = [discord.app_commands.AppCommandContext.guild, discord.app_commands.AppCommandContext.dm_channel, discord.app_commands.AppCommandContext.private_channel]
         cmd.integration_types = [discord.app_commands.AppInstallationType.guild, discord.app_commands.AppInstallationType.user]
     except AttributeError:
-        # 古いバージョンで設定項目自体が存在しない場合は、何もしないでスルー
+        # 古いバージョンで設定項目自体が存在しない場合は、エラーを出さずにスルー
         pass
 
 
