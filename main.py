@@ -4,6 +4,7 @@ import os
 import discord
 from discord.ext import commands
 import json
+import sys  # 💡 システム終了を呼び出すために追加
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 GUILD_ID = 1488795327069945970
@@ -21,9 +22,15 @@ guild = discord.Object(id=GUILD_ID)
 # 💡 JSONファイルの保存先パス
 JSON_FILE = "allowed_users.json"
 
-# 💡 JSONからすべてのデータ（ユーザーリストとチャンネル設定）を読み込む関数
+# 💡 JSONからすべてのデータを読み込む関数
 def load_data():
-    default_data = {"allowed_users": [], "from_channel": None, "to_channel": None}
+    default_data = {
+        "allowed_users": [], 
+        "from_channel": None, 
+        "to_channel": None,
+        "announce_channel": None,
+        "announce_role": None
+    }
     if os.path.exists(JSON_FILE):
         try:
             with open(JSON_FILE, "r", encoding="utf-8") as f:
@@ -40,7 +47,9 @@ def save_data():
             data = {
                 "allowed_users": list(allowed_users),
                 "from_channel": forward_config["from_channel"],
-                "to_channel": forward_config["to_channel"]
+                "to_channel": forward_config["to_channel"],
+                "announce_channel": announce_config["announce_channel"],
+                "announce_role": announce_config["announce_role"]
             }
             json.dump(data, f, ensure_ascii=False, indent=4)
     except Exception as e:
@@ -52,6 +61,10 @@ allowed_users = set(saved_data.get("allowed_users", []))
 forward_config = {
     "from_channel": saved_data.get("from_channel"),
     "to_channel": saved_data.get("to_channel")
+}
+announce_config = {
+    "announce_channel": saved_data.get("announce_channel"),
+    "announce_role": saved_data.get("announce_role")
 }
 
 @bot.event
@@ -66,18 +79,51 @@ async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
-    # 設定された転送元・転送先チャンネルのIDがあるか確認
     from_id = forward_config["from_channel"]
     to_id = forward_config["to_channel"]
 
-    # 1. 設定された「転送元チャンネル」での発言かどうかチェック
-    # 2. 発言したユーザーが「管理者（Administrator）」かどうかチェック
     if from_id and to_id and message.channel.id == from_id and message.author.guild_permissions.administrator:
         to_channel = bot.get_channel(to_id)
         if to_channel:
             await to_channel.send(message.content)
 
     await bot.process_commands(message)
+
+# 💡 【新機能】再起動の確認プロンプト（ボタン）を表示するクラス
+class RestartConfirmView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=60) # 60秒間操作がなければ無効化
+
+    @discord.ui.button(label="はい (再起動)", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("この操作は管理者のみ実行できます。", ephemeral=True)
+            return
+            
+        await interaction.response.send_message("ボットを終了します。Railwayによる自動再起動をお待ちください...", ephemeral=True)
+        # ボットをログアウトさせてプログラムを終了する
+        await bot.close()
+        sys.exit(0)
+
+    @discord.ui.button(label="いいえ (キャンセル)", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message("再起動をキャンセルしました。", ephemeral=True)
+        self.stop()
+
+# 💡 【新機能】再起動コマンド（管理者のみ）
+@bot.tree.command(
+    name="restart",
+    description="ボットを再起動します（確認プロンプトを表示）",
+    guild=guild
+)
+async def restart(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("この管理コマンドはサーバーの管理者のみ実行できます。", ephemeral=True)
+        return
+        
+    # 確認ボタン付きのプロンプトを送信
+    view = RestartConfirmView()
+    await interaction.response.send_message("本当にボットを再起動しますか？", view=view, ephemeral=True)
 
 # 💡 転送元のチャンネルと転送先のチャンネルをコマンドで指定する（管理者のみ）
 @bot.tree.command(
@@ -94,7 +140,6 @@ async def set_forward(
         await interaction.response.send_message("この管理コマンドはサーバーの管理者のみ実行できます。", ephemeral=True)
         return
         
-    # 設定を更新してJSONに保存
     forward_config["from_channel"] = from_channel.id
     forward_config["to_channel"] = to_channel.id
     save_data()
@@ -106,7 +151,7 @@ async def set_forward(
         ephemeral=True
     )
 
-# 💡 【新機能】転送設定を解除（リセット）するコマンド（管理者のみ）
+# 💡 転送設定を解除（リセット）するコマンド（管理者のみ）
 @bot.tree.command(
     name="reset_forward",
     description="チャンネルの転送設定を解除します",
@@ -117,12 +162,65 @@ async def reset_forward(interaction: discord.Interaction):
         await interaction.response.send_message("この管理コマンドはサーバーの管理者のみ実行できます。", ephemeral=True)
         return
         
-    # 設定を空（None）にしてJSONに保存
     forward_config["from_channel"] = None
     forward_config["to_channel"] = None
     save_data()
     
     await interaction.response.send_message("チャンネルの転送設定をリセットしました。", ephemeral=True)
+
+# 💡 お知らせチャンネルと通知対象のロールを設定する（管理者のみ）
+@bot.tree.command(
+    name="set_announcement",
+    description="お知らせチャンネルと通知するロールを設定します",
+    guild=guild
+)
+async def set_announcement(
+    interaction: discord.Interaction, 
+    channel: discord.TextChannel, 
+    role: discord.Role
+):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("この管理コマンドはサーバーの管理者のみ実行できます。", ephemeral=True)
+        return
+        
+    announce_config["announce_channel"] = channel.id
+    announce_config["announce_role"] = role.id
+    save_data()
+    
+    await interaction.response.send_message(
+        f"お知らせ設定を完了しました！\n"
+        f"【送信先】{channel.mention}\n"
+        f"【対象ロール】{role.mention}", 
+        ephemeral=True
+    )
+
+# 💡 設定されたチャンネルにロールメンション付きでお知らせを送信する（管理者のみ）
+@bot.tree.command(
+    name="send_announcement",
+    description="設定されたチャンネルにロールメンション付きでお知らせを送信します",
+    guild=guild
+)
+async def send_announcement(interaction: discord.Interaction, message: str):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("この管理コマンドはサーバーの管理者のみ実行できます。", ephemeral=True)
+        return
+        
+    channel_id = announce_config["announce_channel"]
+    role_id = announce_config["announce_role"]
+    
+    if not channel_id or not role_id:
+        await interaction.response.send_message("お知らせチャンネル、またはロールが設定されていません。先に `/set_announcement` を実行してください。", ephemeral=True)
+        return
+        
+    target_channel = bot.get_channel(channel_id)
+    target_role = interaction.guild.get_role(role_id)
+    
+    if target_channel and target_role:
+        announcement_text = f"{target_role.mention}\n\n{message}"
+        await target_channel.send(announcement_text)
+        await interaction.response.send_message("お知らせを送信しました！", ephemeral=True)
+    else:
+        await interaction.response.send_message("チャンネルまたはロールが見つかりませんでした。再設定してください。", ephemeral=True)
 
 @bot.tree.command(
     name="hello",
