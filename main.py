@@ -63,22 +63,19 @@ def get_guild_config(all_data, guild_id_str):
     return all_data[guild_id_str]
 
 
-# 💡 動的なロールボタンを処理するビュークラス
 class DynamicRoleView(discord.ui.View):
     def __init__(self, roles):
         super().__init__(timeout=None)
         
-        # 4色をローテーションさせてお洒落に配置
         styles = [
-            discord.ButtonStyle.primary,   # 青
-            discord.ButtonStyle.success,   # 緑
-            discord.ButtonStyle.secondary, # グレー
-            discord.ButtonStyle.danger     # 赤
+            discord.ButtonStyle.primary,
+            discord.ButtonStyle.success,
+            discord.ButtonStyle.secondary,
+            discord.ButtonStyle.danger
         ]
         
         for i, role in enumerate(roles):
             style = styles[i % len(styles)]
-            # custom_idにロールIDを仕込んで永続化(ボット再起動でも動くようにする)
             button = discord.ui.Button(
                 label=role.name, 
                 style=style, 
@@ -111,7 +108,6 @@ class DynamicRoleView(discord.ui.View):
         return button_callback
 
 
-# 💡 認証ボタンを処理するクラス
 class VerifyButtonView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -149,7 +145,6 @@ class VerifyButtonView(discord.ui.View):
 async def on_ready():
     bot.add_view(VerifyButtonView())
     
-    # 💡 起動時に保存されているロールIDからボタンを再構築(永続化)
     all_data = load_data()
     for guild_id_str, config in all_data.items():
         panel_roles = config.get("panel_roles", [])
@@ -230,7 +225,30 @@ async def list_users(interaction: discord.Interaction):
 
 # 🔴 管理系コマンド（管理者のみ表示）
 
-# 💡 【新機能】お洒落で超便利なロール選択パネル生成コマンド
+# 💡 【新機能】チャンネルを簡単作成するコマンド
+@bot.tree.command(name="create_channel", description="新しいテキストチャンネルを作成します")
+@discord.app_commands.default_permissions(administrator=True)
+async def create_channel(
+    interaction: discord.Interaction, 
+    name: str, 
+    category: discord.CategoryChannel = None
+):
+    await interaction.response.defer(ephemeral=True)
+    guild = interaction.guild
+
+    try:
+        # カテゴリーが指定されている場合はその中に、ない場合はサーバーの一番上に作成
+        new_channel = await guild.create_text_channel(name=name, category=category)
+        
+        category_msg = f"（カテゴリー: {category.name}）" if category else ""
+        await interaction.followup.send(f"✅ 新しいテキストチャンネル {new_channel.mention} を作成しました！{category_msg}", ephemeral=True)
+        
+    except discord.Forbidden:
+        await interaction.followup.send("❌ ボットの権限が足りないため、チャンネルを作成できませんでした。ボットに『チャンネルの管理』権限が与えられているか確認してください。", ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"❌ チャンネルの作成中にエラーが発生しました: {e}", ephemeral=True)
+
+
 @bot.tree.command(name="create_role_panel", description="このチャンネルの権限を持つロールの選択パネルを自動生成します")
 @discord.app_commands.default_permissions(administrator=True)
 async def create_role_panel(
@@ -243,15 +261,12 @@ async def create_role_panel(
     channel = interaction.channel
     guild = interaction.guild
     
-    # チャンネルの権限オーバーライトからロールを抽出 (@everyoneとボット自身のロールは除外)
     detected_roles = []
     for target, overwrite in channel.overwrites.items():
         if isinstance(target, discord.Role) and target != guild.default_role:
-            # 閲覧権限がある、もしくは何かしらの権限が許可されているロール
             if overwrite.view_channel is True or overwrite.read_messages is True:
                 detected_roles.append(target)
                 
-    # 順序をDiscordの役職の並び順（上にあるものが先）にソートしてお洒落にする
     detected_roles.sort(key=lambda r: r.position, reverse=True)
 
     if not detected_roles:
@@ -262,14 +277,12 @@ async def create_role_panel(
         await interaction.followup.send("⚠️ Discordの仕様上、一度に設置できるボタンは25個までです。ロールの数を減らしてください。", ephemeral=True)
         return
 
-    # データを永続化保存
     guild_id_str = str(guild.id)
     all_data = load_data()
     guild_config = get_guild_config(all_data, guild_id_str)
     guild_config["panel_roles"] = [r.id for r in detected_roles]
     save_data(all_data)
 
-    # EmbedとViewの作成
     embed = discord.Embed(title=title, description=description, color=discord.Color.blurple())
     if image_file:
         embed.set_image(url=image_file.url)
