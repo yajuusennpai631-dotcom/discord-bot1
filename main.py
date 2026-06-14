@@ -3,7 +3,7 @@ print("=== WINDOWS_TEST_0614 ===")
 import os
 import discord
 from discord.ext import commands
-# ...以下はそのまま...
+
 TOKEN = os.getenv("DISCORD_TOKEN")
 GUILD_ID = 1488795327069945970
 
@@ -29,6 +29,7 @@ async def on_ready():
     guild=guild
 )
 async def hello(interaction: discord.Interaction):
-    await interaction.response.send_message("おはよう")
+    # 原型を崩さず、メッセージ部分だけをユーザーのメンション付きに変更しました
+    await interaction.response.send_message(f"{interaction.user.mention} さん、おはよう")
 
 bot.run(TOKEN)
