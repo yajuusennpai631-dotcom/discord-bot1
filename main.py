@@ -1,4 +1,4 @@
-print("=== WINDOWS_TEST_0614 ===")
+print("=== WINDOWS_TEST_0614_FULL_SECURE ===")
 
 import os
 import discord
@@ -8,6 +8,8 @@ import sys
 import asyncio
 import urllib.request
 import urllib.parse
+import base64
+import requests
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 
@@ -466,6 +468,69 @@ async def my_scan_channels(interaction: discord.Interaction):
     await interaction.followup.send(embed=discord.Embed(title="フルスキャン結果", description=full_rep[:1950], color=discord.Color.red()), ephemeral=True)
 
 
+@bot.tree.command(name="my_audit_perms", description="【セキュリティ】@everyoneの権限設定をスキャン")
+async def my_audit_perms(interaction: discord.Interaction):
+    if not await is_owner_check(interaction): return
+    if not interaction.guild:
+        await interaction.response.send_message("サーバー内で実行してください。", ephemeral=True)
+        return
+        
+    await interaction.response.defer(ephemeral=True)
+    
+    report = []
+    for channel in interaction.guild.text_channels:
+        everyone_perms = channel.permissions_for(interaction.guild.default_role)
+        issues = []
+        if everyone_perms.view_channel:
+            issues.append("閲覧")
+        if everyone_perms.send_messages:
+            issues.append("送信")
+            
+        if issues:
+            report.append(f"⚠️ {channel.mention} : @everyone に「{', '.join(issues)}」権限あり")
+            
+    if not report:
+        await interaction.followup.send("✅ チェック完了: @everyone に不適切な権限はありません。", ephemeral=True)
+    else:
+        embed = discord.Embed(
+            title="権限スキャン結果", 
+            description="以下のチャンネルの設定を確認してください：\n\n" + "\n".join(report), 
+            color=discord.Color.red()
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="my_check_url", description="【セキュリティ】URLの安全性をVirusTotalでチェック")
+async def my_check_url(interaction: discord.Interaction, url: str):
+    if not await is_owner_check(interaction): return
+    await interaction.response.defer(ephemeral=True)
+    
+    api_key = os.getenv("VT_API_KEY")
+    if not api_key:
+        await interaction.followup.send("エラー: 環境変数 'VT_API_KEY' が設定されていません。", ephemeral=True)
+        return
+
+    url_id = base64.urlsafe_b64encode(url.encode()).decode().strip("=")
+    headers = {"x-apikey": api_key}
+    
+    try:
+        response = requests.get(f"https://www.virustotal.com/api/v3/urls/{url_id}", headers=headers)
+        data = response.json()
+        if "error" in data:
+            await interaction.followup.send("このURLのスキャンデータが見つかりませんでした。誰もスキャンしたことがない未知のURLの可能性があります。", ephemeral=True)
+            return
+        stats = data["data"]["attributes"]["last_analysis_stats"]
+        malicious = stats["malicious"]
+        suspicious = stats["suspicious"]
+        color = discord.Color.green() if (malicious + suspicious) == 0 else discord.Color.red()
+        msg = f"**判定結果:**\n危険なエンジン: {malicious}件\n怪しいエンジン: {suspicious}件"
+        embed = discord.Embed(title="URLスキャン結果", description=msg, color=color)
+        embed.add_field(name="対象URL", value=url[:100], inline=False)
+        await interaction.followup.send(embed=embed, ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"エラーが発生しました: {e}", ephemeral=True)
+
+
 # ==================== 【サーバー管理コマンド】 ====================
 
 @bot.tree.command(name="server_list_users", description="【管理】使用許可リストの確認・編集を行います")
@@ -546,7 +611,8 @@ async def server_announce_send(interaction: discord.Interaction, message: str):
     if not interaction.guild or not interaction.user.guild_permissions.administrator: return
     all_data = load_data()
     cfg = get_guild_config(all_data, str(interaction.guild.id))
-    ch, r = bot.get_channel(cfg.get("announce_channel")), interaction.guild.get_role(cfg.get("announce_role", 0))
+    ch = bot.get_channel(cfg.get("announce_channel"))
+    r = interaction.guild.get_role(cfg.get("announce_role", 0))
     if ch and r:
         await ch.send(f"{r.mention}\n\n{message}")
         await interaction.response.send_message("お知らせを送信しました。", ephemeral=True)
@@ -594,7 +660,7 @@ async def server_restart(interaction: discord.Interaction):
 
 
 # --- 💡 環境（バージョン）に応じて安全にユーザーアプリ設定を上書き ---
-for cmd in [my_memo, my_search, my_clip, my_scan, my_scan_channels]:
+for cmd in [my_memo, my_search, my_clip, my_scan, my_scan_channels, my_audit_perms, my_check_url]:
     try:
         cmd.contexts = [discord.app_commands.AppCommandContext.guild, discord.app_commands.AppCommandContext.dm_channel, discord.app_commands.AppCommandContext.private_channel]
         cmd.integration_types = [discord.app_commands.AppInstallationType.guild, discord.app_commands.AppInstallationType.user]
