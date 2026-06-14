@@ -106,6 +106,24 @@ async def set_forward(
         ephemeral=True
     )
 
+# 💡 【新機能】転送設定を解除（リセット）するコマンド（管理者のみ）
+@bot.tree.command(
+    name="reset_forward",
+    description="チャンネルの転送設定を解除します",
+    guild=guild
+)
+async def reset_forward(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("この管理コマンドはサーバーの管理者のみ実行できます。", ephemeral=True)
+        return
+        
+    # 設定を空（None）にしてJSONに保存
+    forward_config["from_channel"] = None
+    forward_config["to_channel"] = None
+    save_data()
+    
+    await interaction.response.send_message("チャンネルの転送設定をリセットしました。", ephemeral=True)
+
 @bot.tree.command(
     name="hello",
     description="あいさつするコマンド",
@@ -138,7 +156,7 @@ async def allow_user(interaction: discord.Interaction, user: discord.User):
         return
         
     allowed_users.add(user.id)
-    save_data()  # 共通の保存関数に変更
+    save_data()
     await interaction.response.send_message(f"{user.mention} を許可リストに追加しました。", ephemeral=True)
 
 @bot.tree.command(
@@ -153,7 +171,7 @@ async def deny_user(interaction: discord.Interaction, user: discord.User):
         
     if user.id in allowed_users:
         allowed_users.remove(user.id)
-        save_data()  # 共通の保存関数に変更
+        save_data()
         await interaction.response.send_message(f"{user.mention} を許可リストから削除しました。", ephemeral=True)
     else:
         await interaction.response.send_message(f"{user.mention} は元々許可リストに登録されていません。", ephemeral=True)
