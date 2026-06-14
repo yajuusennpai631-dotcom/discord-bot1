@@ -62,6 +62,74 @@ def get_guild_config(all_data, guild_id_str):
         }
     return all_data[guild_id_str]
 
+def create_user_list_embed(allowed_users):
+    """許可リストのEmbedを生成する共通ヘルパー関数"""
+    embed = discord.Embed(
+        title="👥 アドミンコマンド使用許可ユーザー一覧", 
+        description="現在、以下のユーザーに管理者用コマンドの使用権限が与えられています。\n※サーバー管理者は登録なしで最初からすべてのコマンドを使用できます。",
+        color=discord.Color.dark_blue()
+    )
+    if not allowed_users:
+        embed.add_field(name="【登録ユーザー】", value="現在、登録されているユーザーはいません。", inline=False)
+        embed.set_footer(text="現在の登録者数: 0名")
+    else:
+        user_mentions = [f"・<@{user_id}>" for user_id in allowed_users]
+        embed.add_field(name="【登録ユーザー】", value="\n".join(user_mentions), inline=False)
+        embed.set_footer(text=f"現在の登録者数: {len(allowed_users)}名")
+    return embed
+
+
+# 💡 【新機能】直感的に追加・削除ができる管理用UIビュー
+class UserManageView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=300) # 5分間操作可能
+
+    # ユーザー追加用ドロップダウン
+    @discord.ui.select(cls=discord.ui.UserSelect, placeholder="👤 許可ユーザーを追加する...", custom_id="manage_add_user")
+    async def add_user_callback(self, interaction: discord.Interaction, select: discord.ui.UserSelect):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("この操作は管理者のみ実行できます。", ephemeral=True)
+            return
+
+        target_user = select.values[0]
+        guild_id_str = str(interaction.guild.id)
+        all_data = load_data()
+        guild_config = get_guild_config(all_data, guild_id_str)
+
+        if target_user.id not in guild_config["allowed_users"]:
+            guild_config["allowed_users"].append(target_user.id)
+            save_data(all_data)
+            
+            # 埋め込みとUIをその場で最新の状態に更新
+            updated_embed = create_user_list_embed(guild_config["allowed_users"])
+            await interaction.response.edit_message(embed=updated_embed, view=self)
+            await interaction.followup.send(f"✅ {target_user.mention} を許可リストに追加しました。", ephemeral=True)
+        else:
+            await interaction.response.send_message(f"ℹ️ {target_user.mention} は既に登録されています。", ephemeral=True)
+
+    # ユーザー削除用ドロップダウン
+    @discord.ui.select(cls=discord.ui.UserSelect, placeholder="❌ 許可ユーザーを削除する...", custom_id="manage_remove_user")
+    async def remove_user_callback(self, interaction: discord.Interaction, select: discord.ui.UserSelect):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("この操作は管理者のみ実行できます。", ephemeral=True)
+            return
+
+        target_user = select.values[0]
+        guild_id_str = str(interaction.guild.id)
+        all_data = load_data()
+        guild_config = get_guild_config(all_data, guild_id_str)
+
+        if target_user.id in guild_config["allowed_users"]:
+            guild_config["allowed_users"].remove(target_user.id)
+            save_data(all_data)
+            
+            # 埋め込みとUIをその場で最新の状態に更新
+            updated_embed = create_user_list_embed(guild_config["allowed_users"])
+            await interaction.response.edit_message(embed=updated_embed, view=self)
+            await interaction.followup.send(f"❌ {target_user.mention} を許可リストから削除しました。", ephemeral=True)
+        else:
+            await interaction.response.send_message(f"ℹ️ {target_user.mention} は元々登録されていません。", ephemeral=True)
+
 
 class DynamicRoleView(discord.ui.View):
     def __init__(self, roles):
@@ -210,22 +278,24 @@ class RestartConfirmView(discord.ui.View):
 async def hello(interaction: discord.Interaction):
     await interaction.response.send_message(f"{interaction.user.mention} さん、おはよう")
 
-@bot.tree.command(name="list_users", description="アドミンコマンドの使用を許可されているユーザーの一覧を表示します")
+# 💡 【超絶強化】使用許可リストにその場で追加・削除ができるインタラクティブ機能を追加
+@bot.tree.command(name="list_users", description="使用許可リストの確認、および追加・削除を画面上で行います")
+@discord.app_commands.default_permissions(administrator=True)
 async def list_users(interaction: discord.Interaction):
     guild_id_str = str(interaction.guild.id)
     all_data = load_data()
     guild_config = get_guild_config(all_data, guild_id_str)
     allowed_users = guild_config.get("allowed_users", [])
-    if not allowed_users:
-        await interaction.response.send_message("現在、アドミンコマンドの使用許可リストに登録されているユーザーはいません。\n※サーバー管理者は登録なしで使えます。", ephemeral=True)
-        return
-    user_mentions = [f"・<@{user_id}>" for user_id in allowed_users]
-    await interaction.response.send_message("【アドミンコマンド使用許可ユーザー一覧】\n" + "\n".join(user_mentions), ephemeral=True)
+    
+    embed = create_user_list_embed(allowed_users)
+    view = UserManageView()
+
+    # 管理者本人にだけ表示されるので、安全にポチポチ操作できます
+    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 
 # 🔴 管理系コマンド（管理者のみ表示）
 
-# 💡 【新機能】チャンネルを簡単作成するコマンド
 @bot.tree.command(name="create_channel", description="新しいテキストチャンネルを作成します")
 @discord.app_commands.default_permissions(administrator=True)
 async def create_channel(
@@ -237,12 +307,9 @@ async def create_channel(
     guild = interaction.guild
 
     try:
-        # カテゴリーが指定されている場合はその中に、ない場合はサーバーの一番上に作成
         new_channel = await guild.create_text_channel(name=name, category=category)
-        
         category_msg = f"（カテゴリー: {category.name}）" if category else ""
         await interaction.followup.send(f"✅ 新しいテキストチャンネル {new_channel.mention} を作成しました！{category_msg}", ephemeral=True)
-        
     except discord.Forbidden:
         await interaction.followup.send("❌ ボットの権限が足りないため、チャンネルを作成できませんでした。ボットに『チャンネルの管理』権限が与えられているか確認してください。", ephemeral=True)
     except Exception as e:
@@ -374,30 +441,6 @@ async def send_announcement(interaction: discord.Interaction, message: str):
         await interaction.response.send_message("お知らせを送信しました！", ephemeral=True)
     else:
         await interaction.response.send_message("チャンネルまたはロールが見つかりませんでした。再設定してください。", ephemeral=True)
-
-@bot.tree.command(name="allow_user", description="コマンドの使用を許可するユーザーを追加します")
-@discord.app_commands.default_permissions(administrator=True)
-async def allow_user(interaction: discord.Interaction, user: discord.User):
-    guild_id_str = str(interaction.guild.id)
-    all_data = load_data()
-    guild_config = get_guild_config(all_data, guild_id_str)
-    if user.id not in guild_config["allowed_users"]:
-        guild_config["allowed_users"].append(user.id)
-    save_data(all_data)
-    await interaction.response.send_message(f"{user.mention} を許可リストに追加しました。", ephemeral=True)
-
-@bot.tree.command(name="deny_user", description="コマンドの使用許可リストからユーザーを削除します")
-@discord.app_commands.default_permissions(administrator=True)
-async def deny_user(interaction: discord.Interaction, user: discord.User):
-    guild_id_str = str(interaction.guild.id)
-    all_data = load_data()
-    guild_config = get_guild_config(all_data, guild_id_str)
-    if user.id in guild_config["allowed_users"]:
-        guild_config["allowed_users"].remove(user.id)
-        save_data(all_data)
-        await interaction.response.send_message(f"{user.mention} を許可リストから削除しました。", ephemeral=True)
-    else:
-        await interaction.response.send_message(f"{user.mention} は元々許可リストに登録されていません。", ephemeral=True)
 
 @bot.tree.command(name="set_verify_role", description="認証ボタンを押したときに付与するロールを設定します")
 @discord.app_commands.default_permissions(administrator=True)
