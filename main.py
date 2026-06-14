@@ -79,12 +79,10 @@ def create_user_list_embed(allowed_users):
     return embed
 
 
-# 💡 【新機能】直感的に追加・削除ができる管理用UIビュー
 class UserManageView(discord.ui.View):
     def __init__(self):
-        super().__init__(timeout=300) # 5分間操作可能
+        super().__init__(timeout=300)
 
-    # ユーザー追加用ドロップダウン
     @discord.ui.select(cls=discord.ui.UserSelect, placeholder="👤 許可ユーザーを追加する...", custom_id="manage_add_user")
     async def add_user_callback(self, interaction: discord.Interaction, select: discord.ui.UserSelect):
         if not interaction.user.guild_permissions.administrator:
@@ -100,14 +98,12 @@ class UserManageView(discord.ui.View):
             guild_config["allowed_users"].append(target_user.id)
             save_data(all_data)
             
-            # 埋め込みとUIをその場で最新の状態に更新
             updated_embed = create_user_list_embed(guild_config["allowed_users"])
             await interaction.response.edit_message(embed=updated_embed, view=self)
             await interaction.followup.send(f"✅ {target_user.mention} を許可リストに追加しました。", ephemeral=True)
         else:
             await interaction.response.send_message(f"ℹ️ {target_user.mention} は既に登録されています。", ephemeral=True)
 
-    # ユーザー削除用ドロップダウン
     @discord.ui.select(cls=discord.ui.UserSelect, placeholder="❌ 許可ユーザーを削除する...", custom_id="manage_remove_user")
     async def remove_user_callback(self, interaction: discord.Interaction, select: discord.ui.UserSelect):
         if not interaction.user.guild_permissions.administrator:
@@ -123,7 +119,6 @@ class UserManageView(discord.ui.View):
             guild_config["allowed_users"].remove(target_user.id)
             save_data(all_data)
             
-            # 埋め込みとUIをその場で最新の状態に更新
             updated_embed = create_user_list_embed(guild_config["allowed_users"])
             await interaction.response.edit_message(embed=updated_embed, view=self)
             await interaction.followup.send(f"❌ {target_user.mention} を許可リストから削除しました。", ephemeral=True)
@@ -231,22 +226,30 @@ async def on_ready():
     print(f"🤖 Logged in as {bot.user}")
 
 
+# 💡 【重要修正】メッセージ転送のサーバー間混線を完全に防止しました
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot or not message.guild:
         return
 
+    # メッセージが送信された「現在のサーバー」のIDをもとに設定を取得
     guild_id_str = str(message.guild.id)
     all_data = load_data()
-    guild_config = get_guild_config(all_data, guild_id_str)
+    
+    # 該当サーバーの設定が存在する場合のみ処理する（他サーバーの設定との混線を防ぐ）
+    if guild_id_str in all_data:
+        guild_config = all_data[guild_id_str]
+        from_id = guild_config.get("from_channel")
+        to_id = guild_config.get("to_channel")
 
-    from_id = guild_config.get("from_channel")
-    to_id = guild_config.get("to_channel")
-
-    if from_id and to_id and message.channel.id == from_id and message.author.guild_permissions.administrator:
-        to_channel = bot.get_channel(to_id)
-        if to_channel:
-            await to_channel.send(message.content)
+        # 送信されたチャンネルが、そのサーバーで設定された転送元と一致するかチェック
+        if from_id and to_id and message.channel.id == from_id:
+            # 転送できるのはサーバーの管理者（Administrator）のみ
+            if message.author.guild_permissions.administrator:
+                # 転送先チャンネルを「現在のサーバー内」から取得
+                to_channel = message.guild.get_channel(to_id)
+                if to_channel:
+                    await to_channel.send(message.content)
 
     await bot.process_commands(message)
 
@@ -278,7 +281,6 @@ class RestartConfirmView(discord.ui.View):
 async def hello(interaction: discord.Interaction):
     await interaction.response.send_message(f"{interaction.user.mention} さん、おはよう")
 
-# 💡 【超絶強化】使用許可リストにその場で追加・削除ができるインタラクティブ機能を追加
 @bot.tree.command(name="list_users", description="使用許可リストの確認、および追加・削除を画面上で行います")
 @discord.app_commands.default_permissions(administrator=True)
 async def list_users(interaction: discord.Interaction):
@@ -290,7 +292,6 @@ async def list_users(interaction: discord.Interaction):
     embed = create_user_list_embed(allowed_users)
     view = UserManageView()
 
-    # 管理者本人にだけ表示されるので、安全にポチポチ操作できます
     await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 
