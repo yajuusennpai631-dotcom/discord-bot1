@@ -285,9 +285,9 @@ async def on_ready():
     print("スラッシュコマンドを更新したい場合は、サーバー上で '!sync' と発言してください。")
 
 
-# 【変更箇所】明確に管理者権限を要求し、権限エラー時のハンドリングを追加しました
+# 【変更箇所】管理者権限（has_permissions）から、Botオーナー限定（is_owner）に切り替えました
 @bot.command(name="sync")
-@commands.has_permissions(administrator=True)
+@commands.is_owner()
 async def sync_command(ctx):
     await ctx.send("Discordにスラッシュコマンドを同期中... 少々お待ちください。")
     try:
@@ -298,8 +298,8 @@ async def sync_command(ctx):
 
 @sync_command.error
 async def sync_command_error(ctx, error):
-    if isinstance(error, commands.MissingPermissions):
-        await ctx.send("このコマンドは管理者権限を持つユーザーのみ実行できます。")
+    if isinstance(error, commands.NotOwner):
+        await ctx.send("このコマンドはBotの所有者（オーナー）のみ実行できます。")
 
 
 @bot.event
@@ -549,7 +549,7 @@ async def owner_status(interaction: discord.Interaction, text: str):
     
     try:
         await bot.change_presence(activity=discord.CustomActivity(name=text))
-        await interaction.response.send_message(f"Botのステータスを「{text}」変更しました。", ephemeral=True)
+        await interaction.response.send_message(f"Botのステータスを「{text}」に変更しました。", ephemeral=True)
     except Exception as e:
         await interaction.response.send_message(f"ステータスの変更中にエラーが発生しました: {e}", ephemeral=True)
 
