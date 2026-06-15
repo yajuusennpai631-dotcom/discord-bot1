@@ -275,6 +275,15 @@ async def on_ready():
     bot.add_view(VerifyButtonView())
     all_data = load_data()
     
+    # 【変更点①】!sync コマンドを確実に動作させるため、起動時にオーナーIDを確定・キャッシュする
+    if bot.owner_id is None:
+        try:
+            app_info = await bot.application_info()
+            bot.owner_id = app_info.owner.id
+            print(f"[システム] オーナーIDを確定しました: {bot.owner_id}")
+        except Exception as e:
+            print(f"[警告] オーナー情報の取得に失敗しました: {e}")
+
     try:
         await update_bot_status(bot)
     except Exception as e:
@@ -356,18 +365,31 @@ async def on_message(message: discord.Message):
         if trigger_ch_id and target_role_id and message.channel.id == trigger_ch_id:
             role = message.guild.get_role(target_role_id)
             if role:
-                # 投稿内容を改行を挟んで下に埋め込む形にします（中身が空でない場合のみ付与）
                 content_text = f"\n>>> {message.content}" if message.content else ""
                 full_reply_text = f"{role.mention} {custom_msg}{content_text}"
                 
-                # 送信メッセージの文字数上限（2000文字）を超えないように安全策
                 if len(full_reply_text) > 2000:
                     full_reply_text = full_reply_text[:1997] + "..."
                 
-                await message.reply(
-                    full_reply_text, 
-                    allowed_mentions=discord.AllowedMentions(roles=True)
-                )
+                # 【変更点②】Reply権限やメッセージ履歴閲覧権限がない場合のクラッシュを防ぐ対策
+                try:
+                    await message.reply(
+                        full_reply_text, 
+                        allowed_mentions=discord.AllowedMentions(roles=[role]) # 明示的に対象ロールを指定して確実にメンション
+                    )
+                    print(f"[自動返信成功] ch: #{message.channel.name} でロール @{role.name} 宛てに送信しました。")
+                except discord.Forbidden:
+                    # 「メッセージ履歴の閲覧」権限がないとReplyで落ちるため、通常のメッセージ送信に切り替える（フォールバック）
+                    try:
+                        await message.channel.send(
+                            full_reply_text,
+                            allowed_mentions=discord.AllowedMentions(roles=[role])
+                        )
+                        print(f"[自動返信フォールバック] 返信権限がないため、通常メッセージとして送信しました。")
+                    except Exception as e:
+                        print(f"[自動返信エラー] 通常送信も失敗しました。Botの権限を確認してください: {e}")
+                except Exception as e:
+                    print(f"[自動返信エラー] 不明なエラーが発生しました: {e}")
 
     await bot.process_commands(message)
 
@@ -945,21 +967,28 @@ async def server_mention_setup(interaction: discord.Interaction, channel: discor
         await interaction.response.send_message("このコマンドはサーバー管理者専用です。", ephemeral=True)
         return
 
-    all_data = load_data()
-    cfg = get_guild_config(all_data, str(interaction.guild.id))
-    cfg["mention_trigger_channel"] = channel.id
-    cfg["mention_target_role"] = role.id
-    cfg["mention_custom_message"] = text  
-    save_data(all_data)
-    
-    await interaction.response.send_message(
-        f"自動返信ロールメンション（本文引用付き）を構築しました！\n"
-        f"・監視チャンネル: {channel.mention}\n"
-        f"・通知するロール: {role.mention}\n"
-        f"・返信するテキスト: `{text}`\n"
-        f"※誰かが書き込むと、Botがメッセージを引用しながらロールメンションを付けてインライン返信します。", 
-        ephemeral=True
-    )
+    # 【変更点③】処理のタイムアウトを防ぐため、最初に応答の保留（defer）を入れる
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        all_data = load_data()
+        cfg = get_guild_config(all_data, str(interaction.guild.id))
+        cfg["mention_trigger_channel"] = channel.id
+        cfg["mention_target_role"] = role.id
+        cfg["mention_custom_message"] = text  
+        save_data(all_data)
+        
+        # deferをしているため、応答は interaction.followup.send を使用する
+        await interaction.followup.send(
+            f"自動返信ロールメンション（本文引用付き）を構築しました！\n"
+            f"・監視チャンネル: {channel.mention}\n"
+            f"・通知するロール: {role.mention}\n"
+            f"・返信するテキスト: `{text}`\n"
+            f"※誰かが書き込むと、Botがメッセージを引用しながらロールメンションを付けてインライン返信します。", 
+            ephemeral=True
+        )
+    except Exception as e:
+        await interaction.followup.send(f"設定の保存中にエラーが発生しました: {e}", ephemeral=True)
 
 
 @bot.tree.command(name="server_mention_reset", description="自動ロールメンションの監視・返信設定を解除します")
@@ -970,13 +999,19 @@ async def server_mention_reset(interaction: discord.Interaction):
         await interaction.response.send_message("このコマンドはサーバー管理者専用です。", ephemeral=True)
         return
 
-    all_data = load_data()
-    cfg = get_guild_config(all_data, str(interaction.guild.id))
-    cfg["mention_trigger_channel"] = None
-    cfg["mention_target_role"] = None
-    cfg["mention_custom_message"] = None
-    save_data(all_data)
-    
-    await interaction.response.send_message("自動返信ロールメンションの設定を解除しました。", ephemeral=True)
+    # 【変更点③】こちらもタイムアウトを防ぐための defer を導入
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        all_data = load_data()
+        cfg = get_guild_config(all_data, str(interaction.guild.id))
+        cfg["mention_trigger_channel"] = None
+        cfg["mention_target_role"] = None
+        cfg["mention_custom_message"] = None
+        save_data(all_data)
+        
+        await interaction.followup.send("自動返信ロールメンションの設定を解除しました。", ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"設定の解除中にエラーが発生しました: {e}", ephemeral=True)
 
 bot.run(TOKEN)
