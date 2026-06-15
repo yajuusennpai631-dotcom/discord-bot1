@@ -285,15 +285,21 @@ async def on_ready():
     print("スラッシュコマンドを更新したい場合は、サーバー上で '!sync' と発言してください。")
 
 
+# 【変更箇所】明確に管理者権限を要求し、権限エラー時のハンドリングを追加しました
 @bot.command(name="sync")
+@commands.has_permissions(administrator=True)
 async def sync_command(ctx):
-    if ctx.author.guild_permissions.administrator:
-        await ctx.send("Discordにスラッシュコマンドを同期中... 少々お待ちください。")
-        try:
-            await bot.tree.sync()
-            await ctx.send("スラッシュコマンドの同期が完了しました。Discordアプリを再起動して確認してください。")
-        except discord.errors.HTTPException as e:
-            await ctx.send(f"Discord側で一時的な制限がかかっています。5〜10分ほど置いて再度試してください。\nエラー内容: `{e}`")
+    await ctx.send("Discordにスラッシュコマンドを同期中... 少々お待ちください。")
+    try:
+        await bot.tree.sync()
+        await ctx.send("スラッシュコマンドの同期が完了しました。Discordアプリを再起動して確認してください。")
+    except discord.errors.HTTPException as e:
+        await ctx.send(f"Discord側で一時的な制限がかかっています。5〜10分ほど置いて再度試してください。\nエラー内容: `{e}`")
+
+@sync_command.error
+async def sync_command_error(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("このコマンドは管理者権限を持つユーザーのみ実行できます。")
 
 
 @bot.event
@@ -316,7 +322,6 @@ async def on_message(message: discord.Message):
 
 @bot.tree.command(name="help", description="Botの利用可能なコマンド一覧をカテゴリ別に表示します")
 async def help_command(interaction: discord.Interaction):
-    # Embedタイトルや各フィールド名から絵文字を削除しました
     embed = discord.Embed(
         title="マクマクBOT コマンド一覧",
         description="このBotで利用できるスラッシュコマンドの一覧です。\n権限に応じて使用できるコマンドが異なります。",
@@ -544,7 +549,7 @@ async def owner_status(interaction: discord.Interaction, text: str):
     
     try:
         await bot.change_presence(activity=discord.CustomActivity(name=text))
-        await interaction.response.send_message(f"Botのステータスを「{text}」に変更しました。", ephemeral=True)
+        await interaction.response.send_message(f"Botのステータスを「{text}」変更しました。", ephemeral=True)
     except Exception as e:
         await interaction.response.send_message(f"ステータスの変更中にエラーが発生しました: {e}", ephemeral=True)
 
