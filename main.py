@@ -84,7 +84,7 @@ def create_user_list_embed(allowed_users):
         color=discord.Color.blue()
     )
     if not allowed_users:
-        embed.add_field(name="登録ユーザー", value="現在登録されているユーザーはいません。", inline=False)
+        embed.add_field(name="登録ユーザー", value="開示できるユーザーはいません。", inline=False)
         embed.set_footer(text=f"登録者数: 0名")
     else:
         user_mentions = [f"・<@{user_id}>" for user_id in allowed_users]
@@ -256,6 +256,13 @@ class VerifyButtonView(discord.ui.View):
 async def on_ready():
     bot.add_view(VerifyButtonView())
     all_data = load_data()
+    
+    # 【追加機能】起動時にデフォルトで「マクマクBOT稼働中」のステータスをセット
+    try:
+        await bot.change_presence(activity=discord.CustomActivity(name="マクマクBOT稼働中"))
+        print("初期ステータス『マクマクBOT稼働中』を設定しました。")
+    except Exception as e:
+        print(f"初期ステータス設定エラー: {e}")
     
     print("--- 起動完了: 現在のサーバー設定一覧 ---")
     for guild_id_str, config in all_data.items():
@@ -469,6 +476,19 @@ async def my_clip(interaction: discord.Interaction, action: discord.app_commands
         await interaction.response.send_message("全ての個人クリップを消去しました。", ephemeral=True)
 
 
+# ==================== 【BOT所有者（オーナー）専用コマンド】 ====================
+
+@bot.tree.command(name="owner_status", description="【オーナー限定】Botのステータス（カスタムアクティビティ）をリアルタイムで変更します")
+async def owner_status(interaction: discord.Interaction, text: str):
+    if not await is_owner_check(interaction): return
+    
+    try:
+        await bot.change_presence(activity=discord.CustomActivity(name=text))
+        await interaction.response.send_message(f"Botのステータスを「{text}」に変更しました。", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"ステータスの変更中にエラーが発生しました: {e}", ephemeral=True)
+
+
 # ==================== 【管理者・許可ユーザー専用コマンド】 ====================
 
 @bot.tree.command(name="my_scan_channels", description="サーバーのチャンネル構造とカスタム権限をスキャン")
@@ -501,7 +521,6 @@ async def my_audit_perms(interaction: discord.Interaction):
     if not await is_admin_or_allowed(interaction): return
     if not interaction.guild: return
         
-    # ephemeral=False に変更し、全体に見えるように公開
     await interaction.response.defer(ephemeral=False)
     
     report = []
