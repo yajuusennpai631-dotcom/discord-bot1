@@ -257,7 +257,6 @@ async def on_ready():
     bot.add_view(VerifyButtonView())
     all_data = load_data()
     
-    # 【追加機能】起動時にデフォルトで「マクマクBOT稼働中」のステータスをセット
     try:
         await bot.change_presence(activity=discord.CustomActivity(name="マクマクBOT稼働中"))
         print("初期ステータス『マクマクBOT稼働中』を設定しました。")
@@ -315,6 +314,71 @@ async def on_message(message: discord.Message):
 
 
 # ==================== 【一般ユーザー・プレイヤー向け機能】 ====================
+
+@bot.tree.command(name="help", description="Botの利用可能なコマンド一覧をカテゴリ別に表示します")
+async def help_command(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="🤖 マクマクBOT コマンド一覧",
+        description="このBotで利用できるスラッシュコマンドの一覧です。\n権限に応じて使用できるコマンドが異なります。",
+        color=discord.Color.blue()
+    )
+    
+    embed.add_field(
+        name="👥 一般ユーザー・プレイヤー向け機能",
+        value=(
+            "`/help` : このコマンド一覧を埋め込み形式で表示します\n"
+            "`/hello` : Botが挨拶を返します\n"
+            "`/search` : 各種検索サイトやWikipediaのリンク・概要を生成します\n"
+            "`/my_scan` : 実行したサーバーの基本情報を確認します"
+        ),
+        inline=False
+    )
+    
+    embed.add_field(
+        name="🔒 個人用プライベート機能 (他の人には見えません)",
+        value=(
+            "`/my_memo` : あなた専用の個人メモを追加・一覧表示・削除・全消去します\n"
+            "`/my_clip` : あなた専用のクリップ（テキストやリンク）を保存・管理します"
+        ),
+        inline=False
+    )
+    
+    embed.add_field(
+        name="🛡️ 管理者・許可ユーザー専用コマンド",
+        value=(
+            "`/my_scan_channels` : サーバーのチャンネル構造とカスタム権限をスキャンします\n"
+            "`/my_audit_perms` : @everyone の不適切な権限をスキャンします（全員に公開）\n"
+            "`/my_check_url` : URLの安全性をVirusTotalでチェックします"
+        ),
+        inline=False
+    )
+    
+    embed.add_field(
+        name="⚙️ サーバー管理者専用コマンド (要・管理者権限)",
+        value=(
+            "`/server_status` : 現在の各種機能の設定状況を確認します\n"
+            "`/server_list_users` : コマンド使用許可リストの確認・編集を行います\n"
+            "`/server_create_channel` : 新しいテキストチャンネルを作成します\n"
+            "`/server_role_panel` : 指定ロール（最大5つ）を取得できるボタン付きパネルを設置します\n"
+            "`/server_forward_setup / reset` : メッセージ自動転送の有効化・解除を設定します\n"
+            "`/server_announce_setup / send` : お知らせチャンネルの紐付けと送信を行います\n"
+            "`/server_verify_setup / btn` : メンバー認証用のロール割り当てとボタンパネルを設置します\n"
+            "`/say` : Botに指定したメッセージを代わりに発言させます"
+        ),
+        inline=False
+    )
+    
+    embed.add_field(
+        name="👑 BOT所有者専用コマンド",
+        value="`/owner_status` : Botのステータス（カスタムアクティビティ）をリアルタイムで変更します",
+        inline=False
+    )
+    
+    embed.set_footer(text="※権限のないユーザーが管理コマンドを叩いた場合、エラーメッセージが本人にのみ表示されます。")
+    
+    # 誰でも確認できるように全体公開で送信
+    await interaction.response.send_message(embed=embed)
+
 
 @bot.tree.command(name="hello", description="Botが挨拶を返します")
 async def hello(interaction: discord.Interaction):
@@ -484,7 +548,7 @@ async def owner_status(interaction: discord.Interaction, text: str):
     
     try:
         await bot.change_presence(activity=discord.CustomActivity(name=text))
-        await interaction.response.send_message(f"Botのステータスを「{text}」に変更しました。", ephemeral=True)
+        await interaction.response.send_message(f"Botのステータスを「{text}」変更しました。", ephemeral=True)
     except Exception as e:
         await interaction.response.send_message(f"ステータスの変更中にエラーが発生しました: {e}", ephemeral=True)
 
