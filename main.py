@@ -260,7 +260,6 @@ async def on_ready():
     print("--- 起動完了: 現在のサーバー設定一覧 ---")
     for guild_id_str, config in all_data.items():
         if guild_id_str == "user_apps":
-            print(f"・マイアプリデータ: {len(config.get('memos', []))}件のメモを読込")
             continue
         
         guild = bot.get_guild(int(guild_id_str))
@@ -399,6 +398,77 @@ async def my_scan(interaction: discord.Interaction, target_user: discord.User = 
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
+# ==================== 【個人用プライベート機能（誰でも自由に使用可能）】 ====================
+
+@bot.tree.command(name="my_memo", description="あなた専用の個人メモを追加・一覧表示・削除します（他の人には見えません）")
+@discord.app_commands.choices(action=[
+    discord.app_commands.Choice(name="メモを追加する", value="add"),
+    discord.app_commands.Choice(name="一覧を表示する", value="list"),
+    discord.app_commands.Choice(name="選択して削除する", value="delete"),
+    discord.app_commands.Choice(name="全て消去する", value="clear")
+])
+async def my_memo(interaction: discord.Interaction, action: discord.app_commands.Choice[str], content: str = None):
+    all_data = load_data()
+    user_data = get_user_app_data(all_data, str(interaction.user.id))
+    act = action.value
+
+    if act == "add":
+        if not content:
+            await interaction.response.send_message("保存する内容を入力してください。", ephemeral=True)
+            return
+        user_data["memos"].append(content)
+        save_data(all_data)
+        await interaction.response.send_message(f"個人メモを保存しました:\n`{content}`", ephemeral=True)
+
+    elif act == "list":
+        memos = user_data.get("memos", [])
+        embed = discord.Embed(title="あなた専用の個人メモ一覧", color=discord.Color.gold())
+        embed.description = "\n".join([f"**{i+1}.** {m}" for i, m in enumerate(memos)]) if memos else "保存されているメモはありません。"
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    elif act == "delete":
+        memos = user_data.get("memos", [])
+        if not memos:
+            await interaction.response.send_message("削除できるメモがありません。", ephemeral=True)
+            return
+        view = MemoDeleteView(memos)
+        await interaction.response.send_message("削除したい個人メモをメニューから選んでください：", view=view, ephemeral=True)
+
+    elif act == "clear":
+        user_data["memos"] = []
+        save_data(all_data)
+        await interaction.response.send_message("全ての個人メモを消去しました。", ephemeral=True)
+
+
+@bot.tree.command(name="my_clip", description="あなた専用のクリップ（テキストやリンク）を保存・管理します（他の人には見えません）")
+@discord.app_commands.choices(action=[
+    discord.app_commands.Choice(name="クリップを追加する", value="add"),
+    discord.app_commands.Choice(name="一覧を表示する", value="list"),
+    discord.app_commands.Choice(name="全て消去する", value="clear")
+])
+async def my_clip(interaction: discord.Interaction, action: discord.app_commands.Choice[str], content: str = None):
+    all_data = load_data()
+    user_data = get_user_app_data(all_data, str(interaction.user.id))
+    act = action.value
+
+    if act == "add":
+        if not content:
+            await interaction.response.send_message("内容を入力してください。", ephemeral=True)
+            return
+        user_data["bookmarks"].append(content)
+        save_data(all_data)
+        await interaction.response.send_message("個人クリップに保存しました。", ephemeral=True)
+    elif act == "list":
+        bks = user_data.get("bookmarks", [])
+        embed = discord.Embed(title="あなた専用のクリップ一覧", color=discord.Color.magenta())
+        embed.description = "\n".join([f"• {b}" for b in bks]) if bks else "保存されているクリップはありません。"
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+    elif act == "clear":
+        user_data["bookmarks"] = []
+        save_data(all_data)
+        await interaction.response.send_message("全ての個人クリップを消去しました。", ephemeral=True)
+
+
 # ==================== 【管理者・許可ユーザー専用コマンド】 ====================
 
 @bot.tree.command(name="my_scan_channels", description="サーバーのチャンネル構造とカスタム権限をスキャン")
@@ -431,7 +501,8 @@ async def my_audit_perms(interaction: discord.Interaction):
     if not await is_admin_or_allowed(interaction): return
     if not interaction.guild: return
         
-    await interaction.response.defer(ephemeral=True)
+    # ephemeral=False に変更し、全体に見えるように公開
+    await interaction.response.defer(ephemeral=False)
     
     report = []
     for channel in interaction.guild.text_channels:
@@ -446,14 +517,14 @@ async def my_audit_perms(interaction: discord.Interaction):
             report.append(f"注意 {channel.mention} : @everyone に「{', '.join(issues)}」権限があります")
             
     if not report:
-        await interaction.followup.send("チェック完了: @everyone に不適切な権限はありません。", ephemeral=True)
+        await interaction.followup.send("チェック完了: @everyone に不適切な権限はありません。", ephemeral=False)
     else:
         embed = discord.Embed(
             title="権限スキャン結果", 
             description="以下のチャンネルの設定を確認してください：\n\n" + "\n".join(report), 
             color=discord.Color.red()
         )
-        await interaction.followup.send(embed=embed, ephemeral=True)
+        await interaction.followup.send(embed=embed, ephemeral=False)
 
 
 @bot.tree.command(name="my_check_url", description="URLの安全性をVirusTotalでチェック")
@@ -485,79 +556,6 @@ async def my_check_url(interaction: discord.Interaction, url: str):
         await interaction.followup.send(embed=embed, ephemeral=True)
     except Exception as e:
         await interaction.followup.send(f"エラーが発生しました: {e}", ephemeral=True)
-
-
-# ==================== 【マイアプリ専用（ボットオーナー限定）】 ====================
-
-@bot.tree.command(name="my_memo", description="【マイアプリ専用】メモの追加・一覧表示・削除")
-@discord.app_commands.choices(action=[
-    discord.app_commands.Choice(name="メモを追加する", value="add"),
-    discord.app_commands.Choice(name="一覧を表示する", value="list"),
-    discord.app_commands.Choice(name="選択して削除する", value="delete"),
-    discord.app_commands.Choice(name="全て消去する", value="clear")
-])
-async def my_memo(interaction: discord.Interaction, action: discord.app_commands.Choice[str], content: str = None):
-    if not await is_owner_check(interaction): return
-    all_data = load_data()
-    user_data = get_user_app_data(all_data, str(interaction.user.id))
-    act = action.value
-
-    if act == "add":
-        if not content:
-            await interaction.response.send_message("保存する内容を入力してください。", ephemeral=True)
-            return
-        user_data["memos"].append(content)
-        save_data(all_data)
-        await interaction.response.send_message(f"メモを保存しました:\n`{content}`", ephemeral=True)
-
-    elif act == "list":
-        memos = user_data.get("memos", [])
-        embed = discord.Embed(title="専用メモ一覧", color=discord.Color.gold())
-        embed.description = "\n".join([f"**{i+1}.** {m}" for i, m in enumerate(memos)]) if memos else "保存されているメモはありません。"
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-
-    elif act == "delete":
-        memos = user_data.get("memos", [])
-        if not memos:
-            await interaction.response.send_message("削除できるメモがありません。", ephemeral=True)
-            return
-        view = MemoDeleteView(memos)
-        await interaction.response.send_message("削除したいメモをメニューから選んでください：", view=view, ephemeral=True)
-
-    elif act == "clear":
-        user_data["memos"] = []
-        save_data(all_data)
-        await interaction.response.send_message("全てのメモを消去しました。", ephemeral=True)
-
-
-@bot.tree.command(name="my_clip", description="【マイアプリ専用】テキストやリンクをクリップして保存")
-@discord.app_commands.choices(action=[
-    discord.app_commands.Choice(name="クリップを追加する", value="add"),
-    discord.app_commands.Choice(name="一覧を表示する", value="list"),
-    discord.app_commands.Choice(name="全て消去する", value="clear")
-])
-async def my_clip(interaction: discord.Interaction, action: discord.app_commands.Choice[str], content: str = None):
-    if not await is_owner_check(interaction): return
-    all_data = load_data()
-    user_data = get_user_app_data(all_data, str(interaction.user.id))
-    act = action.value
-
-    if act == "add":
-        if not content:
-            await interaction.response.send_message("内容を入力してください。", ephemeral=True)
-            return
-        user_data["bookmarks"].append(content)
-        save_data(all_data)
-        await interaction.response.send_message("クリップに保存しました。", ephemeral=True)
-    elif act == "list":
-        bks = user_data.get("bookmarks", [])
-        embed = discord.Embed(title="クリップ一覧", color=discord.Color.magenta())
-        embed.description = "\n".join([f"• {b}" for b in bks]) if bks else "保存されているクリップはありません。"
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-    elif act == "clear":
-        user_data["bookmarks"] = []
-        save_data(all_data)
-        await interaction.response.send_message("全て消去しました。", ephemeral=True)
 
 
 # ==================== 【サーバー管理者専用コマンド】 ====================
