@@ -118,7 +118,6 @@ async def is_admin_or_allowed(interaction: discord.Interaction) -> bool:
     return False
 
 
-# --- メモ削除用のコンポーネント ---
 class MemoDeleteSelect(discord.ui.Select):
     def __init__(self, memos):
         options = []
@@ -221,7 +220,7 @@ class DynamicRoleView(discord.ui.View):
             else:
                 try:
                     await interaction.user.add_roles(role)
-                    await interaction.response.send_message(f"{role.name} ロールを付与しました！", ephemeral=True)
+                    await interaction.response.send_message(f"{role.name} ロールを付与しました。", ephemeral=True)
                 except discord.Forbidden:
                     await interaction.response.send_message("Botの権限が不足しているためロールを付与できませんでした。ボットのロールを対象ロールより上に移動してください。", ephemeral=True)
         return button_callback
@@ -247,7 +246,7 @@ class VerifyButtonView(discord.ui.View):
             return
         try:
             await interaction.user.add_roles(role)
-            await interaction.response.send_message("認証が完了しました！", ephemeral=True)
+            await interaction.response.send_message("認証が完了しました。", ephemeral=True)
         except Exception as e:
             await interaction.response.send_message(f"エラーが発生しました: {e}", ephemeral=True)
 
@@ -317,25 +316,26 @@ async def on_message(message: discord.Message):
 
 @bot.tree.command(name="help", description="Botの利用可能なコマンド一覧をカテゴリ別に表示します")
 async def help_command(interaction: discord.Interaction):
+    # Embedタイトルや各フィールド名から絵文字を削除しました
     embed = discord.Embed(
-        title="🤖 マクマクBOT コマンド一覧",
+        title="マクマクBOT コマンド一覧",
         description="このBotで利用できるスラッシュコマンドの一覧です。\n権限に応じて使用できるコマンドが異なります。",
         color=discord.Color.blue()
     )
     
     embed.add_field(
-        name="👥 一般ユーザー・プレイヤー向け機能",
+        name="一般ユーザー・プレイヤー向け機能",
         value=(
             "`/help` : このコマンド一覧を埋め込み形式で表示します\n"
             "`/hello` : Botが挨拶を返します\n"
             "`/search` : 各種検索サイトやWikipediaのリンク・概要を生成します\n"
-            "`/my_scan` : 実行したサーバーの基本情報を確認します"
+            "`/my_scan` : サーバー情報、または指定ユーザーの基本情報を確認します（全体公開）"
         ),
         inline=False
     )
     
     embed.add_field(
-        name="🔒 個人用プライベート機能 (他の人には見えません)",
+        name="個人用プライベート機能 (他の人には見えません)",
         value=(
             "`/my_memo` : あなた専用の個人メモを追加・一覧表示・削除・全消去します\n"
             "`/my_clip` : あなた専用のクリップ（テキストやリンク）を保存・管理します"
@@ -344,17 +344,18 @@ async def help_command(interaction: discord.Interaction):
     )
     
     embed.add_field(
-        name="🛡️ 管理者・許可ユーザー専用コマンド",
+        name="管理者・許可ユーザー専用コマンド",
         value=(
             "`/my_scan_channels` : サーバーのチャンネル構造とカスタム権限をスキャンします\n"
             "`/my_audit_perms` : @everyone の不適切な権限をスキャンします（全員に公開）\n"
-            "`/my_check_url` : URLの安全性をVirusTotalでチェックします"
+            "`/my_check_url` : URLの安全性をVirusTotalでチェックします\n"
+            "`/say` : Botに指定したメッセージを代わりに発言させます"
         ),
         inline=False
     )
     
     embed.add_field(
-        name="⚙️ サーバー管理者専用コマンド (要・管理者権限)",
+        name="サーバー管理者専用コマンド (要・管理者権限)",
         value=(
             "`/server_status` : 現在の各種機能の設定状況を確認します\n"
             "`/server_list_users` : コマンド使用許可リストの確認・編集を行います\n"
@@ -362,34 +363,31 @@ async def help_command(interaction: discord.Interaction):
             "`/server_role_panel` : 指定ロール（最大5つ）を取得できるボタン付きパネルを設置します\n"
             "`/server_forward_setup / reset` : メッセージ自動転送の有効化・解除を設定します\n"
             "`/server_announce_setup / send` : お知らせチャンネルの紐付けと送信を行います\n"
-            "`/server_verify_setup / btn` : メンバー認証用のロール割り当てとボタンパネルを設置します\n"
-            "`/say` : Botに指定したメッセージを代わりに発言させます"
+            "`/server_verify_setup / btn` : メンバー認証用のロール割り当てとボタンパネルを設置します"
         ),
         inline=False
     )
     
     embed.add_field(
-        name="👑 BOT所有者専用コマンド",
+        name="BOT所有者専用コマンド",
         value="`/owner_status` : Botのステータス（カスタムアクティビティ）をリアルタイムで変更します",
         inline=False
     )
     
     embed.set_footer(text="※権限のないユーザーが管理コマンドを叩いた場合、エラーメッセージが本人にのみ表示されます。")
     
-    # 誰でも確認できるように全体公開で送信
     await interaction.response.send_message(embed=embed)
 
 
 @bot.tree.command(name="hello", description="Botが挨拶を返します")
 async def hello(interaction: discord.Interaction):
-    await interaction.response.send_message(f"こんにちは、{interaction.user.mention}さん！")
+    await interaction.response.send_message(f"こんにちは、{interaction.user.mention}さん。")
 
 
 @bot.tree.command(name="say", description="Botに指定したメッセージを発言させます")
 async def say(interaction: discord.Interaction, message: str):
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("このコマンドは管理者のみ使用できます。", ephemeral=True)
-        return
+    if not await is_admin_or_allowed(interaction): return
+    
     await interaction.response.send_message("メッセージを送信しました。", ephemeral=True)
     await interaction.channel.send(message)
 
@@ -436,11 +434,9 @@ async def search(interaction: discord.Interaction, engine: discord.app_commands.
         await interaction.response.send_message(embed=embed)
 
 
-@bot.tree.command(name="my_scan", description="サーバー情報、または指定ユーザーの情報を確認（一般ユーザーはサーバー情報のみ）")
+@bot.tree.command(name="my_scan", description="サーバー情報、または指定ユーザーの基本情報を確認します")
 async def my_scan(interaction: discord.Interaction, target_user: discord.User = None):
     if target_user:
-        if not await is_admin_or_allowed(interaction): return
-        
         embed = discord.Embed(title="ユーザーデータスキャン結果", color=discord.Color.teal())
         embed.set_thumbnail(url=target_user.display_avatar.url)
         embed.add_field(name="ユーザー名", value=f"{target_user.name} ({target_user.mention})", inline=True)
@@ -466,7 +462,7 @@ async def my_scan(interaction: discord.Interaction, target_user: discord.User = 
         embed.add_field(name="ブースト状況", value=f"Level {g.premium_tier} ({g.premium_subscription_count}回)", inline=True)
         embed.add_field(name="サーバー作成日", value=discord.utils.format_dt(g.created_at, style="F"), inline=False)
 
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    await interaction.response.send_message(embed=embed, ephemeral=False)
 
 
 # ==================== 【個人用プライベート機能（誰でも自由に使用可能）】 ====================
@@ -548,7 +544,7 @@ async def owner_status(interaction: discord.Interaction, text: str):
     
     try:
         await bot.change_presence(activity=discord.CustomActivity(name=text))
-        await interaction.response.send_message(f"Botのステータスを「{text}」変更しました。", ephemeral=True)
+        await interaction.response.send_message(f"Botのステータスを「{text}」に変更しました。", ephemeral=True)
     except Exception as e:
         await interaction.response.send_message(f"ステータスの変更中にエラーが発生しました: {e}", ephemeral=True)
 
