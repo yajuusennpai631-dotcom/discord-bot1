@@ -1,8 +1,9 @@
-print("=== WINDOWS_TEST_0614_FULL_SECURE ===")
+print("=== WINDOWS_TEST_0615_AUTO_STATUS_AND_PERMS ===")
 
 import os
 import discord
 from discord.ext import commands
+from discord import app_commands
 import json
 import sys
 import asyncio
@@ -30,6 +31,9 @@ if os.path.exists("/app/data"):
     JSON_FILE = "/app/data/allowed_users.json"
 else:
     JSON_FILE = "allowed_users.json"
+
+# グローバルで手動ステータスを保持する変数（Noneならサーバー数表示）
+current_custom_status = None
 
 def load_data():
     if os.path.exists(JSON_FILE):
@@ -91,6 +95,21 @@ def create_user_list_embed(allowed_users):
         embed.add_field(name="登録ユーザー", value="\n".join(user_mentions), inline=False)
         embed.set_footer(text=f"登録者数: {len(allowed_users)}名")
     return embed
+
+
+# 【新設】視聴中・オンラインステータスを更新する共通関数
+async def update_bot_status(client, text=None):
+    global current_custom_status
+    if text:
+        current_custom_status = text
+    
+    # 手動カスタムテキストがない場合は「〇個のサーバー」を表示
+    status_text = current_custom_status if current_custom_status else f"{len(client.guilds)}個のサーバー"
+    
+    # 視聴中 (watching) かつ オンライン (online) に設定
+    activity = discord.Activity(type=discord.ActivityType.watching, name=status_text)
+    await client.change_presence(status=discord.Status.online, activity=activity)
+    print(f"[ステータス更新] {status_text} を視聴中 (Online)")
 
 
 async def is_owner_check(interaction: discord.Interaction) -> bool:
@@ -256,9 +275,9 @@ async def on_ready():
     bot.add_view(VerifyButtonView())
     all_data = load_data()
     
+    # 視聴中＋オンライン＋導入サーバー数の初期反映
     try:
-        await bot.change_presence(activity=discord.CustomActivity(name="マクマクBOT稼働中"))
-        print("初期ステータス『マクマクBOT稼働中』を設定しました。")
+        await update_bot_status(bot)
     except Exception as e:
         print(f"初期ステータス設定エラー: {e}")
     
@@ -285,7 +304,18 @@ async def on_ready():
     print("スラッシュコマンドを更新したい場合は、サーバー上で '!sync' と発言してください。")
 
 
-# 【変更箇所】管理者権限（has_permissions）から、Botオーナー限定（is_owner）に切り替えました
+# 【新設】サーバー追加・退出時に導入サーバー数をリアルタイム更新するイベント
+@bot.event
+async def on_guild_join(guild: discord.Guild):
+    print(f"[サーバー参加] {guild.name} (ID: {guild.id}) に導入されました。")
+    await update_bot_status(bot)
+
+@bot.event
+async def on_guild_remove(guild: discord.Guild):
+    print(f"[サーバー脱退] {guild.name} (ID: {guild.id}) から削除されました。")
+    await update_bot_status(bot)
+
+
 @bot.command(name="sync")
 @commands.is_owner()
 async def sync_command(ctx):
@@ -320,27 +350,48 @@ async def on_message(message: discord.Message):
 
 # ==================== 【一般ユーザー・プレイヤー向け機能】 ====================
 
-@bot.tree.command(name="help", description="Botの利用可能なコマンド一覧をカテゴリ別に表示します")
+# 【変更】実行した人の権限をその場で判定し、非公開(ephemeral)で出し分けるように強化
+@bot.tree.command(name="help", description="あなたが利用可能なコマンド一覧をカテゴリ別に表示します")
 async def help_command(interaction: discord.Interaction):
+    # 1. 所有者判定
+    is_owner = False
+    if interaction.client.owner_id is None:
+        app_info = await interaction.client.application_info()
+        interaction.client.owner_id = app_info.owner.id
+    if interaction.user.id == interaction.client.owner_id:
+        is_owner = True
+
+    # 2. 管理者・許可ユーザー判定
+    is_admin = False
+    is_allowed = False
+    if interaction.guild:
+        if interaction.user.guild_permissions.administrator:
+            is_admin = True
+        all_data = load_data()
+        cfg = get_guild_config(all_data, str(interaction.guild.id))
+        if interaction.user.id in cfg.get("allowed_users", []):
+            is_allowed = True
+
     embed = discord.Embed(
         title="マクマクBOT コマンド一覧",
-        description="このBotで利用できるスラッシュコマンドの一覧です。\n権限に応じて使用できるコマンドが異なります。",
+        description="あなたがこのサーバーで利用できるスラッシュコマンドの一覧です。",
         color=discord.Color.blue()
     )
     
+    # 一般ユーザー機能は全員に見せる
     embed.add_field(
-        name="一般ユーザー・プレイヤー向け機能",
+        name="👥 一般ユーザー向け機能",
         value=(
-            "`/help` : このコマンド一覧を埋め込み形式で表示します\n"
+            "`/help` : このコマンド一覧をあなただけに表示します\n"
             "`/hello` : Botが挨拶を返します\n"
             "`/search` : 各種検索サイトやWikipediaのリンク・概要を生成します\n"
-            "`/my_scan` : サーバー情報、または指定ユーザーの基本情報を確認します（全体公開）"
+            "`/my_scan` : サーバー情報、または指定ユーザーの基本情報を確認します"
         ),
         inline=False
     )
     
     embed.add_field(
-        name="個人用プライベート機能 (他の人には見えません)",
+        name="🔒 個人用プライベート機能 (他の人には見えません)",
         value=(
             "`/my_memo` : あなた専用の個人メモを追加・一覧表示・削除・全消去します\n"
             "`/my_clip` : あなた専用のクリップ（テキストやリンク）を保存・管理します"
@@ -348,40 +399,46 @@ async def help_command(interaction: discord.Interaction):
         inline=False
     )
     
-    embed.add_field(
-        name="管理者・許可ユーザー専用コマンド",
-        value=(
-            "`/my_scan_channels` : サーバーのチャンネル構造とカスタム権限をスキャンします\n"
-            "`/my_audit_perms` : @everyone の不適切な権限をスキャンします（全員に公開）\n"
-            "`/my_check_url` : URLの安全性をVirusTotalでチェックします\n"
-            "`/say` : Botに指定したメッセージを代わりに発言させます"
-        ),
-        inline=False
-    )
+    # 権限がある場合のみ、該当カテゴリをヘルプに追加
+    if is_admin or is_allowed or is_owner:
+        embed.add_field(
+            name="🛡️ 管理者・許可ユーザー専用コマンド",
+            value=(
+                "`/my_scan_channels` : サーバーのチャンネル構造とカスタム権限をスキャンします\n"
+                "`/my_audit_perms` : @everyone の不適切な権限をスキャンします\n"
+                "`/my_check_url` : URLの安全性をVirusTotalでチェックします\n"
+                "`/say` : Botに指定したメッセージを代わりに発言させます"
+            ),
+            inline=False
+        )
     
-    embed.add_field(
-        name="サーバー管理者専用コマンド (要・管理者権限)",
-        value=(
-            "`/server_status` : 現在の各種機能の設定状況を確認します\n"
-            "`/server_list_users` : コマンド使用許可リストの確認・編集を行います\n"
-            "`/server_create_channel` : 新しいテキストチャンネルを作成します\n"
-            "`/server_role_panel` : 指定ロール（最大5つ）を取得できるボタン付きパネルを設置します\n"
-            "`/server_forward_setup / reset` : メッセージ自動転送の有効化・解除を設定します\n"
-            "`/server_announce_setup / send` : お知らせチャンネルの紐付けと送信を行います\n"
-            "`/server_verify_setup / btn` : メンバー認証用のロール割り当てとボタンパネルを設置します"
-        ),
-        inline=False
-    )
+    if is_admin or is_owner:
+        embed.add_field(
+            name="⚙️ サーバー管理者専用コマンド",
+            value=(
+                "`/server_status` : 現在の各種機能の設定状況を確認します\n"
+                "`/server_list_users` : コマンド使用許可リストの確認・編集を行います\n"
+                "`/server_create_channel` : 新しいテキストチャンネルを作成します\n"
+                "`/server_role_panel` : 指定ロールを取得できるボタン付きパネルを設置します\n"
+                "`/server_forward_setup` / `reset` : メッセージ自動転送の設定を行います\n"
+                "`/server_announce_setup` / `send` : 配信お知らせ機能の設定と送信を行います\n"
+                "`/server_verify_setup` / `btn` : メンバー認証用パネルを設置します"
+            ),
+            inline=False
+        )
     
-    embed.add_field(
-        name="BOT所有者専用コマンド",
-        value="`/owner_status` : Botのステータス（カスタムアクティビティ）をリアルタイムで変更します",
-        inline=False
-    )
+    if is_owner:
+        embed.add_field(
+            name="👑 BOT所有者専用コマンド",
+            value=(
+                "`!sync` : スラッシュコマンドをDiscord側へ即時同期します (通常チャット形式)\n"
+                "`/owner_status` : Botの視聴中ステータス文字をリアルタイムで変更します"
+            ),
+            inline=False
+        )
     
-    embed.set_footer(text="※権限のないユーザーが管理コマンドを叩いた場合、エラーメッセージが本人にのみ表示されます。")
-    
-    await interaction.response.send_message(embed=embed)
+    embed.set_footer(text="※セキュリティのため、このヘルプは実行したあなたにのみ見えています。")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 @bot.tree.command(name="hello", description="Botが挨拶を返します")
@@ -392,7 +449,6 @@ async def hello(interaction: discord.Interaction):
 @bot.tree.command(name="say", description="Botに指定したメッセージを発言させます")
 async def say(interaction: discord.Interaction, message: str):
     if not await is_admin_or_allowed(interaction): return
-    
     await interaction.response.send_message("メッセージを送信しました。", ephemeral=True)
     await interaction.channel.send(message)
 
@@ -470,7 +526,7 @@ async def my_scan(interaction: discord.Interaction, target_user: discord.User = 
     await interaction.response.send_message(embed=embed, ephemeral=False)
 
 
-# ==================== 【個人用プライベート機能（誰でも自由に使用可能）】 ====================
+# ==================== 【個人用プライベート機能】 ====================
 
 @bot.tree.command(name="my_memo", description="あなた専用の個人メモを追加・一覧表示・削除します（他の人には見えません）")
 @discord.app_commands.choices(action=[
@@ -543,13 +599,20 @@ async def my_clip(interaction: discord.Interaction, action: discord.app_commands
 
 # ==================== 【BOT所有者（オーナー）専用コマンド】 ====================
 
-@bot.tree.command(name="owner_status", description="【オーナー限定】Botのステータス（カスタムアクティビティ）をリアルタイムで変更します")
+# 【変更】視聴中(watching)の枠組みを維持したまま、ステータステキストを自由に上書きできるように調整
+@bot.tree.command(name="owner_status", description="【オーナー限定】Botの視聴中ステータスの文字をリアルタイムで変更します")
 async def owner_status(interaction: discord.Interaction, text: str):
     if not await is_owner_check(interaction): return
-    
     try:
-        await bot.change_presence(activity=discord.CustomActivity(name=text))
-        await interaction.response.send_message(f"Botのステータスを「{text}」に変更しました。", ephemeral=True)
+        # textに 'reset' と打つと自動サーバー数表示に戻る仕様
+        if text.lower() == "reset":
+            global current_custom_status
+            current_custom_status = None
+            await update_bot_status(bot)
+            await interaction.response.send_message("ステータスをデフォルト（サーバー数カウント）にリセットしました。", ephemeral=True)
+        else:
+            await update_bot_status(bot, text)
+            await interaction.response.send_message(f"Botのステータスを「{text} を視聴中」に変更しました。", ephemeral=True)
     except Exception as e:
         await interaction.response.send_message(f"ステータスの変更中にエラーが発生しました: {e}", ephemeral=True)
 
@@ -585,29 +648,20 @@ async def my_scan_channels(interaction: discord.Interaction):
 async def my_audit_perms(interaction: discord.Interaction):
     if not await is_admin_or_allowed(interaction): return
     if not interaction.guild: return
-        
     await interaction.response.defer(ephemeral=False)
     
     report = []
     for channel in interaction.guild.text_channels:
         everyone_perms = channel.permissions_for(interaction.guild.default_role)
         issues = []
-        if everyone_perms.view_channel:
-            issues.append("閲覧")
-        if everyone_perms.send_messages:
-            issues.append("送信")
-            
-        if issues:
-            report.append(f"注意 {channel.mention} : @everyone に「{', '.join(issues)}」権限があります")
+        if everyone_perms.view_channel: issues.append("閲覧")
+        if everyone_perms.send_messages: issues.append("送信")
+        if issues: report.append(f"注意 {channel.mention} : @everyone に「{', '.join(issues)}」権限があります")
             
     if not report:
         await interaction.followup.send("チェック完了: @everyone に不適切な権限はありません。", ephemeral=False)
     else:
-        embed = discord.Embed(
-            title="権限スキャン結果", 
-            description="以下のチャンネルの設定を確認してください：\n\n" + "\n".join(report), 
-            color=discord.Color.red()
-        )
+        embed = discord.Embed(title="権限スキャン結果", description="以下のチャンネルの設定を確認してください：\n\n" + "\n".join(report), color=discord.Color.red())
         await interaction.followup.send(embed=embed, ephemeral=False)
 
 
@@ -642,40 +696,34 @@ async def my_check_url(interaction: discord.Interaction, url: str):
         await interaction.followup.send(f"エラーが発生しました: {e}", ephemeral=True)
 
 
-# ==================== 【サーバー管理者専用コマンド】 ====================
+# ==================== 【サーバー管理者専用コマンド (要・管理者権限)】 ====================
+# 【変更】@app_commands.default_permissions(administrator=True) を追加。一般ユーザーのコマンド候補一覧に表示すらされなくなります。
 
 @bot.tree.command(name="server_status", description="現在のサーバー設定状況を確認します")
+@app_commands.default_permissions(administrator=True)
 async def server_status(interaction: discord.Interaction):
-    if not interaction.guild or not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("管理者権限が必要です。", ephemeral=True)
-        return
-        
+    if not interaction.guild: return
     g = interaction.guild
     g_id_str = str(g.id)
     all_data = load_data()
     cfg = get_guild_config(all_data, g_id_str)
 
-    embed = discord.Embed(
-        title=f"{g.name} - 設定状況", 
-        description="このサーバーで有効化されている設定一覧です。",
-        color=discord.Color.blue()
-    )
-    if g.icon:
-        embed.set_thumbnail(url=g.icon.url)
+    embed = discord.Embed(title=f"{g.name} - 設定状況", description="このサーバーで有効化されている設定一覧です。", color=discord.Color.blue())
+    if g.icon: embed.set_thumbnail(url=g.icon.url)
 
     from_ch = g.get_channel(cfg.get("from_channel")) if cfg.get("from_channel") else None
     to_ch = g.get_channel(cfg.get("to_channel")) if cfg.get("to_channel") else None
-    forward_status = f"有効\n・転送元: {from_ch.mention if from_ch else '削除済のチャンネル'}\n・転送先: {to_ch.mention if to_ch else '削除済のチャンネル'}" if (from_ch or to_ch) else "未設定"
+    forward_status = f"有効\n・転送元: {from_ch.mention if from_ch else '削除済'}\n・転送先: {to_ch.mention if to_ch else '削除済'}" if (from_ch or to_ch) else "未設定"
     embed.add_field(name="メッセージ転送設定", value=forward_status, inline=False)
 
     v_ch = g.get_channel(cfg.get("verify_channel")) if cfg.get("verify_channel") else None
     v_role = g.get_role(cfg.get("verify_role")) if cfg.get("verify_role") else None
-    verify_status = f"有効\n・設置ch: {v_ch.mention if v_ch else '削除済のチャンネル'}\n・付与ロール: {v_role.mention if v_role else '削除済のロール'}" if (v_ch or v_role) else "未設定"
+    verify_status = f"有効\n・設置ch: {v_ch.mention if v_ch else '削除済'}\n・付与ロール: {v_role.mention if v_role else '削除済'}" if (v_ch or v_role) else "未設定"
     embed.add_field(name="サーバー認証設定", value=verify_status, inline=False)
 
     a_ch = g.get_channel(cfg.get("announce_channel")) if cfg.get("announce_channel") else None
     a_role = g.get_role(cfg.get("announce_role")) if cfg.get("announce_role") else None
-    announce_status = f"有効\n・お知らせch: {a_ch.mention if a_ch else '削除済のチャンネル'}\n・メンション対象: {a_role.mention if a_role else '削除済のロール'}" if (a_ch or a_role) else "未設定"
+    announce_status = f"有効\n・お知らせch: {a_ch.mention if a_ch else '削除済'}\n・メンション対象: {a_role.mention if a_role else '削除済'}" if (a_ch or a_role) else "未設定"
     embed.add_field(name="配信・お知らせ設定", value=announce_status, inline=False)
 
     panel_roles_ids = cfg.get("panel_roles", [])
@@ -691,10 +739,9 @@ async def server_status(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="server_list_users", description="使用許可リストの確認・編集を行います")
+@app_commands.default_permissions(administrator=True)
 async def server_list_users(interaction: discord.Interaction):
-    if not interaction.guild or not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("管理者権限が必要です。", ephemeral=True)
-        return
+    if not interaction.guild: return
     g_id = str(interaction.guild.id)
     all_data = load_data()
     config = get_guild_config(all_data, g_id)
@@ -703,10 +750,9 @@ async def server_list_users(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="server_create_channel", description="新しいテキストチャンネルを作成します")
+@app_commands.default_permissions(administrator=True)
 async def server_create_channel(interaction: discord.Interaction, name: str, category: discord.CategoryChannel = None):
-    if not interaction.guild or not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("権限がありません。", ephemeral=True)
-        return
+    if not interaction.guild: return
     await interaction.response.defer(ephemeral=True)
     try:
         new_ch = await interaction.guild.create_text_channel(name=name, category=category)
@@ -716,20 +762,12 @@ async def server_create_channel(interaction: discord.Interaction, name: str, cat
 
 
 @bot.tree.command(name="server_role_panel", description="指定したロール（最大5つ）を取得できるボタン付きパネルを送信します")
+@app_commands.default_permissions(administrator=True)
 async def server_role_panel(
-    interaction: discord.Interaction, 
-    title: str, 
-    description: str,
-    role1: discord.Role,
-    role2: discord.Role = None,
-    role3: discord.Role = None,
-    role4: discord.Role = None,
-    role5: discord.Role = None
+    interaction: discord.Interaction, title: str, description: str,
+    role1: discord.Role, role2: discord.Role = None, role3: discord.Role = None, role4: discord.Role = None, role5: discord.Role = None
 ):
-    if not interaction.guild or not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("権限がありません。", ephemeral=True)
-        return
-    
+    if not interaction.guild: return
     await interaction.response.defer(ephemeral=True)
     ch = interaction.channel
     g = interaction.guild
@@ -741,12 +779,7 @@ async def server_role_panel(
     get_guild_config(all_data, str(g.id))["panel_roles"] = [r.id for r in roles]
     save_data(all_data)
     
-    embed = discord.Embed(
-        title=title, 
-        description=description, 
-        color=discord.Color.blue()
-    )
-    
+    embed = discord.Embed(title=title, description=description, color=discord.Color.blue())
     role_mentions = [f"{r.mention}" for r in roles]
     embed.add_field(name="対象ロール一覧", value="\n\n".join(role_mentions), inline=False)
     
@@ -755,10 +788,9 @@ async def server_role_panel(
 
 
 @bot.tree.command(name="server_forward_setup", description="メッセージ転送元のチャンネルと転送先を設定します")
+@app_commands.default_permissions(administrator=True)
 async def server_forward_setup(interaction: discord.Interaction, from_channel: discord.TextChannel, to_channel: discord.TextChannel):
-    if not interaction.guild or not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("権限がありません。", ephemeral=True)
-        return
+    if not interaction.guild: return
     all_data = load_data()
     cfg = get_guild_config(all_data, str(interaction.guild.id))
     cfg["from_channel"], cfg["to_channel"] = from_channel.id, to_channel.id
@@ -767,8 +799,9 @@ async def server_forward_setup(interaction: discord.Interaction, from_channel: d
 
 
 @bot.tree.command(name="server_forward_reset", description="チャンネルの転送設定を解除します")
+@app_commands.default_permissions(administrator=True)
 async def server_forward_reset(interaction: discord.Interaction):
-    if not interaction.guild or not interaction.user.guild_permissions.administrator: return
+    if not interaction.guild: return
     all_data = load_data()
     cfg = get_guild_config(all_data, str(interaction.guild.id))
     cfg["from_channel"], cfg["to_channel"] = None, None
@@ -777,8 +810,9 @@ async def server_forward_reset(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="server_announce_setup", description="お知らせ用のチャンネルとロールを設定します")
+@app_commands.default_permissions(administrator=True)
 async def server_announce_setup(interaction: discord.Interaction, channel: discord.TextChannel, role: discord.Role):
-    if not interaction.guild or not interaction.user.guild_permissions.administrator: return
+    if not interaction.guild: return
     all_data = load_data()
     cfg = get_guild_config(all_data, str(interaction.guild.id))
     cfg["announce_channel"], cfg["announce_role"] = channel.id, role.id
@@ -787,8 +821,9 @@ async def server_announce_setup(interaction: discord.Interaction, channel: disco
 
 
 @bot.tree.command(name="server_announce_send", description="設定されたチャンネルにロールメンション付きでお知らせを送信します")
+@app_commands.default_permissions(administrator=True)
 async def server_announce_send(interaction: discord.Interaction, message: str):
-    if not interaction.guild or not interaction.user.guild_permissions.administrator: return
+    if not interaction.guild: return
     all_data = load_data()
     cfg = get_guild_config(all_data, str(interaction.guild.id))
     ch = bot.get_channel(cfg.get("announce_channel"))
@@ -801,8 +836,9 @@ async def server_announce_send(interaction: discord.Interaction, message: str):
 
 
 @bot.tree.command(name="server_verify_setup", description="認証用ロールと送信チャンネルを設定します")
+@app_commands.default_permissions(administrator=True)
 async def server_verify_setup(interaction: discord.Interaction, channel: discord.TextChannel, role: discord.Role):
-    if not interaction.guild or not interaction.user.guild_permissions.administrator: return
+    if not interaction.guild: return
     all_data = load_data()
     cfg = get_guild_config(all_data, str(interaction.guild.id))
     cfg["verify_channel"], cfg["verify_role"] = channel.id, role.id
@@ -811,8 +847,9 @@ async def server_verify_setup(interaction: discord.Interaction, channel: discord
 
 
 @bot.tree.command(name="server_verify_btn", description="設定されたチャンネルに認証用ボタンパネルを送信します")
+@app_commands.default_permissions(administrator=True)
 async def server_verify_btn(interaction: discord.Interaction, title: str = "サーバー認証", description: str = "ボタンを押すと認証が完了します。", image_file: discord.Attachment = None):
-    if not interaction.guild or not interaction.user.guild_permissions.administrator: return
+    if not interaction.guild: return
     await interaction.response.defer(ephemeral=True)
     all_data = load_data()
     cfg = get_guild_config(all_data, str(interaction.guild.id))
