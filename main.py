@@ -22,11 +22,6 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 
-bot = commands.Bot(
-    command_prefix="!",
-    intents=intents
-)
-
 if os.path.exists("/app/data"):
     JSON_FILE = "/app/data/allowed_users.json"
 else:
@@ -34,6 +29,7 @@ else:
 
 # グローバルで手動ステータスを保持する変数（Noneならサーバー数表示）
 current_custom_status = None
+
 
 def load_data():
     if os.path.exists(JSON_FILE):
@@ -44,6 +40,7 @@ def load_data():
             print(f"JSON読み込みエラー: {e}")
             return {}
     return {}
+
 
 def save_data(data):
     try:
@@ -56,6 +53,84 @@ def save_data(data):
             json.dump(data, f, ensure_ascii=False, indent=4)
     except Exception as e:
         print(f"JSON保存エラー: {e}")
+
+
+# ==================== 【サーバー承認状態の管理】 ====================
+# BOT所有者が「許可する」を押したサーバーのIDだけを approved_guilds に保存する。
+# このリストに入っていないサーバーでは、スラッシュコマンド・自動応答機能を一切動かさない。
+
+def get_approved_guilds(all_data):
+    if "approved_guilds" not in all_data:
+        all_data["approved_guilds"] = []
+    return all_data["approved_guilds"]
+
+
+def is_guild_approved(all_data, guild_id) -> bool:
+    return str(guild_id) in get_approved_guilds(all_data)
+
+
+def approve_guild(guild_id):
+    """このサーバーIDを承認済みにする（＝コマンド等を解禁する）"""
+    all_data = load_data()
+    approved = get_approved_guilds(all_data)
+    gid = str(guild_id)
+    if gid not in approved:
+        approved.append(gid)
+    save_data(all_data)
+
+
+def unapprove_guild(guild_id):
+    """このサーバーIDの承認を取り消す（拒否・脱退時のクリーンアップ用）"""
+    all_data = load_data()
+    approved = get_approved_guilds(all_data)
+    gid = str(guild_id)
+    if gid in approved:
+        approved.remove(gid)
+        save_data(all_data)
+
+
+# ==================== 【未承認サーバーでコマンドをブロックするCommandTree】 ====================
+
+class ApprovalCommandTree(app_commands.CommandTree):
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        # DM等、サーバー外でのインタラクションはそのまま許可
+        # （オーナーDMの承認/拒否ボタンは discord.ui.View 側の処理であり、ここは通らない）
+        if interaction.guild is None:
+            return True
+
+        client = interaction.client
+
+        # オーナーIDを確定
+        if client.owner_id is None:
+            try:
+                app_info = await client.application_info()
+                client.owner_id = app_info.owner.id
+            except Exception:
+                pass
+
+        # BOT所有者本人は、未承認サーバーでも動作確認のため常にコマンドを使用可能
+        if client.owner_id is not None and interaction.user.id == client.owner_id:
+            return True
+
+        all_data = load_data()
+        if not is_guild_approved(all_data, interaction.guild.id):
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    "🔒 このサーバーはまだBOT所有者の承認を受けていないため、コマンドを使用できません。\n"
+                    "サーバー管理者は、Bot参加時に送信されたパネルの「📩 BOT所有者に許可申請を送る」ボタンから申請してください。",
+                    ephemeral=True
+                )
+            return False
+
+        return True
+
+
+bot = commands.Bot(
+    command_prefix="!",
+    intents=intents,
+    tree_cls=ApprovalCommandTree
+)
+
 
 def get_guild_config(all_data, guild_id_str):
     if guild_id_str not in all_data:
@@ -188,7 +263,8 @@ class SendDMToOwnerView(discord.ui.View):
             title="🔔 サーバー参加許可リクエスト",
             description=(
                 f"以下のサーバーへの導入許可リクエストが届きました。\n"
-                f"許可するとBotがそのサーバーに留まり、拒否すると自動的に脱退します。"
+                f"許可するとBotがそのサーバーに留まり、スラッシュコマンドや自動応答機能が使用可能になります。\n"
+                f"拒否すると自動的に脱退します。"
             ),
             color=discord.Color.orange()
         )
@@ -250,8 +326,11 @@ class GuildApprovalView(discord.ui.View):
         self.add_item(reject_btn)
 
     async def _approve_callback(self, interaction: discord.Interaction):
-        """許可ボタン: サーバーにそのまま留まる"""
+        """許可ボタン: サーバーにそのまま留まり、コマンド・自動応答機能を解禁する"""
         guild = interaction.client.get_guild(self.guild_id)
+
+        # ★承認リストに追加 → これでこのサーバーでスラッシュコマンドや自動応答機能が使えるようになる
+        approve_guild(self.guild_id)
 
         # ボタンを無効化
         for item in self.children:
@@ -259,7 +338,7 @@ class GuildApprovalView(discord.ui.View):
 
         approved_embed = discord.Embed(
             title="✅ 参加を許可しました",
-            description=f"**{self.guild_name}** への参加を許可しました。\nBotはそのサーバーに留まります。",
+            description=f"**{self.guild_name}** への参加を許可しました。\nBotはそのサーバーに留まり、スラッシュコマンド等の全機能が使用可能になりました。",
             color=discord.Color.green()
         )
         await interaction.response.edit_message(embed=approved_embed, view=self)
@@ -271,7 +350,7 @@ class GuildApprovalView(discord.ui.View):
                 try:
                     notify_embed = discord.Embed(
                         title="✅ BOT所有者により参加が許可されました",
-                        description="BOT所有者がこのサーバーへの導入を承認しました。\nBotをお使いいただけます！",
+                        description="BOT所有者がこのサーバーへの導入を承認しました。\nBotのコマンドをお使いいただけます！",
                         color=discord.Color.green()
                     )
                     await notify_ch.send(embed=notify_embed)
@@ -280,11 +359,14 @@ class GuildApprovalView(discord.ui.View):
 
         # JSON から pending エントリを削除
         _remove_pending_approval(self.guild_id)
-        print(f"[許可] {self.guild_name} (ID:{self.guild_id}) への参加を許可しました。")
+        print(f"[許可] {self.guild_name} (ID:{self.guild_id}) への参加を許可し、コマンドを有効化しました。")
 
     async def _reject_callback(self, interaction: discord.Interaction):
         """拒否ボタン: サーバーから脱退する"""
         guild = interaction.client.get_guild(self.guild_id)
+
+        # 念のため承認リストからも除外しておく
+        unapprove_guild(self.guild_id)
 
         # サーバー側へ拒否通知を送ってから脱退
         if guild:
@@ -356,6 +438,9 @@ GUILDS_PER_PAGE = 5
 
 def build_guild_list_embed(guilds: list, page: int) -> discord.Embed:
     """サーバー一覧ページのEmbedを生成する"""
+    all_data = load_data()
+    approved_list = all_data.get("approved_guilds", [])
+
     total_pages = max(1, (len(guilds) + GUILDS_PER_PAGE - 1) // GUILDS_PER_PAGE)
     start = page * GUILDS_PER_PAGE
     end = start + GUILDS_PER_PAGE
@@ -369,12 +454,14 @@ def build_guild_list_embed(guilds: list, page: int) -> discord.Embed:
 
     for i, g in enumerate(page_guilds, start=start + 1):
         owner_text = f"<@{g.owner_id}>" if g.owner_id else "不明"
+        approval_text = "✅ 承認済み" if str(g.id) in approved_list else "🔒 未承認"
         embed.add_field(
             name=f"{i}. {g.name}",
             value=(
                 f"ID: `{g.id}`\n"
                 f"メンバー: **{g.member_count}人** | "
-                f"オーナー: {owner_text}"
+                f"オーナー: {owner_text}\n"
+                f"状態: {approval_text}"
             ),
             inline=False
         )
@@ -395,6 +482,7 @@ class GuildLeaveConfirmView(discord.ui.View):
         guild_name = self.guild.name
         try:
             await self.guild.leave()
+            unapprove_guild(self.guild.id)
             await interaction.response.edit_message(
                 content=f"✅ **{guild_name}** から脱退しました。",
                 embed=None,
@@ -688,14 +776,17 @@ async def on_ready():
     except Exception as e:
         print(f"初期ステータス設定エラー: {e}")
 
+    approved_list = all_data.get("approved_guilds", [])
+
     print("--- 起動完了: 現在のサーバー設定一覧 ---")
     for guild_id_str, config in all_data.items():
-        if guild_id_str in ("user_apps", "pending_approvals"):
+        if guild_id_str in ("user_apps", "pending_approvals", "approved_guilds"):
             continue
 
         guild = bot.get_guild(int(guild_id_str))
         guild_name = guild.name if guild else "不明なサーバー"
         print(f"サーバー: {guild_name} (ID: {guild_id_str})")
+        print(f"  > 承認状態: {'承認済み ✅' if guild_id_str in approved_list else '未承認 🔒（コマンド利用不可）'}")
         print(f"  > Message転送: {'有効' if config.get('from_channel') else '未設定'}")
         print(f"  > サーバー認証: {'有効' if config.get('verify_channel') else '未設定'}")
         print(f"  > 配信お知らせ: {'有効' if config.get('announce_channel') else '未設定'}")
@@ -737,7 +828,8 @@ async def on_guild_join(guild: discord.Guild):
         server_embed = discord.Embed(
             title="🔒 このBOTの導入にはBOT所有者の許可が必要です",
             description=(
-                "このBOTを継続して利用するには、**BOT所有者の承認**が必要です。\n\n"
+                "このBOTを継続して利用するには、**BOT所有者の承認**が必要です。\n"
+                "承認されるまで、このサーバーではスラッシュコマンドや自動応答機能はすべて使用できません。\n\n"
                 "下のボタンを押すと、BOT所有者に参加許可申請のDMが送信されます。\n"
                 "所有者が **許可** すればBotが利用可能になります。\n"
                 "所有者が **拒否** した場合、Botは自動的にサーバーから退出します。"
@@ -769,8 +861,9 @@ async def on_guild_join(guild: discord.Guild):
 @bot.event
 async def on_guild_remove(guild: discord.Guild):
     print(f"[サーバー脱退] {guild.name} (ID: {guild.id}) から削除されました。")
-    # 脱退時は pending があれば削除（拒否以外のキック等にも対応）
+    # 脱退時は pending と承認状態をクリーンアップ（再導入時に再承認が必要になる）
     _remove_pending_approval(guild.id)
+    unapprove_guild(guild.id)
     await update_bot_status(bot)
 
 
@@ -829,7 +922,8 @@ async def on_message(message: discord.Message):
     guild_id_str = str(message.guild.id)
     all_data = load_data()
 
-    if guild_id_str in all_data:
+    # ★未承認サーバーでは、自動転送・自動返信などのメッセージ系自動機能を一切動かさない
+    if is_guild_approved(all_data, message.guild.id) and guild_id_str in all_data:
         guild_config = all_data[guild_id_str]
 
         # 1. 管理者のメッセージ自動転送
@@ -1251,6 +1345,10 @@ async def server_status(interaction: discord.Interaction):
 
     embed = discord.Embed(title=f"{g.name} - 設定状況", description="このサーバーで有効化されている設定一覧です。", color=discord.Color.blue())
     if g.icon: embed.set_thumbnail(url=g.icon.url)
+
+    approved_list = all_data.get("approved_guilds", [])
+    approval_status = "✅ 承認済み（コマンド利用可能）" if g_id_str in approved_list else "🔒 未承認（コマンド利用不可）"
+    embed.add_field(name="BOT所有者による承認状態", value=approval_status, inline=False)
 
     from_ch = g.get_channel(cfg.get("from_channel")) if cfg.get("from_channel") else None
     to_ch = g.get_channel(cfg.get("to_channel")) if cfg.get("to_channel") else None
