@@ -137,6 +137,181 @@ async def is_admin_or_allowed(interaction: discord.Interaction) -> bool:
     return False
 
 
+# ==================== 【オーナー専用: サーバー一覧 UI】 ====================
+
+GUILDS_PER_PAGE = 5
+
+def build_guild_list_embed(guilds: list, page: int) -> discord.Embed:
+    """サーバー一覧ページのEmbedを生成する"""
+    total_pages = max(1, (len(guilds) + GUILDS_PER_PAGE - 1) // GUILDS_PER_PAGE)
+    start = page * GUILDS_PER_PAGE
+    end = start + GUILDS_PER_PAGE
+    page_guilds = guilds[start:end]
+
+    embed = discord.Embed(
+        title="📋 導入中サーバー一覧",
+        description=f"現在 **{len(guilds)}個** のサーバーに導入されています。",
+        color=discord.Color.blurple()
+    )
+
+    for i, g in enumerate(page_guilds, start=start + 1):
+        owner_text = f"<@{g.owner_id}>" if g.owner_id else "不明"
+        embed.add_field(
+            name=f"{i}. {g.name}",
+            value=(
+                f"ID: `{g.id}`\n"
+                f"メンバー: **{g.member_count}人** | "
+                f"オーナー: {owner_text}"
+            ),
+            inline=False
+        )
+
+    embed.set_footer(text=f"ページ {page + 1} / {total_pages}")
+    return embed
+
+
+class GuildLeaveConfirmView(discord.ui.View):
+    """脱退確認用ビュー（2段階確認）"""
+    def __init__(self, guild: discord.Guild, original_view: "GuildListView"):
+        super().__init__(timeout=60)
+        self.guild = guild
+        self.original_view = original_view
+
+    @discord.ui.button(label="✅ 本当に脱退する", style=discord.ButtonStyle.danger)
+    async def confirm_leave(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild_name = self.guild.name
+        try:
+            await self.guild.leave()
+            await interaction.response.edit_message(
+                content=f"✅ **{guild_name}** から脱退しました。",
+                embed=None,
+                view=None
+            )
+        except discord.HTTPException as e:
+            await interaction.response.edit_message(
+                content=f"❌ 脱退に失敗しました: `{e}`",
+                embed=None,
+                view=None
+            )
+
+    @discord.ui.button(label="❌ キャンセル", style=discord.ButtonStyle.secondary)
+    async def cancel_leave(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guilds = list(interaction.client.guilds)
+        embed = build_guild_list_embed(guilds, self.original_view.page)
+        self.original_view.update_buttons(guilds)
+        await interaction.response.edit_message(
+            content=None,
+            embed=embed,
+            view=self.original_view
+        )
+
+
+class GuildSelectForLeave(discord.ui.Select):
+    """現在ページのサーバーから脱退対象を選択するセレクトメニュー"""
+    def __init__(self, guilds: list, page: int):
+        start = page * GUILDS_PER_PAGE
+        end = start + GUILDS_PER_PAGE
+        page_guilds = guilds[start:end]
+
+        options = [
+            discord.SelectOption(
+                label=g.name[:100],
+                description=f"ID: {g.id} | メンバー: {g.member_count}人",
+                value=str(g.id),
+                emoji="🚪"
+            )
+            for g in page_guilds
+        ]
+        super().__init__(
+            placeholder="🚪 脱退するサーバーを選択...",
+            options=options,
+            min_values=1,
+            max_values=1
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        guild_id = int(self.values[0])
+        guild = interaction.client.get_guild(guild_id)
+
+        if not guild:
+            await interaction.response.send_message("サーバーが見つかりませんでした。", ephemeral=True)
+            return
+
+        confirm_embed = discord.Embed(
+            title="⚠️ サーバー脱退の確認",
+            description=(
+                f"以下のサーバーから本当に脱退しますか？\n\n"
+                f"**サーバー名:** {guild.name}\n"
+                f"**サーバーID:** `{guild.id}`\n"
+                f"**メンバー数:** {guild.member_count}人\n\n"
+                f"⚠️ この操作は **取り消せません。**"
+            ),
+            color=discord.Color.red()
+        )
+        if guild.icon:
+            confirm_embed.set_thumbnail(url=guild.icon.url)
+
+        # GuildListViewのインスタンスを親として渡す
+        parent_view = self.view
+        await interaction.response.edit_message(
+            embed=confirm_embed,
+            view=GuildLeaveConfirmView(guild, parent_view)
+        )
+
+
+class GuildListView(discord.ui.View):
+    """サーバー一覧のページネーション + 脱退選択ビュー"""
+    def __init__(self, guilds: list, page: int = 0):
+        super().__init__(timeout=300)
+        self.page = page
+        self.guilds = guilds
+        self._rebuild_select()
+        self.update_buttons(guilds)
+
+    def _rebuild_select(self):
+        """現在ページのセレクトメニューを再生成して追加する"""
+        # 既存のSelectを削除してから追加し直す
+        items_to_remove = [item for item in self.children if isinstance(item, GuildSelectForLeave)]
+        for item in items_to_remove:
+            self.remove_item(item)
+        if self.guilds:
+            self.add_item(GuildSelectForLeave(self.guilds, self.page))
+
+    def update_buttons(self, guilds: list):
+        """前へ/次へボタンの有効・無効を更新する"""
+        total_pages = max(1, (len(guilds) + GUILDS_PER_PAGE - 1) // GUILDS_PER_PAGE)
+        self.prev_button.disabled = (self.page <= 0)
+        self.next_button.disabled = (self.page >= total_pages - 1)
+
+    @discord.ui.button(label="◀ 前へ", style=discord.ButtonStyle.secondary, row=1)
+    async def prev_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.page -= 1
+        self.guilds = list(interaction.client.guilds)
+        self._rebuild_select()
+        self.update_buttons(self.guilds)
+        embed = build_guild_list_embed(self.guilds, self.page)
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    @discord.ui.button(label="次へ ▶", style=discord.ButtonStyle.secondary, row=1)
+    async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.page += 1
+        self.guilds = list(interaction.client.guilds)
+        self._rebuild_select()
+        self.update_buttons(self.guilds)
+        embed = build_guild_list_embed(self.guilds, self.page)
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    @discord.ui.button(label="🔄 更新", style=discord.ButtonStyle.primary, row=1)
+    async def refresh_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.guilds = list(interaction.client.guilds)
+        self._rebuild_select()
+        self.update_buttons(self.guilds)
+        embed = build_guild_list_embed(self.guilds, self.page)
+        await interaction.response.edit_message(embed=embed, view=self)
+
+
+# ==================== 【その他UI部品】 ====================
+
 class MemoDeleteSelect(discord.ui.Select):
     def __init__(self, memos):
         options = []
@@ -275,7 +450,6 @@ async def on_ready():
     bot.add_view(VerifyButtonView())
     all_data = load_data()
     
-    # 【変更点①】!sync コマンドを確実に動作させるため、起動時にオーナーIDを確定・キャッシュする
     if bot.owner_id is None:
         try:
             app_info = await bot.application_info()
@@ -357,7 +531,7 @@ async def on_message(message: discord.Message):
                 to_channel = message.guild.get_channel(to_id)
                 if to_channel: await to_channel.send(message.content)
                 
-        # 2. 自動返信＋【追加】投稿された文章を通知する機能
+        # 2. 自動返信＋投稿された文章を通知する機能
         trigger_ch_id = guild_config.get("mention_trigger_channel")
         target_role_id = guild_config.get("mention_target_role")
         custom_msg = guild_config.get("mention_custom_message", "新しい書き込みがありました！")
@@ -371,15 +545,13 @@ async def on_message(message: discord.Message):
                 if len(full_reply_text) > 2000:
                     full_reply_text = full_reply_text[:1997] + "..."
                 
-                # 【変更点②】Reply権限やメッセージ履歴閲覧権限がない場合のクラッシュを防ぐ対策
                 try:
                     await message.reply(
                         full_reply_text, 
-                        allowed_mentions=discord.AllowedMentions(roles=[role]) # 明示的に対象ロールを指定して確実にメンション
+                        allowed_mentions=discord.AllowedMentions(roles=[role])
                     )
                     print(f"[自動返信成功] ch: #{message.channel.name} でロール @{role.name} 宛てに送信しました。")
                 except discord.Forbidden:
-                    # 「メッセージ履歴の閲覧」権限がないとReplyで落ちるため、通常のメッセージ送信に切り替える（フォールバック）
                     try:
                         await message.channel.send(
                             full_reply_text,
@@ -474,7 +646,8 @@ async def help_command(interaction: discord.Interaction):
             name="👑 BOT所有者専用コマンド",
             value=(
                 "`!sync` : スラッシュコマンドをDiscord側へ即時同期します (通常チャット形式)\n"
-                "`/owner_status` : Botの視聴中ステータス文字をリアルタイムで変更します"
+                "`/owner_status` : Botの視聴中ステータス文字をリアルタイムで変更します\n"
+                "`/owner_guilds` : 導入中のサーバー一覧を確認し、任意のサーバーから脱退できます"
             ),
             inline=False
         )
@@ -655,6 +828,23 @@ async def owner_status(interaction: discord.Interaction, text: str):
             await interaction.response.send_message(f"Botのステータスを「{text} を視聴中」に変更しました。", ephemeral=True)
     except Exception as e:
         await interaction.response.send_message(f"ステータスの変更中にエラーが発生しました: {e}", ephemeral=True)
+
+
+@bot.tree.command(name="owner_guilds", description="【オーナー限定】導入中のサーバー一覧を表示し、任意のサーバーから脱退できます")
+async def owner_guilds(interaction: discord.Interaction):
+    """オーナー専用: 導入サーバー一覧表示 & セレクトメニューで脱退"""
+    if not await is_owner_check(interaction):
+        return
+
+    guilds = list(interaction.client.guilds)
+
+    if not guilds:
+        await interaction.response.send_message("現在、どのサーバーにも導入されていません。", ephemeral=True)
+        return
+
+    embed = build_guild_list_embed(guilds, page=0)
+    view = GuildListView(guilds, page=0)
+    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 
 # ==================== 【管理者・許可ユーザー専用コマンド】 ====================
@@ -893,7 +1083,7 @@ async def server_announce_setup(interaction: discord.Interaction, channel: disco
     await interaction.response.send_message("お知らせ設定を保存しました。", ephemeral=True)
 
 
-@bot.tree.command(name="server_announce_send", description="設定されたチャンネルにロールメンション付きでおお知らせを送信します")
+@bot.tree.command(name="server_announce_send", description="設定されたチャンネルにロールメンション付きでお知らせを送信します")
 @app_commands.default_permissions(administrator=True)
 async def server_announce_send(interaction: discord.Interaction, message: str):
     if not interaction.guild: return
@@ -967,7 +1157,6 @@ async def server_mention_setup(interaction: discord.Interaction, channel: discor
         await interaction.response.send_message("このコマンドはサーバー管理者専用です。", ephemeral=True)
         return
 
-    # 【変更点③】処理のタイムアウトを防ぐため、最初に応答の保留（defer）を入れる
     await interaction.response.defer(ephemeral=True)
 
     try:
@@ -978,7 +1167,6 @@ async def server_mention_setup(interaction: discord.Interaction, channel: discor
         cfg["mention_custom_message"] = text  
         save_data(all_data)
         
-        # deferをしているため、応答は interaction.followup.send を使用する
         await interaction.followup.send(
             f"自動返信ロールメンション（本文引用付き）を構築しました！\n"
             f"・監視チャンネル: {channel.mention}\n"
@@ -999,7 +1187,6 @@ async def server_mention_reset(interaction: discord.Interaction):
         await interaction.response.send_message("このコマンドはサーバー管理者専用です。", ephemeral=True)
         return
 
-    # 【変更点③】こちらもタイムアウトを防ぐための defer を導入
     await interaction.response.defer(ephemeral=True)
 
     try:
