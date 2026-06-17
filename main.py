@@ -683,7 +683,8 @@ async def help_command(interaction: discord.Interaction):
                 "`!sync` : スラッシュコマンドをDiscord側へ即時同期します (通常チャット形式)\n"
                 "`/owner_status` : Botの視聴中ステータス文字をリアルタイムで変更します\n"
                 "`/owner_guilds` : 導入中のサーバー一覧を確認し、任意のサーバーから脱退できます\n"
-                "`/owner_guild_detail` : サーバーの詳細情報（ch数・ロール数・Bot設定状況）と招待リンクを取得します"
+                "`/owner_guild_detail` : サーバーの詳細情報（ch数・ロール数・Bot設定状況）と招待リンクを取得します\n"
+                "`/owner_broadcast` : 指定サーバーにEmbedでお知らせを一斉送信します"
             ),
             inline=False
         )
@@ -1430,6 +1431,314 @@ async def owner_guild_detail(interaction: discord.Interaction):
     view = GuildDetailView(guilds, page=0)
     await interaction.response.send_message(
         f"詳細を確認したいサーバーを選択してください（ページ 1/{total_pages}）",
+        view=view,
+        ephemeral=True
+    )
+
+
+# ==================== 【オーナー専用: 全サーバー一括お知らせ送信】 ====================
+
+# Embedの色選択肢
+BROADCAST_COLORS = {
+    "🔵 ブルー":   discord.Color.blue(),
+    "🟢 グリーン": discord.Color.green(),
+    "🔴 レッド":   discord.Color.red(),
+    "🟡 ゴールド": discord.Color.gold(),
+    "🟣 パープル": discord.Color.purple(),
+    "⬜ グレー":   discord.Color.greyple(),
+}
+
+
+class BroadcastEmbedModal(discord.ui.Modal, title="お知らせ内容を入力"):
+    """Embedのタイトル・本文を入力するModal"""
+    embed_title = discord.ui.TextInput(
+        label="タイトル",
+        placeholder="例: 【重要】メンテナンスのお知らせ",
+        max_length=256,
+        required=True
+    )
+    embed_body = discord.ui.TextInput(
+        label="本文",
+        style=discord.TextStyle.paragraph,
+        placeholder="お知らせの本文を入力してください...",
+        max_length=2000,
+        required=True
+    )
+
+    def __init__(self, target_guilds: list, channel_map: dict, color: discord.Color):
+        super().__init__()
+        self.target_guilds = target_guilds  # 送信対象のGuildリスト
+        self.channel_map = channel_map      # {guild_id: channel_id}
+        self.color = color
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+
+        title_text = self.embed_title.value
+        body_text = self.embed_body.value
+
+        # プレビューEmbed
+        preview_embed = discord.Embed(
+            title=f"📋 送信プレビュー（{len(self.target_guilds)}サーバー）",
+            color=discord.Color.greyple()
+        )
+        preview_embed.add_field(name="送信対象サーバー数", value=f"{len(self.target_guilds)}サーバー", inline=False)
+        preview_embed.add_field(name="Embedタイトル", value=title_text, inline=False)
+        preview_embed.add_field(name="Embed本文", value=body_text[:500] + ("..." if len(body_text) > 500 else ""), inline=False)
+
+        confirm_view = BroadcastConfirmView(
+            target_guilds=self.target_guilds,
+            channel_map=self.channel_map,
+            color=self.color,
+            title_text=title_text,
+            body_text=body_text
+        )
+        await interaction.followup.send(
+            "以下の内容で送信します。確認してください。",
+            embed=preview_embed,
+            view=confirm_view,
+            ephemeral=True
+        )
+
+
+class BroadcastConfirmView(discord.ui.View):
+    """送信前の最終確認ビュー"""
+    def __init__(self, target_guilds, channel_map, color, title_text, body_text):
+        super().__init__(timeout=120)
+        self.target_guilds = target_guilds
+        self.channel_map = channel_map
+        self.color = color
+        self.title_text = title_text
+        self.body_text = body_text
+
+    @discord.ui.button(label="✅ 送信する", style=discord.ButtonStyle.success)
+    async def confirm_send(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+
+        broadcast_embed = discord.Embed(
+            title=self.title_text,
+            description=self.body_text,
+            color=self.color
+        )
+        broadcast_embed.set_footer(text=f"送信者: {interaction.user.name}")
+        broadcast_embed.timestamp = discord.utils.utcnow()
+
+        success_list, fail_list = [], []
+
+        for guild in self.target_guilds:
+            ch_id = self.channel_map.get(guild.id)
+            ch = guild.get_channel(ch_id) if ch_id else None
+            if not ch:
+                fail_list.append(f"❌ {guild.name}（チャンネルが見つかりません）")
+                continue
+            try:
+                await ch.send(embed=broadcast_embed)
+                success_list.append(f"✅ {guild.name} → #{ch.name}")
+            except discord.Forbidden:
+                fail_list.append(f"❌ {guild.name} → #{ch.name}（送信権限なし）")
+            except Exception as e:
+                fail_list.append(f"❌ {guild.name}（エラー: {e}）")
+
+        result_embed = discord.Embed(
+            title="📊 送信結果",
+            color=discord.Color.green() if not fail_list else discord.Color.orange()
+        )
+        if success_list:
+            result_embed.add_field(
+                name=f"成功 ({len(success_list)}件)",
+                value="\n".join(success_list[:20]) + ("..." if len(success_list) > 20 else ""),
+                inline=False
+            )
+        if fail_list:
+            result_embed.add_field(
+                name=f"失敗 ({len(fail_list)}件)",
+                value="\n".join(fail_list[:10]) + ("..." if len(fail_list) > 10 else ""),
+                inline=False
+            )
+
+        for item in self.children:
+            item.disabled = True
+        await interaction.edit_original_response(view=self)
+        await interaction.followup.send(embed=result_embed, ephemeral=True)
+
+    @discord.ui.button(label="❌ キャンセル", style=discord.ButtonStyle.secondary)
+    async def cancel_send(self, interaction: discord.Interaction, button: discord.ui.Button):
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(content="❌ 送信をキャンセルしました。", embed=None, view=self)
+
+
+class BroadcastColorSelect(discord.ui.Select):
+    """Embedの色を選択するセレクトメニュー"""
+    def __init__(self, target_guilds: list, channel_map: dict):
+        self.target_guilds = target_guilds
+        self.channel_map = channel_map
+        options = [
+            discord.SelectOption(label=label, value=label)
+            for label in BROADCAST_COLORS
+        ]
+        super().__init__(placeholder="🎨 Embedの色を選択...", options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        color = BROADCAST_COLORS[self.values[0]]
+        modal = BroadcastEmbedModal(
+            target_guilds=self.target_guilds,
+            channel_map=self.channel_map,
+            color=color
+        )
+        await interaction.response.send_modal(modal)
+
+
+class BroadcastColorView(discord.ui.View):
+    """色選択ビュー"""
+    def __init__(self, target_guilds: list, channel_map: dict):
+        super().__init__(timeout=120)
+        self.add_item(BroadcastColorSelect(target_guilds, channel_map))
+
+
+class BroadcastChannelSelect(discord.ui.Select):
+    """指定サーバーの送信先チャンネルを選択するセレクトメニュー"""
+    def __init__(self, guild: discord.Guild, all_guilds: list, channel_map: dict, remaining: list):
+        self.guild = guild
+        self.all_guilds = all_guilds
+        self.channel_map = channel_map  # {guild_id: channel_id} 選択済みマップ
+        self.remaining = remaining      # まだチャンネルを選んでいないGuildリスト
+
+        options = [
+            discord.SelectOption(
+                label=f"#{ch.name}"[:100],
+                description=f"カテゴリ: {ch.category.name if ch.category else 'なし'}",
+                value=str(ch.id),
+                emoji="💬"
+            )
+            for ch in guild.text_channels[:25]
+        ]
+        if not options:
+            options = [discord.SelectOption(label="チャンネルなし", value="none")]
+
+        super().__init__(
+            placeholder=f"📢 {guild.name} の送信先チャンネルを選択...",
+            options=options
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        selected_ch_id = self.values[0]
+
+        if selected_ch_id != "none":
+            self.channel_map[self.guild.id] = int(selected_ch_id)
+
+        # 次のサーバーが残っていれば続けて選択
+        if self.remaining:
+            next_guild = self.remaining[0]
+            next_remaining = self.remaining[1:]
+            view = BroadcastChannelView(next_guild, self.all_guilds, self.channel_map, next_remaining)
+            progress = len(self.all_guilds) - len(next_remaining)
+            await interaction.response.edit_message(
+                content=f"送信先チャンネルを選択してください（{progress}/{len(self.all_guilds)}）",
+                view=view
+            )
+        else:
+            # 全サーバーのチャンネル選択完了 → 色選択へ
+            target_guilds = [g for g in self.all_guilds if g.id in self.channel_map]
+            view = BroadcastColorView(target_guilds, self.channel_map)
+            await interaction.response.edit_message(
+                content=f"✅ 全 {len(target_guilds)} サーバーの送信先を選択しました。\n次にEmbedの色を選んでください。",
+                view=view
+            )
+
+
+class BroadcastChannelView(discord.ui.View):
+    """チャンネル選択ビュー"""
+    def __init__(self, guild: discord.Guild, all_guilds: list, channel_map: dict, remaining: list):
+        super().__init__(timeout=300)
+        self.add_item(BroadcastChannelSelect(guild, all_guilds, channel_map, remaining))
+
+    @discord.ui.button(label="⏭ このサーバーをスキップ", style=discord.ButtonStyle.secondary, row=1)
+    async def skip_guild(self, interaction: discord.Interaction, button: discord.ui.Button):
+        select: BroadcastChannelSelect = self.children[0]
+        if select.remaining:
+            next_guild = select.remaining[0]
+            next_remaining = select.remaining[1:]
+            view = BroadcastChannelView(next_guild, select.all_guilds, select.channel_map, next_remaining)
+            progress = len(select.all_guilds) - len(next_remaining)
+            await interaction.response.edit_message(
+                content=f"送信先チャンネルを選択してください（{progress}/{len(select.all_guilds)}）",
+                view=view
+            )
+        else:
+            target_guilds = [g for g in select.all_guilds if g.id in select.channel_map]
+            if not target_guilds:
+                await interaction.response.edit_message(content="❌ 送信先が1件もありません。コマンドをやり直してください。", view=None)
+                return
+            view = BroadcastColorView(target_guilds, select.channel_map)
+            await interaction.response.edit_message(
+                content=f"✅ {len(target_guilds)} サーバーの送信先を選択しました。\n次にEmbedの色を選んでください。",
+                view=view
+            )
+
+
+class BroadcastGuildSelect(discord.ui.Select):
+    """送信対象サーバーを選択（全選択 or 個別選択）"""
+    def __init__(self, guilds: list):
+        self.all_guilds = guilds
+        options = [discord.SelectOption(label="📢 全サーバーに送信", value="ALL", emoji="🌐")]
+        for g in guilds[:24]:  # ALLで1枠使うので24件まで
+            options.append(discord.SelectOption(
+                label=g.name[:100],
+                description=f"メンバー: {g.member_count}人",
+                value=str(g.id),
+                emoji="🏠"
+            ))
+        super().__init__(
+            placeholder="送信対象サーバーを選択（複数可）...",
+            options=options,
+            min_values=1,
+            max_values=len(options)
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if "ALL" in self.values:
+            target_guilds = self.all_guilds
+        else:
+            selected_ids = {int(v) for v in self.values}
+            target_guilds = [g for g in self.all_guilds if g.id in selected_ids]
+
+        if not target_guilds:
+            await interaction.response.send_message("送信対象サーバーがありません。", ephemeral=True)
+            return
+
+        # 最初のサーバーのチャンネル選択へ
+        first_guild = target_guilds[0]
+        remaining = target_guilds[1:]
+        channel_map = {}
+        view = BroadcastChannelView(first_guild, target_guilds, channel_map, remaining)
+        await interaction.response.edit_message(
+            content=f"送信先チャンネルを選択してください（1/{len(target_guilds)}）",
+            view=view
+        )
+
+
+class BroadcastGuildView(discord.ui.View):
+    """送信対象サーバー選択ビュー"""
+    def __init__(self, guilds: list):
+        super().__init__(timeout=300)
+        self.add_item(BroadcastGuildSelect(guilds))
+
+
+@bot.tree.command(name="owner_broadcast", description="【オーナー限定】指定サーバーにEmbedでお知らせを一斉送信します")
+async def owner_broadcast(interaction: discord.Interaction):
+    if not await is_owner_check(interaction):
+        return
+
+    guilds = list(interaction.client.guilds)
+    if not guilds:
+        await interaction.response.send_message("現在、どのサーバーにも導入されていません。", ephemeral=True)
+        return
+
+    view = BroadcastGuildView(guilds)
+    await interaction.response.send_message(
+        "📢 **お知らせ送信先のサーバーを選択してください。**\n"
+        "「全サーバーに送信」を選ぶと全サーバーが対象になります。",
         view=view,
         ephemeral=True
     )
