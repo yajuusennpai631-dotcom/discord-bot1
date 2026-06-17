@@ -501,12 +501,47 @@ async def on_guild_remove(guild: discord.Guild):
 @bot.command(name="sync")
 @commands.is_owner()
 async def sync_command(ctx):
-    await ctx.send("Discordにスラッシュコマンドを同期中... 少々お待ちください。")
-    try:
-        await bot.tree.sync()
-        await ctx.send("スラッシュコマンドの同期が完了しました。Discordアプリを再起動して確認してください。")
-    except discord.errors.HTTPException as e:
-        await ctx.send(f"Discord側で一時的な制限がかかっています。5〜10分ほど置いて再度試してください。\nエラー内容: `{e}`")
+    """
+    使い方:
+      !sync       → このサーバーに即時同期（数秒で反映・テスト用）
+      !sync global → 全サーバーにグローバル同期（反映まで最大1時間）
+      !sync clear  → このサーバーのギルドコマンドをクリア（グローバルのみに戻す）
+    """
+    arg = ctx.message.content.replace("!sync", "").strip().lower()
+
+    if arg == "global":
+        await ctx.send("🌐 全サーバーへグローバル同期中... 反映まで最大1時間かかります。")
+        try:
+            synced = await bot.tree.sync()
+            await ctx.send(f"✅ グローバル同期完了: {len(synced)}個のコマンドを同期しました。")
+        except discord.errors.HTTPException as e:
+            await ctx.send(f"❌ Discord側で制限がかかっています。5〜10分後に再試行してください。\n`{e}`")
+
+    elif arg == "clear":
+        if not ctx.guild:
+            await ctx.send("このコマンドはサーバー内で実行してください。")
+            return
+        bot.tree.clear_commands(guild=ctx.guild)
+        await bot.tree.sync(guild=ctx.guild)
+        await ctx.send(f"🗑️ このサーバーのギルドコマンドをクリアしました。グローバルコマンドのみが有効です。")
+
+    else:
+        # 引数なし → このサーバーへ即時ギルド同期
+        if not ctx.guild:
+            await ctx.send("サーバー内で実行してください。グローバル同期は `!sync global` を使用してください。")
+            return
+        await ctx.send("⚡ このサーバーへ即時同期中...")
+        try:
+            # グローバルに登録済みのコマンドをこのギルドへコピーして即時反映
+            bot.tree.copy_global_to(guild=ctx.guild)
+            synced = await bot.tree.sync(guild=ctx.guild)
+            await ctx.send(
+                f"✅ このサーバーへの即時同期が完了しました（{len(synced)}個）。\n"
+                f"すぐに `/` で確認できます。\n"
+                f"※全サーバーへ反映したい場合は `!sync global` を実行してください（最大1時間）。"
+            )
+        except discord.errors.HTTPException as e:
+            await ctx.send(f"❌ 同期に失敗しました。\n`{e}`")
 
 @sync_command.error
 async def sync_command_error(ctx, error):
