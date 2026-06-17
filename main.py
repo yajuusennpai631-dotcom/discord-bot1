@@ -682,7 +682,8 @@ async def help_command(interaction: discord.Interaction):
             value=(
                 "`!sync` : スラッシュコマンドをDiscord側へ即時同期します (通常チャット形式)\n"
                 "`/owner_status` : Botの視聴中ステータス文字をリアルタイムで変更します\n"
-                "`/owner_guilds` : 導入中のサーバー一覧を確認し、任意のサーバーから脱退できます"
+                "`/owner_guilds` : 導入中のサーバー一覧を確認し、任意のサーバーから脱退できます\n"
+                "`/owner_guild_detail` : サーバーの詳細情報（ch数・ロール数・Bot設定状況）と招待リンクを取得します"
             ),
             inline=False
         )
@@ -1235,5 +1236,203 @@ async def server_mention_reset(interaction: discord.Interaction):
         await interaction.followup.send("自動返信ロールメンションの設定を解除しました。", ephemeral=True)
     except Exception as e:
         await interaction.followup.send(f"設定の解除中にエラーが発生しました: {e}", ephemeral=True)
+
+
+# ==================== 【オーナー専用: サーバー詳細情報 & 招待リンク取得】 ====================
+
+class GuildDetailSelect(discord.ui.Select):
+    """詳細確認するサーバーを選択するセレクトメニュー"""
+    def __init__(self, guilds: list):
+        options = [
+            discord.SelectOption(
+                label=g.name[:100],
+                description=f"メンバー: {g.member_count}人 | ID: {g.id}",
+                value=str(g.id),
+                emoji="🔍"
+            )
+            for g in guilds[:25]  # Discordのセレクトメニュー上限は25件
+        ]
+        super().__init__(
+            placeholder="🔍 詳細を確認するサーバーを選択...",
+            options=options,
+            min_values=1,
+            max_values=1
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        guild_id = int(self.values[0])
+        guild = interaction.client.get_guild(guild_id)
+
+        if not guild:
+            await interaction.response.send_message("サーバーが見つかりませんでした。", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        # 招待リンクの生成（1時間有効・1回限り）
+        invite_url = "取得失敗（権限不足またはチャンネルなし）"
+        try:
+            for ch in guild.text_channels:
+                perms = ch.permissions_for(guild.me)
+                if perms.create_instant_invite:
+                    invite = await ch.create_invite(
+                        max_age=3600,
+                        max_uses=1,
+                        unique=True,
+                        reason="オーナーによる招待リンク取得"
+                    )
+                    invite_url = invite.url
+                    break
+        except discord.Forbidden:
+            invite_url = "権限不足のため取得できませんでした"
+        except Exception as e:
+            invite_url = f"エラー: {e}"
+
+        # サーバー詳細情報のEmbed生成
+        embed = discord.Embed(
+            title=f"🔍 {guild.name} の詳細情報",
+            color=discord.Color.blurple()
+        )
+        if guild.icon:
+            embed.set_thumbnail(url=guild.icon.url)
+
+        # 基本情報
+        owner = guild.owner
+        owner_text = f"{owner} (`{owner.id}`)" if owner else f"<@{guild.owner_id}>"
+        embed.add_field(name="📛 サーバー名", value=guild.name, inline=True)
+        embed.add_field(name="🆔 サーバーID", value=f"`{guild.id}`", inline=True)
+        embed.add_field(name="👑 オーナー", value=owner_text, inline=True)
+
+        # メンバー情報
+        total = guild.member_count
+        bots = sum(1 for m in guild.members if m.bot)
+        humans = total - bots
+        embed.add_field(
+            name="👥 メンバー数",
+            value=f"総計: **{total}人**\n└ 人間: {humans}人 / Bot: {bots}体",
+            inline=True
+        )
+
+        # チャンネル情報
+        text_ch = len(guild.text_channels)
+        voice_ch = len(guild.voice_channels)
+        category_ch = len(guild.categories)
+        embed.add_field(
+            name="💬 チャンネル数",
+            value=f"テキスト: {text_ch} / ボイス: {voice_ch}\nカテゴリー: {category_ch}",
+            inline=True
+        )
+
+        # ロール情報（@everyoneを除く）
+        role_count = len(guild.roles) - 1
+        embed.add_field(name="🏷️ ロール数", value=f"{role_count}個", inline=True)
+
+        # ブースト情報
+        embed.add_field(
+            name="💎 ブースト状況",
+            value=f"Lv.{guild.premium_tier} ({guild.premium_subscription_count}回)",
+            inline=True
+        )
+
+        # サーバー作成日
+        embed.add_field(
+            name="📅 サーバー作成日",
+            value=discord.utils.format_dt(guild.created_at, style="F"),
+            inline=False
+        )
+
+        # Bot設定状況
+        all_data = load_data()
+        cfg = get_guild_config(all_data, str(guild.id))
+        settings = [
+            f"{'✅' if cfg.get('from_channel') else '❌'} メッセージ転送",
+            f"{'✅' if cfg.get('verify_channel') else '❌'} サーバー認証",
+            f"{'✅' if cfg.get('announce_channel') else '❌'} 配信お知らせ",
+            f"{'✅' if cfg.get('mention_trigger_channel') else '❌'} 自動返信メンション",
+            f"{'✅' if cfg.get('panel_roles') else '❌'} ロールパネル",
+            f"👤 許可ユーザー: {len(cfg.get('allowed_users', []))}人",
+        ]
+        embed.add_field(name="⚙️ Bot設定状況", value="\n".join(settings), inline=False)
+
+        # 招待リンク
+        embed.add_field(
+            name="🔗 招待リンク（1時間有効・1回限り）",
+            value=invite_url,
+            inline=False
+        )
+        embed.set_footer(text="取得日時")
+        embed.timestamp = discord.utils.utcnow()
+
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+class GuildDetailView(discord.ui.View):
+    """サーバー詳細確認用ビュー（ページネーション付き）"""
+    def __init__(self, guilds: list, page: int = 0):
+        super().__init__(timeout=300)
+        self.guilds = guilds
+        self.page = page
+        self._rebuild_select()
+        self._update_buttons()
+
+    def _get_page_guilds(self):
+        start = self.page * 25
+        return self.guilds[start:start + 25]
+
+    def _rebuild_select(self):
+        for item in [i for i in self.children if isinstance(i, GuildDetailSelect)]:
+            self.remove_item(item)
+        page_guilds = self._get_page_guilds()
+        if page_guilds:
+            self.add_item(GuildDetailSelect(page_guilds))
+
+    def _update_buttons(self):
+        total_pages = max(1, (len(self.guilds) + 24) // 25)
+        self.prev_btn.disabled = (self.page <= 0)
+        self.next_btn.disabled = (self.page >= total_pages - 1)
+
+    @discord.ui.button(label="◀ 前へ", style=discord.ButtonStyle.secondary, row=1)
+    async def prev_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.page -= 1
+        self.guilds = list(interaction.client.guilds)
+        self._rebuild_select()
+        self._update_buttons()
+        total_pages = max(1, (len(self.guilds) + 24) // 25)
+        await interaction.response.edit_message(
+            content=f"サーバーを選択してください（ページ {self.page + 1}/{total_pages}）",
+            view=self
+        )
+
+    @discord.ui.button(label="次へ ▶", style=discord.ButtonStyle.secondary, row=1)
+    async def next_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.page += 1
+        self.guilds = list(interaction.client.guilds)
+        self._rebuild_select()
+        self._update_buttons()
+        total_pages = max(1, (len(self.guilds) + 24) // 25)
+        await interaction.response.edit_message(
+            content=f"サーバーを選択してください（ページ {self.page + 1}/{total_pages}）",
+            view=self
+        )
+
+
+@bot.tree.command(name="owner_guild_detail", description="【オーナー限定】サーバーの詳細情報と招待リンクを取得します")
+async def owner_guild_detail(interaction: discord.Interaction):
+    if not await is_owner_check(interaction):
+        return
+
+    guilds = list(interaction.client.guilds)
+    if not guilds:
+        await interaction.response.send_message("現在、どのサーバーにも導入されていません。", ephemeral=True)
+        return
+
+    total_pages = max(1, (len(guilds) + 24) // 25)
+    view = GuildDetailView(guilds, page=0)
+    await interaction.response.send_message(
+        f"詳細を確認したいサーバーを選択してください（ページ 1/{total_pages}）",
+        view=view,
+        ephemeral=True
+    )
+
 
 bot.run(TOKEN)
