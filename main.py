@@ -880,7 +880,9 @@ async def my_clip(interaction: discord.Interaction, action: discord.app_commands
 
 # ==================== 【BOT所有者（オーナー）専用コマンド】 ====================
 
-@bot.tree.command(name="owner_status", description="【オーナー限定】Botの視聴中ステータスの文字をリアルタイムで変更します", guild_only=False)
+@bot.tree.command(name="owner_status", description="【オーナー限定】Botの視聴中ステータスの文字をリアルタイムで変更します")
+@app_commands.allowed_contexts(guilds=False, dms=True, private_channels=False)
+@app_commands.allowed_installs(guilds=True, users=False)
 async def owner_status(interaction: discord.Interaction, text: str):
     if not await is_owner_check(interaction): return
     try:
@@ -896,7 +898,9 @@ async def owner_status(interaction: discord.Interaction, text: str):
         await interaction.response.send_message(f"ステータスの変更中にエラーが発生しました: {e}", ephemeral=True)
 
 
-@bot.tree.command(name="owner_guilds", description="【オーナー限定】導入中のサーバー一覧を表示し、任意のサーバーから脱退できます", guild_only=False)
+@bot.tree.command(name="owner_guilds", description="【オーナー限定】導入中のサーバー一覧を表示し、任意のサーバーから脱退できます")
+@app_commands.allowed_contexts(guilds=False, dms=True, private_channels=False)
+@app_commands.allowed_installs(guilds=True, users=False)
 async def owner_guilds(interaction: discord.Interaction):
     if not await is_owner_check(interaction):
         return
@@ -1402,7 +1406,9 @@ class GuildDetailView(discord.ui.View):
         )
 
 
-@bot.tree.command(name="owner_guild_detail", description="【オーナー限定】サーバーの詳細情報と招待リンクを取得します", guild_only=False)
+@bot.tree.command(name="owner_guild_detail", description="【オーナー限定】サーバーの詳細情報と招待リンクを取得します")
+@app_commands.allowed_contexts(guilds=False, dms=True, private_channels=False)
+@app_commands.allowed_installs(guilds=True, users=False)
 async def owner_guild_detail(interaction: discord.Interaction):
     if not await is_owner_check(interaction):
         return
@@ -1697,7 +1703,9 @@ class BroadcastGuildView(discord.ui.View):
         self.add_item(BroadcastGuildSelect(guilds))
 
 
-@bot.tree.command(name="owner_broadcast", description="【オーナー限定】指定サーバーにEmbedでお知らせを一斉送信します", guild_only=False)
+@bot.tree.command(name="owner_broadcast", description="【オーナー限定】指定サーバーにEmbedでお知らせを一斉送信します")
+@app_commands.allowed_contexts(guilds=False, dms=True, private_channels=False)
+@app_commands.allowed_installs(guilds=True, users=False)
 async def owner_broadcast(interaction: discord.Interaction):
     if not await is_owner_check(interaction):
         return
