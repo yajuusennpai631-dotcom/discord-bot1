@@ -11,6 +11,8 @@ import urllib.request
 import urllib.parse
 import base64
 import requests
+import io
+import datetime
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 
@@ -985,6 +987,8 @@ async def help_command(interaction: discord.Interaction):
                 "`/my_scan_channels` : サーバーのチャンネル構造とカスタム権限をスキャンします\n"
                 "`/my_audit_perms` : @everyone の不適切な権限をスキャンします\n"
                 "`/my_check_url` : URLの安全性をVirusTotalでチェックします\n"
+                "`/server_bot_check` : サーバーに導入されているBOTの権限を一括スキャンします\n"
+                "`/backup_create` : サーバー構造（ロール/カテゴリ/チャンネル/権限）をJSONバックアップします\n"
                 "`/say` : Botに指定したメッセージを代わりに発言させます"
             ),
             inline=False
@@ -1296,6 +1300,85 @@ async def my_check_url(interaction: discord.Interaction, url: str):
         await interaction.followup.send(f"エラーが発生しました: {e}", ephemeral=True)
 
 
+# Bot権限スキャンで「注意すべき権限」として表示する項目
+# (属性名, 表示名)
+WATCHED_BOT_PERMISSIONS = [
+    ("administrator", "管理者"),
+    ("ban_members", "メンバーBAN"),
+    ("kick_members", "メンバーキック"),
+    ("manage_guild", "サーバー管理"),
+    ("manage_roles", "ロール管理"),
+    ("manage_channels", "チャンネル管理"),
+    ("manage_webhooks", "Webhook管理"),
+    ("manage_messages", "メッセージ管理"),
+    ("mention_everyone", "全員メンション"),
+]
+
+
+@bot.tree.command(name="server_bot_check", description="サーバーに導入されているBOTの権限をスキャンします")
+async def server_bot_check(interaction: discord.Interaction):
+    if not await is_admin_or_allowed(interaction): return
+    if not interaction.guild: return
+
+    await interaction.response.defer(ephemeral=True)
+    g = interaction.guild
+
+    bot_members = [m for m in g.members if m.bot]
+
+    if not bot_members:
+        await interaction.followup.send("このサーバーにはBOTが導入されていません。", ephemeral=True)
+        return
+
+    danger_lines = []
+    normal_lines = []
+
+    for m in bot_members:
+        perms = m.guild_permissions
+        watched = [label for attr, label in WATCHED_BOT_PERMISSIONS if getattr(perms, attr, False)]
+
+        if perms.administrator:
+            # 管理者権限を持つBOTは危険として強調
+            danger_lines.append(f"🔴 **{m.mention}** (`{m.name}`)\n　└ 危険: **管理者権限を保有**（全権限と同等）")
+        elif watched:
+            normal_lines.append(f"🟡 {m.mention} (`{m.name}`)\n　└ 権限: {', '.join(watched)}")
+        else:
+            normal_lines.append(f"🟢 {m.mention} (`{m.name}`)\n　└ 注意すべき権限はありません")
+
+    embed = discord.Embed(
+        title=f"{g.name} - BOT権限スキャン結果",
+        description=f"導入されているBOT: **{len(bot_members)}体**",
+        color=discord.Color.red() if danger_lines else discord.Color.green()
+    )
+
+    if danger_lines:
+        embed.add_field(
+            name=f"⚠️ 管理者権限を持つBOT ({len(danger_lines)}体)",
+            value="\n".join(danger_lines)[:1024],
+            inline=False
+        )
+
+    if normal_lines:
+        # Discord embedのフィールド上限(1024文字)を考慮して分割
+        chunk = []
+        chunk_len = 0
+        chunk_idx = 1
+        for line in normal_lines:
+            if chunk_len + len(line) + 1 > 1024:
+                embed.add_field(name=f"その他のBOT ({chunk_idx})", value="\n".join(chunk), inline=False)
+                chunk = []
+                chunk_len = 0
+                chunk_idx += 1
+            chunk.append(line)
+            chunk_len += len(line) + 1
+        if chunk:
+            embed.add_field(name=f"その他のBOT ({chunk_idx})" if chunk_idx > 1 else "その他のBOT", value="\n".join(chunk), inline=False)
+
+    if danger_lines:
+        embed.set_footer(text="管理者権限を持つBOTは、サーバー設定の改変やチャンネル削除など全操作が可能です。信頼できないBOTであれば権限の見直しを推奨します。")
+
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
 # ==================== 【サーバー管理者専用コマンド (要・管理者権限)】 ====================
 # ◆ @app_commands.default_permissions(administrator=True) を全て削除し、
 #    is_guild_admin() による手動チェックに統一。
@@ -1541,6 +1624,153 @@ async def server_mention_reset(interaction: discord.Interaction):
         await interaction.followup.send("自動返信ロールメンションの設定を解除しました。", ephemeral=True)
     except Exception as e:
         await interaction.followup.send(f"設定の解除中にエラーが発生しました: {e}", ephemeral=True)
+
+
+# ==================== 【荒らし対策: サーバー構造バックアップ】 ====================
+
+def _overwrites_to_dict(overwrites: dict) -> list:
+    """チャンネル/カテゴリのpermission_overwritesをJSON化可能な形に変換する"""
+    result = []
+    for target, ow in overwrites.items():
+        allow, deny = ow.pair()
+        entry = {
+            "target_type": "role" if isinstance(target, discord.Role) else "member",
+            "target_id": target.id,
+            "target_name": target.name if isinstance(target, discord.Role) else str(target),
+            "allow": [perm for perm, value in allow if value],
+            "deny": [perm for perm, value in deny if value],
+        }
+        result.append(entry)
+    return result
+
+
+def build_guild_backup_data(g: discord.Guild) -> dict:
+    """サーバーのロール・カテゴリ・チャンネル・権限構造をdictにまとめる"""
+    backup = {
+        "backup_version": 1,
+        "created_at": discord.utils.utcnow().isoformat(),
+        "guild_id": g.id,
+        "guild_name": g.name,
+    }
+
+    # ロール（@everyoneも含む。position順）
+    roles_data = []
+    for r in sorted(g.roles, key=lambda r: r.position):
+        roles_data.append({
+            "id": r.id,
+            "name": r.name,
+            "color": r.color.value,
+            "hoist": r.hoist,
+            "mentionable": r.mentionable,
+            "permissions": r.permissions.value,
+            "position": r.position,
+            "is_default": r.is_default(),
+        })
+    backup["roles"] = roles_data
+
+    # カテゴリ
+    categories_data = []
+    for cat in sorted(g.categories, key=lambda c: c.position):
+        categories_data.append({
+            "id": cat.id,
+            "name": cat.name,
+            "position": cat.position,
+            "overwrites": _overwrites_to_dict(cat.overwrites),
+        })
+    backup["categories"] = categories_data
+
+    # テキストチャンネル
+    text_channels_data = []
+    for ch in sorted(g.text_channels, key=lambda c: c.position):
+        text_channels_data.append({
+            "id": ch.id,
+            "name": ch.name,
+            "category_id": ch.category_id,
+            "position": ch.position,
+            "topic": ch.topic,
+            "nsfw": ch.nsfw,
+            "slowmode_delay": ch.slowmode_delay,
+            "overwrites": _overwrites_to_dict(ch.overwrites),
+        })
+    backup["text_channels"] = text_channels_data
+
+    # ボイスチャンネル
+    voice_channels_data = []
+    for ch in sorted(g.voice_channels, key=lambda c: c.position):
+        voice_channels_data.append({
+            "id": ch.id,
+            "name": ch.name,
+            "category_id": ch.category_id,
+            "position": ch.position,
+            "bitrate": ch.bitrate,
+            "user_limit": ch.user_limit,
+            "overwrites": _overwrites_to_dict(ch.overwrites),
+        })
+    backup["voice_channels"] = voice_channels_data
+
+    # フォーラム/Stage等その他のチャンネル種別も念のため記録
+    other_channels_data = []
+    known_ids = {c["id"] for c in text_channels_data} | {c["id"] for c in voice_channels_data} | {c["id"] for c in categories_data}
+    for ch in g.channels:
+        if ch.id in known_ids:
+            continue
+        other_channels_data.append({
+            "id": ch.id,
+            "name": ch.name,
+            "type": str(ch.type),
+            "category_id": ch.category_id,
+            "position": getattr(ch, "position", None),
+            "overwrites": _overwrites_to_dict(ch.overwrites) if hasattr(ch, "overwrites") else [],
+        })
+    backup["other_channels"] = other_channels_data
+
+    backup["summary"] = {
+        "role_count": len(roles_data),
+        "category_count": len(categories_data),
+        "text_channel_count": len(text_channels_data),
+        "voice_channel_count": len(voice_channels_data),
+        "other_channel_count": len(other_channels_data),
+    }
+
+    return backup
+
+
+@bot.tree.command(name="backup_create", description="サーバーのロール・カテゴリ・チャンネル・権限構造をJSONバックアップします（nuke荒らし対策）")
+async def backup_create(interaction: discord.Interaction):
+    if not await is_admin_or_allowed(interaction): return
+    if not interaction.guild: return
+
+    await interaction.response.defer(ephemeral=True)
+    g = interaction.guild
+
+    try:
+        backup_data = build_guild_backup_data(g)
+    except Exception as e:
+        await interaction.followup.send(f"バックアップの作成中にエラーが発生しました: {e}", ephemeral=True)
+        return
+
+    json_bytes = json.dumps(backup_data, ensure_ascii=False, indent=2).encode("utf-8")
+    file_buffer = io.BytesIO(json_bytes)
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"backup_{g.id}_{timestamp}.json"
+    discord_file = discord.File(fp=file_buffer, filename=filename)
+
+    summary = backup_data["summary"]
+    embed = discord.Embed(
+        title=f"{g.name} - バックアップ作成完了",
+        description="サーバー構造（ロール・カテゴリ・チャンネル・権限）をJSONに保存しました。\n荒らし被害時の復旧用に、安全な場所に保管してください。",
+        color=discord.Color.green()
+    )
+    embed.add_field(name="ロール数", value=f"{summary['role_count']}個", inline=True)
+    embed.add_field(name="カテゴリ数", value=f"{summary['category_count']}個", inline=True)
+    embed.add_field(name="テキストCh", value=f"{summary['text_channel_count']}個", inline=True)
+    embed.add_field(name="ボイスCh", value=f"{summary['voice_channel_count']}個", inline=True)
+    if summary["other_channel_count"]:
+        embed.add_field(name="その他Ch", value=f"{summary['other_channel_count']}個", inline=True)
+    embed.add_field(name="作成日時", value=discord.utils.format_dt(discord.utils.utcnow(), style="F"), inline=False)
+    embed.set_footer(text="※このバックアップには権限の構造のみが含まれます。メッセージ内容や絵文字・スタンプは含まれません。")
+
+    await interaction.followup.send(embed=embed, file=discord_file, ephemeral=True)
 
 
 # ==================== 【オーナー専用: サーバー詳細情報 & 招待リンク取得】 ====================
