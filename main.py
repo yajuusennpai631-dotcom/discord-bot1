@@ -123,7 +123,7 @@ async def is_owner_check(interaction: discord.Interaction) -> bool:
     return True
 
 
-# ★ 修正: オーナーを最初にチェックし、全サーバーで管理者権限相当を付与
+# ◆ 修正: オーナーを最初にチェックし、全サーバーで管理者権限相当を付与
 async def is_admin_or_allowed(interaction: discord.Interaction) -> bool:
     # オーナーIDを確定
     if interaction.client.owner_id is None:
@@ -149,7 +149,7 @@ async def is_admin_or_allowed(interaction: discord.Interaction) -> bool:
     return False
 
 
-# ★ 修正: サーバー管理者専用コマンド用チェック（オーナーも通す）
+# ◆ 修正: サーバー管理者専用コマンド用チェック（オーナーも通す）
 async def is_guild_admin(interaction: discord.Interaction) -> bool:
     """サーバー管理者 または BOTオーナーのみ通すチェック関数"""
     # オーナーIDを確定
@@ -184,7 +184,7 @@ def build_guild_list_embed(guilds: list, page: int) -> discord.Embed:
     page_guilds = guilds[start:end]
 
     embed = discord.Embed(
-        title="📋 導入中サーバー一覧",
+        title="導入中サーバー一覧",
         description=f"現在 **{len(guilds)}個** のサーバーに導入されています。",
         color=discord.Color.blurple()
     )
@@ -212,24 +212,24 @@ class GuildLeaveConfirmView(discord.ui.View):
         self.guild = guild
         self.original_view = original_view
 
-    @discord.ui.button(label="✅ 本当に脱退する", style=discord.ButtonStyle.danger)
+    @discord.ui.button(label="本当に脱退する", style=discord.ButtonStyle.danger)
     async def confirm_leave(self, interaction: discord.Interaction, button: discord.ui.Button):
         guild_name = self.guild.name
         try:
             await self.guild.leave()
             await interaction.response.edit_message(
-                content=f"✅ **{guild_name}** から脱退しました。",
+                content=f"■ **{guild_name}** から脱退しました。",
                 embed=None,
                 view=None
             )
         except discord.HTTPException as e:
             await interaction.response.edit_message(
-                content=f"❌ 脱退に失敗しました: `{e}`",
+                content=f"■ 脱退に失敗しました: `{e}`",
                 embed=None,
                 view=None
             )
 
-    @discord.ui.button(label="❌ キャンセル", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="キャンセル", style=discord.ButtonStyle.secondary)
     async def cancel_leave(self, interaction: discord.Interaction, button: discord.ui.Button):
         guilds = list(interaction.client.guilds)
         embed = build_guild_list_embed(guilds, self.original_view.page)
@@ -252,13 +252,12 @@ class GuildSelectForLeave(discord.ui.Select):
             discord.SelectOption(
                 label=g.name[:100],
                 description=f"ID: {g.id} | メンバー: {g.member_count}人",
-                value=str(g.id),
-                emoji="🚪"
+                value=str(g.id)
             )
             for g in page_guilds
         ]
         super().__init__(
-            placeholder="🚪 脱退するサーバーを選択...",
+            placeholder="脱退するサーバーを選択...",
             options=options,
             min_values=1,
             max_values=1
@@ -273,13 +272,13 @@ class GuildSelectForLeave(discord.ui.Select):
             return
 
         confirm_embed = discord.Embed(
-            title="⚠️ サーバー脱退の確認",
+            title="サーバー脱退の確認",
             description=(
                 f"以下のサーバーから本当に脱退しますか？\n\n"
                 f"**サーバー名:** {guild.name}\n"
                 f"**サーバーID:** `{guild.id}`\n"
                 f"**メンバー数:** {guild.member_count}人\n\n"
-                f"⚠️ この操作は **取り消せません。**"
+                f"※この操作は **取り消せません。**"
             ),
             color=discord.Color.red()
         )
@@ -332,7 +331,7 @@ class GuildListView(discord.ui.View):
         embed = build_guild_list_embed(self.guilds, self.page)
         await interaction.response.edit_message(embed=embed, view=self)
 
-    @discord.ui.button(label="🔄 更新", style=discord.ButtonStyle.primary, row=1)
+    @discord.ui.button(label="更新", style=discord.ButtonStyle.primary, row=1)
     async def refresh_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.guilds = list(interaction.client.guilds)
         self._rebuild_select()
@@ -541,12 +540,12 @@ async def sync_command(ctx):
     arg = ctx.message.content.replace("!sync", "").strip().lower()
 
     if arg == "global":
-        await ctx.send("🌐 全サーバーへグローバル同期中... 反映まで最大1時間かかります。")
+        await ctx.send("全サーバーへグローバル同期中... 反映まで最大1時間かかります。")
         try:
             synced = await bot.tree.sync()
-            await ctx.send(f"✅ グローバル同期完了: {len(synced)}個のコマンドを同期しました。")
+            await ctx.send(f"■ グローバル同期完了: {len(synced)}個のコマンドを同期しました。")
         except discord.errors.HTTPException as e:
-            await ctx.send(f"❌ Discord側で制限がかかっています。5〜10分後に再試行してください。\n`{e}`")
+            await ctx.send(f"■ Discord側で制限がかかっています。5〜10分後に再試行してください。\n`{e}`")
 
     elif arg == "clear":
         if not ctx.guild:
@@ -554,23 +553,23 @@ async def sync_command(ctx):
             return
         bot.tree.clear_commands(guild=ctx.guild)
         await bot.tree.sync(guild=ctx.guild)
-        await ctx.send(f"🗑️ このサーバーのギルドコマンドをクリアしました。グローバルコマンドのみが有効です。")
+        await ctx.send(f"このサーバーのギルドコマンドをクリアしました。グローバルコマンドのみが有効です。")
 
     else:
         if not ctx.guild:
             await ctx.send("サーバー内で実行してください。グローバル同期は `!sync global` を使用してください。")
             return
-        await ctx.send("⚡ このサーバーへ即時同期中...")
+        await ctx.send("このサーバーへ即時同期中...")
         try:
             bot.tree.copy_global_to(guild=ctx.guild)
             synced = await bot.tree.sync(guild=ctx.guild)
             await ctx.send(
-                f"✅ このサーバーへの即時同期が完了しました（{len(synced)}個）。\n"
+                f"■ このサーバーへの即時同期が完了しました（{len(synced)}個）。\n"
                 f"すぐに `/` で確認できます。\n"
                 f"※全サーバーへ反映したい場合は `!sync global` を実行してください（最大1時間）。"
             )
         except discord.errors.HTTPException as e:
-            await ctx.send(f"❌ 同期に失敗しました。\n`{e}`")
+            await ctx.send(f"■ 同期に失敗しました。\n`{e}`")
 
 @sync_command.error
 async def sync_command_error(ctx, error):
@@ -658,7 +657,7 @@ async def help_command(interaction: discord.Interaction):
     )
     
     embed.add_field(
-        name="👥 一般ユーザー向け機能",
+        name="▼ 一般ユーザー向け機能",
         value=(
             "`/help` : このコマンド一覧をあなただけに表示します\n"
             "`/hello` : Botが挨拶を返します\n"
@@ -669,7 +668,7 @@ async def help_command(interaction: discord.Interaction):
     )
     
     embed.add_field(
-        name="🔒 個人用プライベート機能 (他の人には見えません)",
+        name="▼ 個人用プライベート機能 (他の人には見えません)",
         value=(
             "`/my_memo` : あなた専用の個人メモを追加・一覧表示・削除・全消去します\n"
             "`/my_clip` : あなた専用のクリップ（テキストやリンク）を保存・管理します"
@@ -679,7 +678,7 @@ async def help_command(interaction: discord.Interaction):
     
     if is_admin or is_allowed or is_owner:
         embed.add_field(
-            name="🛡️ 管理者・許可ユーザー専用コマンド",
+            name="▼ 管理者・許可ユーザー専用コマンド",
             value=(
                 "`/my_scan_channels` : サーバーのチャンネル構造とカスタム権限をスキャンします\n"
                 "`/my_audit_perms` : @everyone の不適切な権限をスキャンします\n"
@@ -691,7 +690,7 @@ async def help_command(interaction: discord.Interaction):
     
     if is_admin or is_owner:
         embed.add_field(
-            name="⚙️ サーバー管理者専用コマンド",
+            name="▼ サーバー管理者専用コマンド",
             value=(
                 "`/server_status` : 現在の各種機能の設定状況を確認します\n"
                 "`/server_list_users` : コマンド使用許可リストの確認・編集を行います\n"
@@ -707,7 +706,7 @@ async def help_command(interaction: discord.Interaction):
     
     if is_owner:
         embed.add_field(
-            name="👑 BOT所有者専用コマンド",
+            name="▼ BOT所有者専用コマンド",
             value=(
                 "`!sync` : スラッシュコマンドをDiscord側へ即時同期します (通常チャット形式)\n"
                 "`/owner_status` : Botの視聴中ステータス文字をリアルタイムで変更します\n"
@@ -831,7 +830,7 @@ async def my_memo(interaction: discord.Interaction, action: discord.app_commands
 
     elif act == "list":
         memos = user_data.get("memos", [])
-        embed = discord.Embed(title="あなた専用 of 個人メモ一覧", color=discord.Color.gold())
+        embed = discord.Embed(title="あなた専用の個人メモ一覧", color=discord.Color.gold())
         embed.description = "\n".join([f"**{i+1}.** {m}" for i, m in enumerate(memos)]) if memos else "保存されているメモはありません。"
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -870,7 +869,7 @@ async def my_clip(interaction: discord.Interaction, action: discord.app_commands
     elif act == "list":
         bks = user_data.get("bookmarks", [])
         embed = discord.Embed(title="あなた専用のクリップ一覧", color=discord.Color.magenta())
-        embed.description = "\n".join([f"• {b}" for b in bks]) if bks else "保存されているクリップはありません。"
+        embed.description = "\n".join([f"・{b}" for b in bks]) if bks else "保存されているクリップはありません。"
         await interaction.response.send_message(embed=embed, ephemeral=True)
     elif act == "clear":
         user_data["bookmarks"] = []
@@ -937,7 +936,7 @@ async def my_scan_channels(interaction: discord.Interaction):
                     elif ow.view_channel is True or ow.read_messages is True: roles.append(f"閲覧可: {target.name}")
             if roles:
                 count += 1
-                report.append(f"• {ch.mention} -> {', '.join(roles[:3])}")
+                report.append(f"・{ch.mention} -> {', '.join(roles[:3])}")
     if count == 0: report.append("個別設定されたチャンネルはありません。")
     full_rep = "\n".join(report)
     await interaction.followup.send(embed=discord.Embed(title="フルスキャン結果", description=full_rep[:1950], color=discord.Color.red()), ephemeral=True)
@@ -996,7 +995,7 @@ async def my_check_url(interaction: discord.Interaction, url: str):
 
 
 # ==================== 【サーバー管理者専用コマンド (要・管理者権限)】 ====================
-# ★ @app_commands.default_permissions(administrator=True) を全て削除し、
+# ◆ @app_commands.default_permissions(administrator=True) を全て削除し、
 #    is_guild_admin() による手動チェックに統一。
 #    これによりBOTオーナーもサーバー管理者権限なしで全コマンドを利用可能。
 
@@ -1247,13 +1246,12 @@ class GuildDetailSelect(discord.ui.Select):
             discord.SelectOption(
                 label=g.name[:100],
                 description=f"メンバー: {g.member_count}人 | ID: {g.id}",
-                value=str(g.id),
-                emoji="🔍"
+                value=str(g.id)
             )
             for g in guilds[:25]
         ]
         super().__init__(
-            placeholder="🔍 詳細を確認するサーバーを選択...",
+            placeholder="詳細を確認するサーバーを選択...",
             options=options,
             min_values=1,
             max_values=1
@@ -1288,7 +1286,7 @@ class GuildDetailSelect(discord.ui.Select):
             invite_url = f"エラー: {e}"
 
         embed = discord.Embed(
-            title=f"🔍 {guild.name} の詳細情報",
+            title=f"{guild.name} の詳細情報",
             color=discord.Color.blurple()
         )
         if guild.icon:
@@ -1296,15 +1294,15 @@ class GuildDetailSelect(discord.ui.Select):
 
         owner = guild.owner
         owner_text = f"{owner} (`{owner.id}`)" if owner else f"<@{guild.owner_id}>"
-        embed.add_field(name="📛 サーバー名", value=guild.name, inline=True)
-        embed.add_field(name="🆔 サーバーID", value=f"`{guild.id}`", inline=True)
-        embed.add_field(name="👑 オーナー", value=owner_text, inline=True)
+        embed.add_field(name="サーバー名", value=guild.name, inline=True)
+        embed.add_field(name="サーバーID", value=f"`{guild.id}`", inline=True)
+        embed.add_field(name="オーナー", value=owner_text, inline=True)
 
         total = guild.member_count
         bots = sum(1 for m in guild.members if m.bot)
         humans = total - bots
         embed.add_field(
-            name="👥 メンバー数",
+            name="メンバー数",
             value=f"総計: **{total}人**\n└ 人間: {humans}人 / Bot: {bots}体",
             inline=True
         )
@@ -1313,22 +1311,22 @@ class GuildDetailSelect(discord.ui.Select):
         voice_ch = len(guild.voice_channels)
         category_ch = len(guild.categories)
         embed.add_field(
-            name="💬 チャンネル数",
+            name="チャンネル数",
             value=f"テキスト: {text_ch} / ボイス: {voice_ch}\nカテゴリー: {category_ch}",
             inline=True
         )
 
         role_count = len(guild.roles) - 1
-        embed.add_field(name="🏷️ ロール数", value=f"{role_count}個", inline=True)
+        embed.add_field(name="ロール数", value=f"{role_count}個", inline=True)
 
         embed.add_field(
-            name="💎 ブースト状況",
+            name="ブースト状況",
             value=f"Lv.{guild.premium_tier} ({guild.premium_subscription_count}回)",
             inline=True
         )
 
         embed.add_field(
-            name="📅 サーバー作成日",
+            name="サーバー作成日",
             value=discord.utils.format_dt(guild.created_at, style="F"),
             inline=False
         )
@@ -1336,17 +1334,17 @@ class GuildDetailSelect(discord.ui.Select):
         all_data = load_data()
         cfg = get_guild_config(all_data, str(guild.id))
         settings = [
-            f"{'✅' if cfg.get('from_channel') else '❌'} メッセージ転送",
-            f"{'✅' if cfg.get('verify_channel') else '❌'} サーバー認証",
-            f"{'✅' if cfg.get('announce_channel') else '❌'} 配信お知らせ",
-            f"{'✅' if cfg.get('mention_trigger_channel') else '❌'} 自動返信メンション",
-            f"{'✅' if cfg.get('panel_roles') else '❌'} ロールパネル",
-            f"👤 許可ユーザー: {len(cfg.get('allowed_users', []))}人",
+            f"{'■' if cfg.get('from_channel') else '―'} メッセージ転送",
+            f"{'■' if cfg.get('verify_channel') else '―'} サーバー認証",
+            f"{'■' if cfg.get('announce_channel') else '―'} 配信お知らせ",
+            f"{'■' if cfg.get('mention_trigger_channel') else '―'} 自動返信メンション",
+            f"{'■' if cfg.get('panel_roles') else '―'} ロールパネル",
+            f"許可ユーザー: {len(cfg.get('allowed_users', []))}人",
         ]
-        embed.add_field(name="⚙️ Bot設定状況", value="\n".join(settings), inline=False)
+        embed.add_field(name="Bot設定状況", value="\n".join(settings), inline=False)
 
         embed.add_field(
-            name="🔗 招待リンク（1時間有効・1回限り）",
+            name="招待リンク（1時間有効・1回限り）",
             value=invite_url,
             inline=False
         )
@@ -1430,12 +1428,12 @@ async def owner_guild_detail(interaction: discord.Interaction):
 # ==================== 【オーナー専用: 全サーバー一括お知らせ送信】 ====================
 
 BROADCAST_COLORS = {
-    "🔵 ブルー":   discord.Color.blue(),
-    "🟢 グリーン": discord.Color.green(),
-    "🔴 レッド":   discord.Color.red(),
-    "🟡 ゴールド": discord.Color.gold(),
-    "🟣 パープル": discord.Color.purple(),
-    "⬜ グレー":   discord.Color.greyple(),
+    "ブルー":   discord.Color.blue(),
+    "グリーン": discord.Color.green(),
+    "レッド":   discord.Color.red(),
+    "ゴールド": discord.Color.gold(),
+    "パープル": discord.Color.purple(),
+    "グレー":   discord.Color.greyple(),
 }
 
 
@@ -1467,7 +1465,7 @@ class BroadcastEmbedModal(discord.ui.Modal, title="お知らせ内容を入力")
         body_text = self.embed_body.value
 
         preview_embed = discord.Embed(
-            title=f"📋 送信プレビュー（{len(self.target_guilds)}サーバー）",
+            title=f"送信プレビュー（{len(self.target_guilds)}サーバー）",
             color=discord.Color.greyple()
         )
         preview_embed.add_field(name="送信対象サーバー数", value=f"{len(self.target_guilds)}サーバー", inline=False)
@@ -1498,7 +1496,7 @@ class BroadcastConfirmView(discord.ui.View):
         self.title_text = title_text
         self.body_text = body_text
 
-    @discord.ui.button(label="✅ 送信する", style=discord.ButtonStyle.success)
+    @discord.ui.button(label="送信する", style=discord.ButtonStyle.success)
     async def confirm_send(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer(ephemeral=True)
 
@@ -1516,18 +1514,18 @@ class BroadcastConfirmView(discord.ui.View):
             ch_id = self.channel_map.get(guild.id)
             ch = guild.get_channel(ch_id) if ch_id else None
             if not ch:
-                fail_list.append(f"❌ {guild.name}（チャンネルが見つかりません）")
+                fail_list.append(f"× {guild.name}（チャンネルが見つかりません）")
                 continue
             try:
                 await ch.send(embed=broadcast_embed)
-                success_list.append(f"✅ {guild.name} → #{ch.name}")
+                success_list.append(f"○ {guild.name} → #{ch.name}")
             except discord.Forbidden:
-                fail_list.append(f"❌ {guild.name} → #{ch.name}（送信権限なし）")
+                fail_list.append(f"× {guild.name} → #{ch.name}（送信権限なし）")
             except Exception as e:
-                fail_list.append(f"❌ {guild.name}（エラー: {e}）")
+                fail_list.append(f"× {guild.name}（エラー: {e}）")
 
         result_embed = discord.Embed(
-            title="📊 送信結果",
+            title="送信結果",
             color=discord.Color.green() if not fail_list else discord.Color.orange()
         )
         if success_list:
@@ -1548,11 +1546,11 @@ class BroadcastConfirmView(discord.ui.View):
         await interaction.edit_original_response(view=self)
         await interaction.followup.send(embed=result_embed, ephemeral=True)
 
-    @discord.ui.button(label="❌ キャンセル", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="キャンセル", style=discord.ButtonStyle.secondary)
     async def cancel_send(self, interaction: discord.Interaction, button: discord.ui.Button):
         for item in self.children:
             item.disabled = True
-        await interaction.response.edit_message(content="❌ 送信をキャンセルしました。", embed=None, view=self)
+        await interaction.response.edit_message(content="送信をキャンセルしました。", embed=None, view=self)
 
 
 class BroadcastColorSelect(discord.ui.Select):
@@ -1563,7 +1561,7 @@ class BroadcastColorSelect(discord.ui.Select):
             discord.SelectOption(label=label, value=label)
             for label in BROADCAST_COLORS
         ]
-        super().__init__(placeholder="🎨 Embedの色を選択...", options=options)
+        super().__init__(placeholder="Embedの色を選択...", options=options)
 
     async def callback(self, interaction: discord.Interaction):
         color = BROADCAST_COLORS[self.values[0]]
@@ -1592,8 +1590,7 @@ class BroadcastChannelSelect(discord.ui.Select):
             discord.SelectOption(
                 label=f"#{ch.name}"[:100],
                 description=f"カテゴリ: {ch.category.name if ch.category else 'なし'}",
-                value=str(ch.id),
-                emoji="💬"
+                value=str(ch.id)
             )
             for ch in guild.text_channels[:25]
         ]
@@ -1601,7 +1598,7 @@ class BroadcastChannelSelect(discord.ui.Select):
             options = [discord.SelectOption(label="チャンネルなし", value="none")]
 
         super().__init__(
-            placeholder=f"📢 {guild.name} の送信先チャンネルを選択...",
+            placeholder=f"{guild.name} の送信先チャンネルを選択...",
             options=options
         )
 
@@ -1624,7 +1621,7 @@ class BroadcastChannelSelect(discord.ui.Select):
             target_guilds = [g for g in self.all_guilds if g.id in self.channel_map]
             view = BroadcastColorView(target_guilds, self.channel_map)
             await interaction.response.edit_message(
-                content=f"✅ 全 {len(target_guilds)} サーバーの送信先を選択しました。\n次にEmbedの色を選んでください。",
+                content=f"全 {len(target_guilds)} サーバーの送信先を選択しました。\n次にEmbedの色を選んでください。",
                 view=view
             )
 
@@ -1634,7 +1631,7 @@ class BroadcastChannelView(discord.ui.View):
         super().__init__(timeout=300)
         self.add_item(BroadcastChannelSelect(guild, all_guilds, channel_map, remaining))
 
-    @discord.ui.button(label="⏭ このサーバーをスキップ", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="このサーバーをスキップ", style=discord.ButtonStyle.secondary, row=1)
     async def skip_guild(self, interaction: discord.Interaction, button: discord.ui.Button):
         select: BroadcastChannelSelect = self.children[0]
         if select.remaining:
@@ -1649,11 +1646,11 @@ class BroadcastChannelView(discord.ui.View):
         else:
             target_guilds = [g for g in select.all_guilds if g.id in select.channel_map]
             if not target_guilds:
-                await interaction.response.edit_message(content="❌ 送信先が1件もありません。コマンドをやり直してください。", view=None)
+                await interaction.response.edit_message(content="送信先が1件もありません。コマンドをやり直してください。", view=None)
                 return
             view = BroadcastColorView(target_guilds, select.channel_map)
             await interaction.response.edit_message(
-                content=f"✅ {len(target_guilds)} サーバーの送信先を選択しました。\n次にEmbedの色を選んでください。",
+                content=f"{len(target_guilds)} サーバーの送信先を選択しました。\n次にEmbedの色を選んでください。",
                 view=view
             )
 
@@ -1661,13 +1658,12 @@ class BroadcastChannelView(discord.ui.View):
 class BroadcastGuildSelect(discord.ui.Select):
     def __init__(self, guilds: list):
         self.all_guilds = guilds
-        options = [discord.SelectOption(label="📢 全サーバーに送信", value="ALL", emoji="🌐")]
+        options = [discord.SelectOption(label="全サーバーに送信", value="ALL")]
         for g in guilds[:24]:
             options.append(discord.SelectOption(
                 label=g.name[:100],
                 description=f"メンバー: {g.member_count}人",
-                value=str(g.id),
-                emoji="🏠"
+                value=str(g.id)
             ))
         super().__init__(
             placeholder="送信対象サーバーを選択（複数可）...",
@@ -1717,7 +1713,7 @@ async def owner_broadcast(interaction: discord.Interaction):
 
     view = BroadcastGuildView(guilds)
     await interaction.response.send_message(
-        "📢 **お知らせ送信先のサーバーを選択してください。**\n"
+        "お知らせ送信先のサーバーを選択してください。\n"
         "「全サーバーに送信」を選ぶと全サーバーが対象になります。",
         view=view,
         ephemeral=True
