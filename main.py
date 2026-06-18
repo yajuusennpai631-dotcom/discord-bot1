@@ -18,6 +18,9 @@ if not TOKEN:
     print("エラー: 環境変数 'DISCORD_TOKEN' が見つかりません。")
     sys.exit(1)
 
+# ◆ 追加: 申請パネルを送信する固定チャンネル名（BOTオーナーが事前に指定）
+APPROVAL_PANEL_CHANNEL_NAME = os.getenv("APPROVAL_PANEL_CHANNEL_NAME", "bot-許可申請")
+
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
@@ -70,8 +73,12 @@ def get_guild_config(all_data, guild_id_str):
             "panel_roles": [],
             "mention_trigger_channel": None,  
             "mention_target_role": None,       
-            "mention_custom_message": None    
+            "mention_custom_message": None,
+            "approval_status": "pending",
+            "approval_panel_channel_id": None
         }
+    if "approval_status" not in all_data[guild_id_str]:
+        all_data[guild_id_str]["approval_status"] = "pending"
     return all_data[guild_id_str]
 
 def get_user_app_data(all_data, user_id_str):
@@ -123,6 +130,12 @@ async def is_owner_check(interaction: discord.Interaction) -> bool:
     return True
 
 
+def is_guild_approved(all_data, guild_id_str: str) -> bool:
+    """サーバーがBOTオーナーから利用許可されているかを確認する"""
+    cfg = get_guild_config(all_data, guild_id_str)
+    return cfg.get("approval_status") == "approved"
+
+
 # ◆ 修正: オーナーを最初にチェックし、全サーバーで管理者権限相当を付与
 async def is_admin_or_allowed(interaction: discord.Interaction) -> bool:
     # オーナーIDを確定
@@ -170,6 +183,232 @@ async def is_guild_admin(interaction: discord.Interaction) -> bool:
 
     await interaction.response.send_message("このコマンドはサーバー管理者専用です。", ephemeral=True)
     return False
+
+
+# ==================== 【BOTオーナー許可制: 導入時承認フロー】 ====================
+
+def find_approval_panel_channel(guild: discord.Guild):
+    """固定チャンネル名から申請パネル送信先を検索する"""
+    channel = discord.utils.find(
+        lambda c: c.name == APPROVAL_PANEL_CHANNEL_NAME and isinstance(c, discord.TextChannel),
+        guild.text_channels
+    )
+    if channel:
+        return channel
+    # フォールバック: Botが送信可能な最初のテキストチャンネル
+    for ch in guild.text_channels:
+        perms = ch.permissions_for(guild.me)
+        if perms.send_messages:
+            return ch
+    return None
+
+
+def build_approval_request_embed(guild: discord.Guild) -> discord.Embed:
+    embed = discord.Embed(
+        title="🔒 このBOTの導入にはBOT所有者の許可が必要です",
+        description=(
+            "このBOTを継続して利用するには、**BOT所有者の承認**が必要です。\n\n"
+            "下のボタンを押すと、BOT所有者に参加許可申請のDMが送信されます。\n"
+            "所有者が**許可**すればBotが利用可能になります。\n"
+            "所有者が**拒否**した場合、Botは自動的にサーバーから退出します。"
+        ),
+        color=discord.Color.orange()
+    )
+    embed.add_field(name="🏠 このサーバー", value=guild.name, inline=True)
+    embed.add_field(name="👤 メンバー数", value=f"{guild.member_count}人", inline=True)
+    embed.set_footer(text="サーバー管理者がボタンを押して申請してください")
+    return embed
+
+
+class ApprovalRequestView(discord.ui.View):
+    """サーバー側に表示する『許可申請を送る』ボタン"""
+    def __init__(self, guild_id: int):
+        super().__init__(timeout=None)
+        self.guild_id = guild_id
+
+    @discord.ui.button(label="📩 BOT所有者に許可申請を送る", style=discord.ButtonStyle.primary, custom_id="send_approval_request")
+    async def send_request(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.guild:
+            return
+
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("このボタンはサーバー管理者のみ使用できます。", ephemeral=True)
+            return
+
+        all_data = load_data()
+        cfg = get_guild_config(all_data, str(interaction.guild.id))
+
+        if cfg.get("approval_status") == "approved":
+            await interaction.response.send_message("このサーバーは既に許可されています。", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        client = interaction.client
+        if client.owner_id is None:
+            app_info = await client.application_info()
+            client.owner_id = app_info.owner.id
+
+        try:
+            owner = client.get_user(client.owner_id) or await client.fetch_user(client.owner_id)
+        except Exception:
+            owner = None
+
+        if not owner:
+            await interaction.followup.send("BOT所有者の情報を取得できませんでした。時間をおいて再試行してください。", ephemeral=True)
+            return
+
+        request_embed = discord.Embed(
+            title="📨 新しいサーバー導入の許可申請",
+            description="以下のサーバーからBotの利用許可申請が届きました。",
+            color=discord.Color.gold()
+        )
+        if interaction.guild.icon:
+            request_embed.set_thumbnail(url=interaction.guild.icon.url)
+
+        owner_text = f"<@{interaction.guild.owner_id}>" if interaction.guild.owner_id else "不明"
+        request_embed.add_field(name="サーバー名", value=interaction.guild.name, inline=True)
+        request_embed.add_field(name="サーバーID", value=f"`{interaction.guild.id}`", inline=True)
+        request_embed.add_field(name="サーバーオーナー", value=owner_text, inline=True)
+        request_embed.add_field(name="メンバー数", value=f"{interaction.guild.member_count}人", inline=True)
+        request_embed.add_field(name="申請者", value=f"{interaction.user} ({interaction.user.mention})", inline=False)
+        request_embed.timestamp = discord.utils.utcnow()
+
+        try:
+            await owner.send(
+                embed=request_embed,
+                view=ApprovalDecisionView(
+                    guild_id=interaction.guild.id,
+                    panel_channel_id=interaction.channel.id
+                )
+            )
+        except discord.Forbidden:
+            await interaction.followup.send(
+                "BOT所有者へのDM送信に失敗しました（DM拒否設定の可能性があります）。所有者に直接ご連絡ください。",
+                ephemeral=True
+            )
+            return
+        except Exception as e:
+            await interaction.followup.send(f"申請送信中にエラーが発生しました: {e}", ephemeral=True)
+            return
+
+        cfg["approval_status"] = "pending_review"
+        save_data(all_data)
+
+        button.disabled = True
+        button.label = "申請送信済み（所有者の確認待ち）"
+        try:
+            await interaction.message.edit(view=self)
+        except Exception:
+            pass
+
+        await interaction.followup.send("BOT所有者に許可申請を送信しました。承認結果をお待ちください。", ephemeral=True)
+
+
+class ApprovalDecisionView(discord.ui.View):
+    """BOTオーナーのDMに表示する『許可/拒否』ボタン"""
+    def __init__(self, guild_id: int, panel_channel_id: int):
+        super().__init__(timeout=None)
+        self.guild_id = guild_id
+        self.panel_channel_id = panel_channel_id
+
+    async def _notify_panel_channel(self, client, text: str):
+        guild = client.get_guild(self.guild_id)
+        if not guild:
+            return
+        channel = guild.get_channel(self.panel_channel_id)
+        if channel:
+            try:
+                await channel.send(text)
+            except Exception:
+                pass
+
+    @discord.ui.button(label="✅ 許可する", style=discord.ButtonStyle.success, custom_id="approve_guild")
+    async def approve(self, interaction: discord.Interaction, button: discord.ui.Button):
+        client = interaction.client
+        if client.owner_id is None:
+            app_info = await client.application_info()
+            client.owner_id = app_info.owner.id
+        if interaction.user.id != client.owner_id:
+            await interaction.response.send_message("このボタンはBOT所有者専用です。", ephemeral=True)
+            return
+
+        guild = client.get_guild(self.guild_id)
+        guild_name = guild.name if guild else f"ID:{self.guild_id}"
+
+        all_data = load_data()
+        cfg = get_guild_config(all_data, str(self.guild_id))
+        cfg["approval_status"] = "approved"
+        save_data(all_data)
+
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(
+            content=f"✅ **{guild_name}** の利用を許可しました。",
+            embed=None,
+            view=self
+        )
+
+        await self._notify_panel_channel(
+            client,
+            f"✅ BOT所有者がこのサーバーでの利用を**許可**しました。全機能が利用可能になりました。"
+        )
+
+    @discord.ui.button(label="❌ 拒否する", style=discord.ButtonStyle.danger, custom_id="reject_guild")
+    async def reject(self, interaction: discord.Interaction, button: discord.ui.Button):
+        client = interaction.client
+        if client.owner_id is None:
+            app_info = await client.application_info()
+            client.owner_id = app_info.owner.id
+        if interaction.user.id != client.owner_id:
+            await interaction.response.send_message("このボタンはBOT所有者専用です。", ephemeral=True)
+            return
+
+        guild = client.get_guild(self.guild_id)
+        guild_name = guild.name if guild else f"ID:{self.guild_id}"
+
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(
+            content=f"❌ **{guild_name}** への導入を拒否しました。サーバーから退出します。",
+            embed=None,
+            view=self
+        )
+
+        if guild:
+            try:
+                await guild.leave()
+                print(f"[許可拒否] {guild_name} (ID: {self.guild_id}) から自動退出しました。")
+            except Exception as e:
+                print(f"[許可拒否エラー] 退出処理に失敗しました: {e}")
+
+        all_data = load_data()
+        if str(self.guild_id) in all_data:
+            del all_data[str(self.guild_id)]
+            save_data(all_data)
+
+
+async def send_approval_panel(guild: discord.Guild):
+    """サーバー参加時に許可申請パネルを送信する"""
+    channel = find_approval_panel_channel(guild)
+    if not channel:
+        print(f"[許可パネル] {guild.name} に送信可能なチャンネルが見つかりませんでした。")
+        return
+
+    embed = build_approval_request_embed(guild)
+    view = ApprovalRequestView(guild_id=guild.id)
+    try:
+        await channel.send(embed=embed, view=view)
+        print(f"[許可パネル] {guild.name} (#{channel.name}) に申請パネルを送信しました。")
+
+        all_data = load_data()
+        cfg = get_guild_config(all_data, str(guild.id))
+        cfg["approval_panel_channel_id"] = channel.id
+        save_data(all_data)
+    except discord.Forbidden:
+        print(f"[許可パネルエラー] {guild.name} で送信権限がありません。")
+    except Exception as e:
+        print(f"[許可パネルエラー] {guild.name} で予期しないエラー: {e}")
 
 
 # ==================== 【オーナー専用: サーバー一覧 UI】 ====================
@@ -475,11 +714,51 @@ class VerifyButtonView(discord.ui.View):
             await interaction.response.send_message(f"エラーが発生しました: {e}", ephemeral=True)
 
 
+# ◆ 追加: 全スラッシュコマンドの実行前に承認状態をチェックするグローバルフィルタ
+@bot.tree.interaction_check
+async def global_approval_check(interaction: discord.Interaction) -> bool:
+    # DM等、ギルド外でのインタラクションはここでは制限しない
+    if not interaction.guild:
+        return True
+
+    # オーナーIDを確定
+    if bot.owner_id is None:
+        try:
+            app_info = await bot.application_info()
+            bot.owner_id = app_info.owner.id
+        except Exception:
+            pass
+
+    # BOTオーナーは未許可サーバーでも常に操作可能（許可申請の確認や設定変更のため）
+    if interaction.user.id == bot.owner_id:
+        return True
+
+    all_data = load_data()
+    if not is_guild_approved(all_data, str(interaction.guild.id)):
+        await interaction.response.send_message(
+            "🔒 このサーバーはまだBOT所有者の利用許可を受けていません。\n"
+            "サーバー管理者に申請パネルからの許可申請をご依頼ください。",
+            ephemeral=True
+        )
+        return False
+
+    return True
+
+
 @bot.event
 async def on_ready():
     bot.add_view(VerifyButtonView())
     all_data = load_data()
-    
+
+    # ◆ 追加: 再起動後も許可申請パネル/承認DMのボタンを有効化する
+    for guild_id_str, config in all_data.items():
+        if guild_id_str == "user_apps":
+            continue
+        if config.get("approval_status") in ("pending", "pending_review"):
+            bot.add_view(ApprovalRequestView(guild_id=int(guild_id_str)))
+            panel_ch_id = config.get("approval_panel_channel_id") or 0
+            bot.add_view(ApprovalDecisionView(guild_id=int(guild_id_str), panel_channel_id=panel_ch_id))
+
     if bot.owner_id is None:
         try:
             app_info = await bot.application_info()
@@ -501,6 +780,7 @@ async def on_ready():
         guild = bot.get_guild(int(guild_id_str))
         guild_name = guild.name if guild else "不明なサーバー"
         print(f"サーバー: {guild_name} (ID: {guild_id_str})")
+        print(f"  > 承認状態: {config.get('approval_status', 'pending')}")
         print(f"  > Message転送: {'有効' if config.get('from_channel') else '未設定'}")
         print(f"  > サーバー認証: {'有効' if config.get('verify_channel') else '未設定'}")
         print(f"  > 配信お知らせ: {'有効' if config.get('announce_channel') else '未設定'}")
@@ -521,6 +801,14 @@ async def on_ready():
 async def on_guild_join(guild: discord.Guild):
     print(f"[サーバー参加] {guild.name} (ID: {guild.id}) に導入されました。")
     await update_bot_status(bot)
+
+    # ◆ 追加: 未許可状態として登録し、許可申請パネルを送信する
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(guild.id))
+    cfg["approval_status"] = "pending"
+    save_data(all_data)
+
+    await send_approval_panel(guild)
 
 @bot.event
 async def on_guild_remove(guild: discord.Guild):
@@ -585,6 +873,11 @@ async def on_message(message: discord.Message):
     
     if guild_id_str in all_data:
         guild_config = all_data[guild_id_str]
+
+        # ◆ 追加: 未許可サーバーでは自動応答系の機能も停止する
+        if guild_config.get("approval_status") != "approved":
+            await bot.process_commands(message)
+            return
         
         # 1. 管理者のメッセージ自動転送
         from_id = guild_config.get("from_channel")
@@ -1012,6 +1305,10 @@ async def server_status(interaction: discord.Interaction):
     embed = discord.Embed(title=f"{g.name} - 設定状況", description="このサーバーで有効化されている設定一覧です。", color=discord.Color.blue())
     if g.icon: embed.set_thumbnail(url=g.icon.url)
 
+    approval_status = cfg.get("approval_status", "pending")
+    approval_label = {"approved": "✅ 許可済み", "pending_review": "⏳ 所有者確認待ち", "pending": "🔒 未申請"}.get(approval_status, approval_status)
+    embed.add_field(name="BOT利用許可状態", value=approval_label, inline=False)
+
     from_ch = g.get_channel(cfg.get("from_channel")) if cfg.get("from_channel") else None
     to_ch = g.get_channel(cfg.get("to_channel")) if cfg.get("to_channel") else None
     forward_status = f"有効\n・転送元: {from_ch.mention if from_ch else '削除済'}\n・転送先: {to_ch.mention if to_ch else '削除済'}" if (from_ch or to_ch) else "未設定"
@@ -1333,7 +1630,10 @@ class GuildDetailSelect(discord.ui.Select):
 
         all_data = load_data()
         cfg = get_guild_config(all_data, str(guild.id))
+        approval_status = cfg.get("approval_status", "pending")
+        approval_label = {"approved": "✅ 許可済み", "pending_review": "⏳ 確認待ち", "pending": "🔒 未申請"}.get(approval_status, approval_status)
         settings = [
+            f"利用許可: {approval_label}",
             f"{'■' if cfg.get('from_channel') else '―'} メッセージ転送",
             f"{'■' if cfg.get('verify_channel') else '―'} サーバー認証",
             f"{'■' if cfg.get('announce_channel') else '―'} 配信お知らせ",
