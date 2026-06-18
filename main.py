@@ -736,7 +736,8 @@ async def global_approval_check(interaction: discord.Interaction) -> bool:
     all_data = load_data()
     if not is_guild_approved(all_data, str(interaction.guild.id)):
         await interaction.response.send_message(
-            "🔒 このサーバーはまだBOT所有者の利用許可を受けていません。\n"
+            "🔒 エラー: BOT所有者の認証がまだです。\n"
+            "このサーバーはBOT所有者の利用許可を受けていないため、コマンドは無効化されています。\n"
             "サーバー管理者に申請パネルからの許可申請をご依頼ください。",
             ephemeral=True
         )
