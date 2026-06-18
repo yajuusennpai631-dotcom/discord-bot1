@@ -25,10 +25,8 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 
-bot = commands.Bot(
-    command_prefix="!",
-    intents=intents
-)
+# ◆ 注意: bot インスタンスは load_data() など下記の関数定義後にまとめて生成する
+# （ApprovalCommandTree が load_data / get_guild_config を参照するため）
 
 if os.path.exists("/app/data"):
     JSON_FILE = "/app/data/allowed_users.json"
@@ -81,6 +79,54 @@ def get_guild_config(all_data, guild_id_str):
         all_data[guild_id_str]["approval_status"] = "pending"
     return all_data[guild_id_str]
 
+
+def is_guild_approved(all_data, guild_id_str: str) -> bool:
+    """サーバーがBOTオーナーから利用許可されているかを確認する"""
+    cfg = get_guild_config(all_data, guild_id_str)
+    return cfg.get("approval_status") == "approved"
+
+
+# ◆ 修正: interaction_check は CommandTree をサブクラス化してオーバーライドする必要がある。
+#    （@bot.tree.interaction_check というデコレータ形式は実際には機能しないため）
+class ApprovalCommandTree(app_commands.CommandTree):
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        # DM等、ギルド外でのインタラクションはここでは制限しない
+        if not interaction.guild:
+            return True
+
+        client = interaction.client
+
+        # オーナーIDを確定
+        if client.owner_id is None:
+            try:
+                app_info = await client.application_info()
+                client.owner_id = app_info.owner.id
+            except Exception:
+                pass
+
+        # BOTオーナーは未許可サーバーでも常に操作可能（許可申請の確認や設定変更のため）
+        if interaction.user.id == client.owner_id:
+            return True
+
+        all_data = load_data()
+        if not is_guild_approved(all_data, str(interaction.guild.id)):
+            await interaction.response.send_message(
+                "🔒 エラー: BOT所有者の認証がまだです。\n"
+                "このサーバーはBOT所有者の利用許可を受けていないため、コマンドは無効化されています。\n"
+                "サーバー管理者に申請パネルからの許可申請をご依頼ください。",
+                ephemeral=True
+            )
+            return False
+
+        return True
+
+
+bot = commands.Bot(
+    command_prefix="!",
+    intents=intents,
+    tree_cls=ApprovalCommandTree
+)
+
 def get_user_app_data(all_data, user_id_str):
     if "user_apps" not in all_data:
         all_data["user_apps"] = {}
@@ -128,12 +174,6 @@ async def is_owner_check(interaction: discord.Interaction) -> bool:
         await interaction.response.send_message("このコマンドはアプリの所有者専用です。", ephemeral=True)
         return False
     return True
-
-
-def is_guild_approved(all_data, guild_id_str: str) -> bool:
-    """サーバーがBOTオーナーから利用許可されているかを確認する"""
-    cfg = get_guild_config(all_data, guild_id_str)
-    return cfg.get("approval_status") == "approved"
 
 
 # ◆ 修正: オーナーを最初にチェックし、全サーバーで管理者権限相当を付与
@@ -712,38 +752,6 @@ class VerifyButtonView(discord.ui.View):
             await interaction.response.send_message("認証が完了しました。", ephemeral=True)
         except Exception as e:
             await interaction.response.send_message(f"エラーが発生しました: {e}", ephemeral=True)
-
-
-# ◆ 追加: 全スラッシュコマンドの実行前に承認状態をチェックするグローバルフィルタ
-@bot.tree.interaction_check
-async def global_approval_check(interaction: discord.Interaction) -> bool:
-    # DM等、ギルド外でのインタラクションはここでは制限しない
-    if not interaction.guild:
-        return True
-
-    # オーナーIDを確定
-    if bot.owner_id is None:
-        try:
-            app_info = await bot.application_info()
-            bot.owner_id = app_info.owner.id
-        except Exception:
-            pass
-
-    # BOTオーナーは未許可サーバーでも常に操作可能（許可申請の確認や設定変更のため）
-    if interaction.user.id == bot.owner_id:
-        return True
-
-    all_data = load_data()
-    if not is_guild_approved(all_data, str(interaction.guild.id)):
-        await interaction.response.send_message(
-            "🔒 エラー: BOT所有者の認証がまだです。\n"
-            "このサーバーはBOT所有者の利用許可を受けていないため、コマンドは無効化されています。\n"
-            "サーバー管理者に申請パネルからの許可申請をご依頼ください。",
-            ephemeral=True
-        )
-        return False
-
-    return True
 
 
 @bot.event
