@@ -1,12 +1,8 @@
-エラーの原因は、Pythonプログラムファイル（main.py）の1行目に、プログラムではない日本語の説明文（「まだうまく動作しない（チャンネルやロールが作成されない）とのこと、ご不便をおかけしています。」）がそのまま書き込まれてしまっていることです。
 
-Pythonはプログラム以外の文字列がコード内に直接書き込まれていると、構文エラー（SyntaxError）を出して起動を停止してしまいます。
 
-このエラーを解消するためには、/app/main.py
-の中身を一度すべて消去し、以下の修正済みのコード（最初のメッセージでご提示いただいたBotのプログラムコード）のみを貼り付け直して保存してください。
+### 修正後の `main.py` のコード
 
-修正後の main.py のコード
-
+```python
 print("=== WINDOWS_TEST_0615_AUTO_STATUS_AND_PERMS ===")
 
 import os
@@ -2859,3 +2855,4 @@ async def antinuke_status(interaction: discord.Interaction):
 
 
 bot.run(TOKEN)
+```
