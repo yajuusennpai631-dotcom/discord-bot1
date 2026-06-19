@@ -104,7 +104,7 @@ class ApprovalCommandTree(app_commands.CommandTree):
         all_data = load_data()
         if not is_guild_approved(all_data, str(interaction.guild.id)):
             await interaction.response.send_message(
-                "🔒 エラー: BOT所有者の認証がまだです。\n"
+                "エラー: BOT所有者の認証がまだです。\n"
                 "このサーバーはBOT所有者の利用許可を受けていないため、コマンドは無効化されています。\n"
                 "サーバー管理者に申請パネルからの許可申請をご依頼ください。",
                 ephemeral=True
@@ -226,7 +226,7 @@ def find_approval_panel_channel(guild: discord.Guild):
 
 def build_approval_request_embed(guild: discord.Guild) -> discord.Embed:
     embed = discord.Embed(
-        title="🔒 このBOTの導入にはBOT所有者の許可が必要です",
+        title="このBOTの導入にはBOT所有者の許可が必要です",
         description=(
             "このBOTを継続して利用するには、**BOT所有者の承認**が必要です。\n\n"
             "下のボタンを押すと、BOT所有者に参加許可申請のDMが送信されます。\n"
@@ -235,8 +235,8 @@ def build_approval_request_embed(guild: discord.Guild) -> discord.Embed:
         ),
         color=discord.Color.orange()
     )
-    embed.add_field(name="🏠 このサーバー", value=guild.name, inline=True)
-    embed.add_field(name="👤 メンバー数", value=f"{guild.member_count}人", inline=True)
+    embed.add_field(name="このサーバー", value=guild.name, inline=True)
+    embed.add_field(name="メンバー数", value=f"{guild.member_count}人", inline=True)
     embed.set_footer(text="サーバー管理者がボタンを押して申請してください")
     return embed
 
@@ -246,7 +246,7 @@ class ApprovalRequestView(discord.ui.View):
         super().__init__(timeout=None)
         self.guild_id = guild_id
 
-    @discord.ui.button(label="📩 BOT所有者に許可申請を送る", style=discord.ButtonStyle.primary, custom_id="send_approval_request")
+    @discord.ui.button(label="BOT所有者に許可申請を送る", style=discord.ButtonStyle.primary, custom_id="send_approval_request")
     async def send_request(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not interaction.guild:
             return
@@ -279,7 +279,7 @@ class ApprovalRequestView(discord.ui.View):
             return
 
         request_embed = discord.Embed(
-            title="📨 新しいサーバー導入の許可申請",
+            title="新しいサーバー導入の許可申請",
             description="以下のサーバーからBotの利用許可申請が届きました。",
             color=discord.Color.gold()
         )
@@ -342,7 +342,7 @@ class ApprovalDecisionView(discord.ui.View):
             except Exception:
                 pass
 
-    @discord.ui.button(label="✅ 許可する", style=discord.ButtonStyle.success, custom_id="approve_guild")
+    @discord.ui.button(label="許可する", style=discord.ButtonStyle.success, custom_id="approve_guild")
     async def approve(self, interaction: discord.Interaction, button: discord.ui.Button):
         client = interaction.client
         if client.owner_id is None:
@@ -363,17 +363,17 @@ class ApprovalDecisionView(discord.ui.View):
         for item in self.children:
             item.disabled = True
         await interaction.response.edit_message(
-            content=f"✅ **{guild_name}** の利用を許可しました。",
+            content=f"**{guild_name}** の利用を許可しました。",
             embed=None,
             view=self
         )
 
         await self._notify_panel_channel(
             client,
-            f"✅ BOT所有者がこのサーバーでの利用を**許可**しました。全機能が利用可能になりました。"
+            f"BOT所有者がこのサーバーでの利用を許可しました。全機能が利用可能になりました。"
         )
 
-    @discord.ui.button(label="❌ 拒否する", style=discord.ButtonStyle.danger, custom_id="reject_guild")
+    @discord.ui.button(label="拒否する", style=discord.ButtonStyle.danger, custom_id="reject_guild")
     async def reject(self, interaction: discord.Interaction, button: discord.ui.Button):
         client = interaction.client
         if client.owner_id is None:
@@ -389,7 +389,7 @@ class ApprovalDecisionView(discord.ui.View):
         for item in self.children:
             item.disabled = True
         await interaction.response.edit_message(
-            content=f"❌ **{guild_name}** への導入を拒否しました。サーバーから退出します。",
+            content=f"**{guild_name}** への導入を拒否しました。サーバーから退出します。",
             embed=None,
             view=self
         )
@@ -471,13 +471,13 @@ class GuildLeaveConfirmView(discord.ui.View):
         try:
             await self.guild.leave()
             await interaction.response.edit_message(
-                content=f"■ **{guild_name}** から脱退しました。",
+                content=f"**{guild_name}** から脱退しました。",
                 embed=None,
                 view=None
             )
         except discord.HTTPException as e:
             await interaction.response.edit_message(
-                content=f"■ 脱退に失敗しました: `{e}`",
+                content=f"脱退に失敗しました: `{e}`",
                 embed=None,
                 view=None
             )
@@ -530,7 +530,7 @@ class GuildSelectForLeave(discord.ui.Select):
                 f"**サーバー名:** {guild.name}\n"
                 f"**サーバーID:** `{guild.id}`\n"
                 f"**メンバー数:** {guild.member_count}人\n\n"
-                f"※この操作は **取り消せません。**"
+                f"この操作は **取り消せません。**"
             ),
             color=discord.Color.red()
         )
@@ -564,7 +564,7 @@ class GuildListView(discord.ui.View):
         self.prev_button.disabled = (self.page <= 0)
         self.next_button.disabled = (self.page >= total_pages - 1)
 
-    @discord.ui.button(label="◀ 前へ", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="前へ", style=discord.ButtonStyle.secondary, row=1)
     async def prev_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.page -= 1
         self.guilds = list(interaction.client.guilds)
@@ -573,7 +573,7 @@ class GuildListView(discord.ui.View):
         embed = build_guild_list_embed(self.guilds, self.page)
         await interaction.response.edit_message(embed=embed, view=self)
 
-    @discord.ui.button(label="次へ ▶", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="次へ", style=discord.ButtonStyle.secondary, row=1)
     async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.page += 1
         self.guilds = list(interaction.client.guilds)
@@ -888,6 +888,12 @@ async def _wipe_guild(guild: discord.Guild) -> tuple[list[str], list[str]]:
     return success_logs, fail_logs
 
 
+# ----------------------------------------------------------------
+# 修正箇所:
+#   ワイプ後はチャンネル・ロール・カテゴリが存在しないため、
+#   existing_* を空辞書で初期化し、常に新規作成ルートに入るように変更。
+#   （旧コードは削除前の古いオブジェクト辞書を使っていたため edit が失敗していた）
+# ----------------------------------------------------------------
 async def _restore_from_backup(guild: discord.Guild, data: dict):
     success_logs = []
     fail_logs    = []
@@ -900,31 +906,21 @@ async def _restore_from_backup(guild: discord.Guild, data: dict):
         fail_logs.append(f"@everyone 権限の復元に失敗: {e}")
 
     old_role_id_map = {}
-    existing_roles  = {r.name: r for r in guild.roles}
 
+    # ワイプ後はロールが存在しないため existing_roles は空で固定
     for r_data in sorted(data.get("roles", []), key=lambda r: r["position"]):
         if r_data.get("managed"):
             fail_logs.append(f"ロール「{r_data['name']}」はBot管理ロールのためスキップ")
             continue
         try:
-            if r_data["name"] in existing_roles:
-                role = existing_roles[r_data["name"]]
-                await role.edit(
-                    color=discord.Color(r_data["color"]),
-                    hoist=r_data["hoist"],
-                    mentionable=r_data["mentionable"],
-                    permissions=discord.Permissions(r_data["permissions"]),
-                )
-                success_logs.append(f"ロール「{r_data['name']}」を更新しました")
-            else:
-                role = await guild.create_role(
-                    name=r_data["name"],
-                    color=discord.Color(r_data["color"]),
-                    hoist=r_data["hoist"],
-                    mentionable=r_data["mentionable"],
-                    permissions=discord.Permissions(r_data["permissions"]),
-                )
-                success_logs.append(f"ロール「{r_data['name']}」を新規作成しました")
+            role = await guild.create_role(
+                name=r_data["name"],
+                color=discord.Color(r_data["color"]),
+                hoist=r_data["hoist"],
+                mentionable=r_data["mentionable"],
+                permissions=discord.Permissions(r_data["permissions"]),
+            )
+            success_logs.append(f"ロール「{r_data['name']}」を作成しました")
             old_role_id_map[r_data["id"]] = role
         except Exception as e:
             fail_logs.append(f"ロール「{r_data['name']}」の復元に失敗: {e}")
@@ -945,86 +941,58 @@ async def _restore_from_backup(guild: discord.Guild, data: dict):
             overwrites[target] = discord.PermissionOverwrite.from_pair(allow, deny)
         return overwrites
 
-    existing_cats = {c.name: c for c in guild.categories}
-
     old_cat_id_map = {}
 
+    # ワイプ後はカテゴリが存在しないため常に新規作成
     for c_data in sorted(data.get("categories", []), key=lambda c: c["position"]):
         try:
             overwrites = _build_overwrites(c_data.get("overwrites", {}))
-            if c_data["name"] in existing_cats:
-                cat = existing_cats[c_data["name"]]
-                await cat.edit(overwrites=overwrites)
-                success_logs.append(f"カテゴリ「{c_data['name']}」の権限を更新しました")
-            else:
-                cat = await guild.create_category(name=c_data["name"], overwrites=overwrites)
-                success_logs.append(f"カテゴリ「{c_data['name']}」を新規作成しました")
+            cat = await guild.create_category(name=c_data["name"], overwrites=overwrites)
+            success_logs.append(f"カテゴリ「{c_data['name']}」を作成しました")
             old_cat_id_map[c_data["id"]] = cat
         except Exception as e:
             fail_logs.append(f"カテゴリ「{c_data['name']}」の復元に失敗: {e}")
 
-    existing_text_chs  = {c.name: c for c in guild.text_channels}
-    existing_voice_chs = {c.name: c for c in guild.voice_channels}
-
+    # ワイプ後はテキストチャンネルが存在しないため常に新規作成
     for ch_data in sorted(data.get("text_channels", []), key=lambda c: c["position"]):
         try:
             overwrites = _build_overwrites(ch_data.get("overwrites", {}))
             category   = old_cat_id_map.get(ch_data.get("category_id"))
 
-            if ch_data["name"] in existing_text_chs:
-                ch = existing_text_chs[ch_data["name"]]
-                await ch.edit(
-                    topic=ch_data.get("topic"),
-                    nsfw=ch_data.get("nsfw", False),
-                    slowmode_delay=ch_data.get("slowmode", 0),
-                    overwrites=overwrites,
-                    category=category,
-                )
-                success_logs.append(f"テキストch「#{ch_data['name']}」の設定を更新しました")
-            else:
-                ch = await guild.create_text_channel(
-                    name=ch_data["name"],
-                    topic=ch_data.get("topic"),
-                    nsfw=ch_data.get("nsfw", False),
-                    slowmode_delay=ch_data.get("slowmode", 0),
-                    overwrites=overwrites,
-                    category=category,
-                )
-                success_logs.append(f"テキストch「#{ch_data['name']}」を新規作成しました")
+            ch = await guild.create_text_channel(
+                name=ch_data["name"],
+                topic=ch_data.get("topic"),
+                nsfw=ch_data.get("nsfw", False),
+                slowmode_delay=ch_data.get("slowmode", 0),
+                overwrites=overwrites,
+                category=category,
+            )
+            success_logs.append(f"テキストch「#{ch_data['name']}」を作成しました")
 
             for wh_data in ch_data.get("webhooks", []):
                 try:
                     await ch.create_webhook(name=wh_data["name"])
-                    success_logs.append(f"  └ Webhook「{wh_data['name']}」を再作成しました")
+                    success_logs.append(f"  Webhook「{wh_data['name']}」を作成しました")
                 except Exception as we:
-                    fail_logs.append(f"  └ Webhook「{wh_data['name']}」の作成に失敗: {we}")
+                    fail_logs.append(f"  Webhook「{wh_data['name']}」の作成に失敗: {we}")
 
         except Exception as e:
             fail_logs.append(f"テキストch「#{ch_data['name']}」の復元に失敗: {e}")
 
+    # ワイプ後はボイスチャンネルが存在しないため常に新規作成
     for ch_data in sorted(data.get("voice_channels", []), key=lambda c: c["position"]):
         try:
             overwrites = _build_overwrites(ch_data.get("overwrites", {}))
             category   = old_cat_id_map.get(ch_data.get("category_id"))
 
-            if ch_data["name"] in existing_voice_chs:
-                ch = existing_voice_chs[ch_data["name"]]
-                await ch.edit(
-                    bitrate=min(ch_data.get("bitrate", 64000), guild.bitrate_limit),
-                    user_limit=ch_data.get("user_limit", 0),
-                    overwrites=overwrites,
-                    category=category,
-                )
-                success_logs.append(f"ボイスch「{ch_data['name']}」の設定を更新しました")
-            else:
-                await guild.create_voice_channel(
-                    name=ch_data["name"],
-                    bitrate=min(ch_data.get("bitrate", 64000), guild.bitrate_limit),
-                    user_limit=ch_data.get("user_limit", 0),
-                    overwrites=overwrites,
-                    category=category,
-                )
-                success_logs.append(f"ボイスch「{ch_data['name']}」を新規作成しました")
+            await guild.create_voice_channel(
+                name=ch_data["name"],
+                bitrate=min(ch_data.get("bitrate", 64000), guild.bitrate_limit),
+                user_limit=ch_data.get("user_limit", 0),
+                overwrites=overwrites,
+                category=category,
+            )
+            success_logs.append(f"ボイスch「{ch_data['name']}」を作成しました")
         except Exception as e:
             fail_logs.append(f"ボイスch「{ch_data['name']}」の復元に失敗: {e}")
 
@@ -1036,7 +1004,7 @@ class RestoreConfirmView(discord.ui.View):
         super().__init__(timeout=120)
         self.backup_data = backup_data
 
-    @discord.ui.button(label="✅ 全削除してリストアを実行する", style=discord.ButtonStyle.danger)
+    @discord.ui.button(label="全削除してリストアを実行する", style=discord.ButtonStyle.danger)
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not interaction.guild:
             return
@@ -1051,27 +1019,36 @@ class RestoreConfirmView(discord.ui.View):
             pass
 
         await interaction.followup.send(
-            "🗑️ 既存のチャンネル・カテゴリ・ロールを削除しています...",
+            "既存のチャンネル・カテゴリ・ロールを削除しています...",
             ephemeral=True
         )
 
+        # ワイプ実行
         wipe_success, wipe_fail = await _wipe_guild(interaction.guild)
 
         await interaction.followup.send(
-            f"🗑️ 削除完了（成功: {len(wipe_success)}件 / 失敗: {len(wipe_fail)}件）\n"
-            f"📦 バックアップから再構築しています...",
+            f"削除完了（成功: {len(wipe_success)}件 / 失敗: {len(wipe_fail)}件）\n"
+            f"バックアップから再構築しています...",
             ephemeral=True
         )
 
-        restore_success, restore_fail = await _restore_from_backup(interaction.guild, self.backup_data)
+        # ----------------------------------------------------------------
+        # 修正箇所:
+        #   ワイプ後にギルドオブジェクトを再取得して渡す。
+        #   discord.py のキャッシュは削除操作後も古い状態を持つ場合があるため、
+        #   interaction.guild を都度参照せずに bot.get_guild で最新を取得する。
+        # ----------------------------------------------------------------
+        fresh_guild = interaction.client.get_guild(interaction.guild.id) or interaction.guild
+
+        restore_success, restore_fail = await _restore_from_backup(fresh_guild, self.backup_data)
 
         success_logs = wipe_success + restore_success
         fail_logs    = wipe_fail + restore_fail
 
         result_lines = (
-            [f"**リストア完了** ✅成功: {len(success_logs)}件 / ❌失敗: {len(fail_logs)}件\n"]
-            + [f"✅ {s}" for s in success_logs]
-            + [f"❌ {f}" for f in fail_logs]
+            [f"**リストア完了** 成功: {len(success_logs)}件 / 失敗: {len(fail_logs)}件\n"]
+            + [f"OK {s}" for s in success_logs]
+            + [f"NG {f}" for f in fail_logs]
         )
 
         chunk = ""
@@ -1179,9 +1156,9 @@ async def sync_command(ctx):
         await ctx.send("全サーバーへグローバル同期中... 反映まで最大1時間かかります。")
         try:
             synced = await bot.tree.sync()
-            await ctx.send(f"■ グローバル同期完了: {len(synced)}個のコマンドを同期しました。")
+            await ctx.send(f"グローバル同期完了: {len(synced)}個のコマンドを同期しました。")
         except discord.errors.HTTPException as e:
-            await ctx.send(f"■ Discord側で制限がかかっています。5〜10分後に再試行してください。\n`{e}`")
+            await ctx.send(f"Discord側で制限がかかっています。5〜10分後に再試行してください。\n`{e}`")
 
     elif arg == "clear":
         if not ctx.guild:
@@ -1200,12 +1177,12 @@ async def sync_command(ctx):
             bot.tree.copy_global_to(guild=ctx.guild)
             synced = await bot.tree.sync(guild=ctx.guild)
             await ctx.send(
-                f"■ このサーバーへの即時同期が完了しました（{len(synced)}個）。\n"
+                f"このサーバーへの即時同期が完了しました（{len(synced)}個）。\n"
                 f"すぐに `/` で確認できます。\n"
-                f"※全サーバーへ反映したい場合は `!sync global` を実行してください（最大1時間）。"
+                f"全サーバーへ反映したい場合は `!sync global` を実行してください（最大1時間）。"
             )
         except discord.errors.HTTPException as e:
-            await ctx.send(f"■ 同期に失敗しました。\n`{e}`")
+            await ctx.send(f"同期に失敗しました。\n`{e}`")
 
 @sync_command.error
 async def sync_command_error(ctx, error):
@@ -1293,7 +1270,7 @@ async def help_command(interaction: discord.Interaction):
     )
     
     embed.add_field(
-        name="▼ 一般ユーザー向け機能",
+        name="一般ユーザー向け機能",
         value=(
             "`/help` : このコマンド一覧をあなただけに表示します\n"
             "`/hello` : Botが挨拶を返します\n"
@@ -1304,7 +1281,7 @@ async def help_command(interaction: discord.Interaction):
     )
     
     embed.add_field(
-        name="▼ 個人用プライベート機能 (他の人には見えません)",
+        name="個人用プライベート機能 (他の人には見えません)",
         value=(
             "`/my_memo` : あなた専用の個人メモを追加・一覧表示・削除・全消去します\n"
             "`/my_clip` : あなた専用のクリップ（テキストやリンク）を保存・管理します"
@@ -1314,7 +1291,7 @@ async def help_command(interaction: discord.Interaction):
     
     if is_admin or is_allowed or is_owner:
         embed.add_field(
-            name="▼ 管理者・許可ユーザー専用コマンド",
+            name="管理者・許可ユーザー専用コマンド",
             value=(
                 "`/my_scan_channels` : サーバーのチャンネル構造とカスタム権限をスキャンします\n"
                 "`/my_audit_perms` : @everyone の不適切な権限をスキャンします\n"
@@ -1326,7 +1303,7 @@ async def help_command(interaction: discord.Interaction):
     
     if is_admin or is_owner:
         embed.add_field(
-            name="▼ サーバー管理者専用コマンド",
+            name="サーバー管理者専用コマンド",
             value=(
                 "`/server_status` : 現在の各種機能の設定状況を確認します\n"
                 "`/server_list_users` : コマンド使用許可リストの確認・編集を行います\n"
@@ -1337,19 +1314,19 @@ async def help_command(interaction: discord.Interaction):
                 "`/server_verify_setup` / `btn` : メンバー認証用パネルを設置します\n"
                 "`/server_mention_setup` / `reset` : 自動返信ロールメンションの設定と解除を行います\n"
                 "`/server_backup` : サーバーのロール・チャンネル・権限をJSONバックアップします\n"
-                "`/server_restore` : バックアップJSONからサーバー構成を復元します（nuke対策）\n"
-                "`/antinuke` : nuke対策の有効・無効を切り替えます\n"
+                "`/server_restore` : バックアップJSONからサーバー構成を復元します\n"
+                "`/antinuke` : 不審な連続操作の自動検出を有効・無効にします\n"
                 "`/antinuke_level` : 検出時の対応（ロール剥奪 or BAN）を設定します\n"
-                "`/antinuke_threshold` : nukeとみなす操作回数・時間幅を設定します\n"
+                "`/antinuke_threshold` : 検出条件の操作回数・時間幅を設定します\n"
                 "`/antinuke_notify` : 通知先チャンネルと免除ロールを設定します\n"
-                "`/antinuke_status` : アンチnukeの現在の設定状況を確認します"
+                "`/antinuke_status` : 現在の設定状況を確認します"
             ),
             inline=False
         )
     
     if is_owner:
         embed.add_field(
-            name="▼ BOT所有者専用コマンド",
+            name="BOT所有者専用コマンド",
             value=(
                 "`!sync` : スラッシュコマンドをDiscord側へ即時同期します (通常チャット形式)\n"
                 "`/owner_status` : Botの視聴中ステータス文字をリアルタイムで変更します\n"
@@ -1360,7 +1337,7 @@ async def help_command(interaction: discord.Interaction):
             inline=False
         )
     
-    embed.set_footer(text="※セキュリティのため、このヘルプは実行したあなたにのみ見えています。")
+    embed.set_footer(text="セキュリティのため、このヘルプは実行したあなたにのみ見えています。")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
@@ -1645,7 +1622,7 @@ async def server_status(interaction: discord.Interaction):
     if g.icon: embed.set_thumbnail(url=g.icon.url)
 
     approval_status = cfg.get("approval_status", "pending")
-    approval_label = {"approved": "✅ 許可済み", "pending_review": "⏳ 所有者確認待ち", "pending": "🔒 未申請"}.get(approval_status, approval_status)
+    approval_label = {"approved": "許可済み", "pending_review": "所有者確認待ち", "pending": "未申請"}.get(approval_status, approval_status)
     embed.add_field(name="BOT利用許可状態", value=approval_label, inline=False)
 
     from_ch = g.get_channel(cfg.get("from_channel")) if cfg.get("from_channel") else None
@@ -1840,11 +1817,11 @@ async def server_mention_setup(interaction: discord.Interaction, channel: discor
         save_data(all_data)
         
         await interaction.followup.send(
-            f"自動返信ロールメンション（本文引用付き）を構築しました！\n"
+            f"自動返信ロールメンション（本文引用付き）を設定しました。\n"
             f"・監視チャンネル: {channel.mention}\n"
             f"・通知するロール: {role.mention}\n"
             f"・返信するテキスト: `{text}`\n"
-            f"※誰かが書き込むと、Botがメッセージを引用しながらロールメンションを付けてインライン返信します。", 
+            f"誰かが書き込むと、Botがメッセージを引用しながらロールメンションを付けてインライン返信します。", 
             ephemeral=True
         )
     except Exception as e:
@@ -1894,7 +1871,7 @@ async def server_backup(interaction: discord.Interaction):
     filename   = f"backup_{interaction.guild.id}_{timestamp}.json"
 
     embed = discord.Embed(
-        title="✅ サーバーバックアップ完了",
+        title="サーバーバックアップ完了",
         color=discord.Color.green()
     )
     if interaction.guild.icon:
@@ -1918,7 +1895,7 @@ async def server_backup(interaction: discord.Interaction):
         name="使い方",
         value=(
             "このJSONファイルを大切に保管してください。\n"
-            "nuke等で破壊された場合は `/server_restore` にこのファイルを添付すると復元できます。"
+            "サーバーが破壊された場合は `/server_restore` にこのファイルを添付すると復元できます。"
         ),
         inline=False
     )
@@ -1934,7 +1911,7 @@ async def server_backup(interaction: discord.Interaction):
 
 @bot.tree.command(
     name="server_restore",
-    description="バックアップJSONを添付してサーバー構成を復元します（nuke対策）"
+    description="バックアップJSONを添付してサーバー構成を復元します"
 )
 async def server_restore(interaction: discord.Interaction, backup_file: discord.Attachment):
     if not await is_guild_admin(interaction): return
@@ -1971,23 +1948,23 @@ async def server_restore(interaction: discord.Interaction, backup_file: discord.
     guild_match = meta.get("guild_id") == interaction.guild.id
 
     embed = discord.Embed(
-        title="🚨 サーバー全削除＆リストア確認",
+        title="サーバー全削除・リストア確認",
         description=(
             "バックアップデータを確認しました。\n\n"
-            "**この操作を実行すると、現在のサーバーの以下が全て削除されます：**\n"
+            "この操作を実行すると、現在のサーバーの以下が全て削除されます:\n"
             "・全テキストチャンネル\n"
             "・全ボイスチャンネル\n"
             "・全カテゴリ\n"
             "・全ロール（@everyone・Bot連携ロールを除く）\n\n"
-            "**削除後、バックアップの内容で再構築します。**\n"
-            "⚠️ この操作は**取り消せません**。"
+            "削除後、バックアップの内容で再構築します。\n"
+            "この操作は取り消せません。"
         ),
         color=discord.Color.red()
     )
     embed.add_field(name="バックアップ元サーバー", value=meta.get("guild_name", "不明"), inline=True)
     embed.add_field(
         name="サーバー一致",
-        value="✅ 同じサーバー" if guild_match else "⚠️ 別のサーバーのバックアップです",
+        value="同じサーバー" if guild_match else "別のサーバーのバックアップです",
         inline=True
     )
     embed.add_field(name="バックアップ日時", value=meta.get("backed_up_at", "不明")[:19].replace("T", " ") + " UTC", inline=False)
@@ -2102,14 +2079,14 @@ class GuildDetailSelect(discord.ui.Select):
         all_data = load_data()
         cfg = get_guild_config(all_data, str(guild.id))
         approval_status = cfg.get("approval_status", "pending")
-        approval_label = {"approved": "✅ 許可済み", "pending_review": "⏳ 確認待ち", "pending": "🔒 未申請"}.get(approval_status, approval_status)
+        approval_label = {"approved": "許可済み", "pending_review": "確認待ち", "pending": "未申請"}.get(approval_status, approval_status)
         settings = [
             f"利用許可: {approval_label}",
-            f"{'■' if cfg.get('from_channel') else '―'} メッセージ転送",
-            f"{'■' if cfg.get('verify_channel') else '―'} サーバー認証",
-            f"{'■' if cfg.get('announce_channel') else '―'} 配信お知らせ",
-            f"{'■' if cfg.get('mention_trigger_channel') else '―'} 自動返信メンション",
-            f"{'■' if cfg.get('panel_roles') else '―'} ロールパネル",
+            f"{'ON' if cfg.get('from_channel') else 'OFF'} メッセージ転送",
+            f"{'ON' if cfg.get('verify_channel') else 'OFF'} サーバー認証",
+            f"{'ON' if cfg.get('announce_channel') else 'OFF'} 配信お知らせ",
+            f"{'ON' if cfg.get('mention_trigger_channel') else 'OFF'} 自動返信メンション",
+            f"{'ON' if cfg.get('panel_roles') else 'OFF'} ロールパネル",
             f"許可ユーザー: {len(cfg.get('allowed_users', []))}人",
         ]
         embed.add_field(name="Bot設定状況", value="\n".join(settings), inline=False)
@@ -2149,7 +2126,7 @@ class GuildDetailView(discord.ui.View):
         self.prev_btn.disabled = (self.page <= 0)
         self.next_btn.disabled = (self.page >= total_pages - 1)
 
-    @discord.ui.button(label="◀ 前へ", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="前へ", style=discord.ButtonStyle.secondary, row=1)
     async def prev_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.page -= 1
         self.guilds = list(interaction.client.guilds)
@@ -2161,7 +2138,7 @@ class GuildDetailView(discord.ui.View):
             view=self
         )
 
-    @discord.ui.button(label="次へ ▶", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="次へ", style=discord.ButtonStyle.secondary, row=1)
     async def next_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.page += 1
         self.guilds = list(interaction.client.guilds)
@@ -2208,7 +2185,7 @@ BROADCAST_COLORS = {
 class BroadcastEmbedModal(discord.ui.Modal, title="お知らせ内容を入力"):
     embed_title = discord.ui.TextInput(
         label="タイトル",
-        placeholder="例: 【重要】メンテナンスのお知らせ",
+        placeholder="例: メンテナンスのお知らせ",
         max_length=256,
         required=True
     )
@@ -2282,15 +2259,15 @@ class BroadcastConfirmView(discord.ui.View):
             ch_id = self.channel_map.get(guild.id)
             ch = guild.get_channel(ch_id) if ch_id else None
             if not ch:
-                fail_list.append(f"× {guild.name}（チャンネルが見つかりません）")
+                fail_list.append(f"x {guild.name}（チャンネルが見つかりません）")
                 continue
             try:
                 await ch.send(embed=broadcast_embed)
-                success_list.append(f"○ {guild.name} → #{ch.name}")
+                success_list.append(f"o {guild.name} → #{ch.name}")
             except discord.Forbidden:
-                fail_list.append(f"× {guild.name} → #{ch.name}（送信権限なし）")
+                fail_list.append(f"x {guild.name} → #{ch.name}（送信権限なし）")
             except Exception as e:
-                fail_list.append(f"× {guild.name}（エラー: {e}）")
+                fail_list.append(f"x {guild.name}（エラー: {e}）")
 
         result_embed = discord.Embed(
             title="送信結果",
@@ -2489,15 +2466,9 @@ async def owner_broadcast(interaction: discord.Interaction):
 
 
 # ====================================================================
-# アンチnuke（不審な大量操作の自動検出）
-#
-# 短時間にチャンネル削除・ロール削除・BAN・Webhook作成が連続したら、
-# 犯人と思われるユーザーのロールを剥奪（または任意でBAN）して被害を止める。
-# 設定は4つのコマンドに分けてある：
-#   /antinuke            … ON/OFFの切り替えだけ
-#   /antinuke_level       … 検出時の対応（ロール剥奪 or BAN）
-#   /antinuke_threshold    … 何回・何秒で検出するか
-#   /antinuke_notify      … 通知先チャンネルと免除ロール
+# アンチnuke
+# 短時間にチャンネル削除・ロール削除・BAN・Webhook作成が連続した場合、
+# 犯人と思われるユーザーのロールを剥奪またはBANして被害を止める。
 # ====================================================================
 
 DEFAULT_ANTINUKE_CONFIG = {
@@ -2525,7 +2496,7 @@ _action_history: dict[int, dict[int, dict[str, list]]] = collections.defaultdict
     lambda: collections.defaultdict(lambda: collections.defaultdict(list))
 )
 
-# 二重対応を防ぐための処理中フラグ（guild_id, user_id）
+# 二重対応防止フラグ（guild_id, user_id）
 _already_handled: set[tuple[int, int]] = set()
 
 
@@ -2566,29 +2537,27 @@ async def _handle_nuke_detected(guild: discord.Guild, suspect: discord.Member, a
     try:
         if cfg["action"] == "ban":
             try:
-                await guild.ban(suspect, reason=f"アンチnuke自動検出: {action_label}の連続実行")
-                result_text = f"🔨 **{suspect}** をサーバーからBANしました。"
+                await guild.ban(suspect, reason=f"antinuke: {action_label}の連続実行を検出")
+                result_text = f"{suspect} をBANしました。"
             except discord.Forbidden:
-                result_text = f"⚠️ **{suspect}** のBANに失敗しました（Bot権限不足）。代わりにロールを剥奪します。"
+                result_text = f"{suspect} のBANに失敗しました（権限不足）。ロール剥奪を試みます。"
                 await _strip_roles(guild, suspect)
             except Exception as e:
-                result_text = f"⚠️ **{suspect}** のBAN中にエラー: {e}\n代わりにロールを剥奪します。"
+                result_text = f"{suspect} のBAN中にエラー: {e}。ロール剥奪を試みます。"
                 await _strip_roles(guild, suspect)
         else:
             await _strip_roles(guild, suspect)
-            result_text = f"🛡️ **{suspect}** の危険なロールを全て剥奪しました。"
+            result_text = f"{suspect} の危険な権限を持つロールを剥奪しました。"
     except Exception as e:
-        result_text = f"❌ 自動対応中にエラーが発生しました: {e}"
+        result_text = f"自動対応中にエラーが発生しました: {e}"
 
     embed = discord.Embed(
-        title="🚨 アンチnuke: 不審な操作を検出しました",
-        description=(
-            f"**検出内容:** {action_label}が短時間に連続実行されました。\n"
-            f"**対象者:** {suspect.mention} (`{suspect.id}`)\n\n"
-            f"**実行した対応:**\n{result_text}"
-        ),
+        title="antinuke: 不審な操作を検出しました",
         color=discord.Color.red()
     )
+    embed.add_field(name="検出内容", value=f"{action_label}が短時間に連続実行されました", inline=False)
+    embed.add_field(name="対象ユーザー", value=f"{suspect.mention} (`{suspect.id}`)", inline=False)
+    embed.add_field(name="実行した対応", value=result_text, inline=False)
     embed.timestamp = discord.utils.utcnow()
     embed.set_footer(text=f"サーバー: {guild.name}")
 
@@ -2614,7 +2583,7 @@ async def _handle_nuke_detected(guild: discord.Guild, suspect: discord.Member, a
     except Exception:
         pass
 
-    print(f"[アンチnuke] {guild.name} で {suspect} による {action_label} の連続実行を検出し、対応しました。")
+    print(f"[antinuke] {guild.name}: {suspect} による {action_label} の連続実行を検出しました。")
 
     await asyncio.sleep(300)
     _already_handled.discard(key)
@@ -2634,7 +2603,7 @@ async def _strip_roles(guild: discord.Guild, member: discord.Member):
 
     if roles_to_remove:
         try:
-            await member.remove_roles(*roles_to_remove, reason="アンチnuke自動検出による緊急剥奪")
+            await member.remove_roles(*roles_to_remove, reason="antinuke: 緊急ロール剥奪")
         except discord.Forbidden:
             pass
         except Exception:
@@ -2705,10 +2674,10 @@ async def on_audit_log_entry_create(entry: discord.AuditLogEntry):
 
 def _build_antinuke_status_embed(guild: discord.Guild, cfg: dict) -> discord.Embed:
     embed = discord.Embed(
-        title=f"🛡️ {guild.name} - アンチnuke設定",
-        color=discord.Color.green() if cfg["enabled"] else discord.Color.greyple()
+        title=f"{guild.name} - antinuke 設定状況",
+        color=discord.Color.blue() if cfg["enabled"] else discord.Color.greyple()
     )
-    embed.add_field(name="状態", value="✅ 有効" if cfg["enabled"] else "⛔ 無効", inline=True)
+    embed.add_field(name="状態", value="有効" if cfg["enabled"] else "無効", inline=True)
     embed.add_field(
         name="対応レベル",
         value="BANも試行" if cfg["action"] == "ban" else "ロール剥奪のみ",
@@ -2738,7 +2707,7 @@ def _build_antinuke_status_embed(guild: discord.Guild, cfg: dict) -> discord.Emb
     )
 
     embed.add_field(
-        name="監視対象",
+        name="監視対象の操作",
         value="メンバーBAN / チャンネル削除 / ロール削除 / Webhook作成",
         inline=False
     )
@@ -2747,7 +2716,7 @@ def _build_antinuke_status_embed(guild: discord.Guild, cfg: dict) -> discord.Emb
 
 @bot.tree.command(
     name="antinuke",
-    description="nuke対策（不審な連続操作の自動検出）をON/OFFします"
+    description="不審な連続操作の自動検出をON/OFFします"
 )
 @discord.app_commands.choices(状態=[
     discord.app_commands.Choice(name="有効にする", value="on"),
@@ -2766,12 +2735,12 @@ async def antinuke(interaction: discord.Interaction, 状態: discord.app_command
 
     if cfg["enabled"]:
         msg = (
-            "🛡️ アンチnukeを有効にしました。\n"
-            f"現在の検出条件: **{cfg['threshold_seconds']}秒間に{cfg['threshold_count']}回**の不審な操作で発動します。\n"
-            "対応レベルや通知先を変更したい場合は `/antinuke_level` `/antinuke_threshold` `/antinuke_notify` を使ってください。"
+            f"antinukeを有効にしました。\n"
+            f"現在の検出条件: {cfg['threshold_seconds']}秒間に{cfg['threshold_count']}回の不審な操作で発動します。\n"
+            f"設定変更は /antinuke_level /antinuke_threshold /antinuke_notify で行えます。"
         )
     else:
-        msg = "⛔ アンチnukeを無効にしました。"
+        msg = "antinukeを無効にしました。"
 
     await interaction.response.send_message(msg, ephemeral=True)
 
@@ -2781,8 +2750,8 @@ async def antinuke(interaction: discord.Interaction, 状態: discord.app_command
     description="検出時の対応レベルを設定します（ロール剥奪 or BAN）"
 )
 @discord.app_commands.choices(対応=[
-    discord.app_commands.Choice(name="ロール剥奪のみ（安全・推奨）", value="role_strip"),
-    discord.app_commands.Choice(name="BANを試行する（より厳格）", value="ban"),
+    discord.app_commands.Choice(name="ロール剥奪のみ（推奨）", value="role_strip"),
+    discord.app_commands.Choice(name="BANを試行する", value="ban"),
 ])
 async def antinuke_level(interaction: discord.Interaction, 対応: discord.app_commands.Choice[str]):
     if not await is_guild_admin(interaction):
@@ -2803,7 +2772,7 @@ async def antinuke_level(interaction: discord.Interaction, 対応: discord.app_c
 
 @bot.tree.command(
     name="antinuke_threshold",
-    description="何秒間に何回の操作でnukeとみなすかを設定します（デフォルト: 10秒で3回）"
+    description="何秒間に何回の操作で検出するかを設定します（デフォルト: 10秒で3回）"
 )
 async def antinuke_threshold(
     interaction: discord.Interaction,
@@ -2823,14 +2792,14 @@ async def antinuke_threshold(
 
     await interaction.response.send_message(
         f"検出条件を「{秒数}秒間に{回数}回以上」に変更しました。\n"
-        f"※回数を少なく・秒数を短くするほど敏感に検出します。誤検知が増える場合は緩めてください。",
+        f"回数を少なく・秒数を短くすると検出が敏感になります。誤検知が出る場合は緩めてください。",
         ephemeral=True
     )
 
 
 @bot.tree.command(
     name="antinuke_notify",
-    description="アンチnukeの通知先チャンネルと、検出から除外するロールを設定します"
+    description="通知先チャンネルと、検出から除外するロールを設定します"
 )
 async def antinuke_notify(
     interaction: discord.Interaction,
@@ -2867,7 +2836,7 @@ async def antinuke_notify(
     if not changed:
         await interaction.response.send_message(
             "変更するパラメータを1つ以上指定してください（通知先チャンネル / 免除ロール / 免除ロール解除）。\n"
-            "現在の設定は `/antinuke_status` で確認できます。",
+            "現在の設定は /antinuke_status で確認できます。",
             ephemeral=True
         )
         return
@@ -2879,7 +2848,7 @@ async def antinuke_notify(
 
 @bot.tree.command(
     name="antinuke_status",
-    description="現在のアンチnuke設定状況を確認します"
+    description="現在のantinuke設定状況を確認します"
 )
 async def antinuke_status(interaction: discord.Interaction):
     if not await is_guild_admin(interaction):
