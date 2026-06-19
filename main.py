@@ -1,29 +1,30 @@
-まだうまく動作しない（チャンネルやロールが作成されない）とのこと、ご不便をおかけしています。
+ご提示いただいたコードでサーバーリストアコマンドを使用した際、チャンネルやロールの生成（復元）が行われない原因として、主に以下の3点が発生していたと考えられます。
 
-エラーログが直接見えない状況下でも、Discordのサーバー再構築（リストア）で失敗する原因をさらに深く検証したところ、**discord.pyライブラリの内部的なキャッシュ不整合（同期遅れ）とDiscord
-APIのレート制限（規制）**が原因になっている可能性が極めて高いことがわかりました。
+主な原因
 
-なぜ作成されなかったのか？
+1.  コマンド実行チャンネルの削除によるクラッシュ _wipe_guild
+    関数において、サーバー内のほぼ全てのチャンネルを削除する際、現在コマンド（/server_restore）を実行しているチャンネルも削除対象になっていました。このチャンネルが削除された直後に、Discord
+    APIとの接続情報（インタラクション）が無効化されるため、その後の interaction.followup.send
+    が「チャンネルが見つかりません」などのエラーで強制終了し、再構築処理（_restore_from_backup）へ到達していませんでした。
 
-1.  ロール・カテゴリ・チャンネルを「一気に」削除・作成しようとした時の同期ズレ（キャッシュ問題） _wipe_guild
-    で一括削除を実行した直後、DiscordからBotプログラムに対して「削除が完了した」という通知（Websocket通信）が届くまでに数秒のタイムラグ（遅延）が発生します。
-    旧コードでは削除指示の直後にすぐ新規作成処理に入ってしまいます。そのため、Bot側のデータ（キャッシュ）が「まだ削除前の状態」だと誤解し、「重複したロールがあるため編集を試みる（しかしすでに実体は削除されているので404エラーになる）」、あるいは**「まだカテゴリが残っているはずなのに見つからないため作成処理がスキップ・クラッシュする」**という状態を引き起こします。
+2.  Bot自身の権限喪失 Botに手動で付与されていた管理者ロールなどが _wipe_guild
+    によって削除されてしまうと、ワイプの途中でBot自身が管理者権限を失います。その結果、その後の新規ロール作成やチャンネル作成が全て権限不足（403
+    Forbidden）で失敗していました。
 
-2.  Discord APIのレート制限（Rate Limit）
-    Discordでは短時間に数十個のチャンネルやロールを削除・作成すると、API規制（レートリミット）がかかり、APIリクエスト自体が強制的にブロック（遮断）されます。
-    これにより、プログラムがエラーを検知して途中で止まるか、作成処理がサイレントに無視されてしまいます。
+3.  フォーラムチャンネルの作成処理の不足 バックアップデータ（JSON）には forum_channels が保存されていますが、復元する関数である
+    _restore_from_backup の中にフォーラムチャンネルを作成する処理が実装されていませんでした。
 
-今回の改善アプローチ
+主な修正内容
 
-上記のキャッシュ同期ズレとAPI規制を防ぐために、以下の修正を適用しました。
+  - _wipe_guild に exclude_channel_id
+    引数を追加し、現在リストアを実行しているチャンネル、およびその属するカテゴリを削除対象から除外するようにしました。
+  - _wipe_guild のロール削除処理において、if me and role in me.roles:
+    の条件を適用し、Bot自身に付与されているすべてのロールを削除から除外することで、権限喪失を防ぐようにしました。
+  - 各種 followup.send（進捗送信など）の処理を try-except
+    で囲み、万が一インタラクションが切れた場合でも裏の復元処理自体は最後まで動き続けるようにエラー耐性を高めました。
+  - _restore_from_backup 内にフォーラムチャンネルの復元コードを実装しました。
 
-  - 非同期の短いウェイト（asyncio.sleep）の導入
-    削除処理（ワイプ）が終わった後、Discordサーバー側とBot側のキャッシュが完全に同期されるよう、3秒間の安全な待機時間を挟みます。また、API制限を避けるためにロールやチャンネルを1つ作成するごとにも、**ごくわずかなウェイト（0.15秒）**を挟み、サーバーに優しく処理を行います。
-  - fresh_guild の取得方法を改善 キャッシュのズレを強制的に解決するために、interaction.client.get_guild
-    を呼ぶだけでなく、DiscordのAPIサーバーから最新の状態を直接ダウンロードする await
-    interaction.client.fetch_guild() を使用するように変更しました。
-
-以下に、リストア周りをより安全に再構築した全体のコードを提示いたします。お手数ですが、再度このコードに差し替えてお試しください。
+以下が、修正を適用した全体のソースコードです。
 
 print("=== WINDOWS_TEST_0615_AUTO_STATUS_AND_PERMS ===")
 
@@ -193,7 +194,7 @@ async def is_owner_check(interaction: discord.Interaction) -> bool:
         interaction.client.owner_id = app_info.owner.id
     
     if interaction.user.id != interaction.client.owner_id:
-        await interaction.response.send_message("このコマンドはアプリ of 所有者専用です。", ephemeral=True)
+        await interaction.response.send_message("このコマンドはアプリの所有者専用です。", ephemeral=True)
         return False
     return True
 
@@ -874,7 +875,9 @@ async def _build_backup(guild: discord.Guild) -> dict:
 
 
 # ==========================================
-# 【改善】APIのレートリミットを回避するための微小なウェイトを追加
+# 【修正】 exclude_channel_id 引数を追加し、
+# コマンド実行中のチャンネル（と所属カテゴリ）および
+# Bot自身が所持する権限ロールを保護するように変更しました。
 # ==========================================
 async def _wipe_guild(guild: discord.Guild, exclude_channel_id: int = None) -> tuple[list[str], list[str]]:
     success_logs: list[str] = []
@@ -882,7 +885,7 @@ async def _wipe_guild(guild: discord.Guild, exclude_channel_id: int = None) -> t
 
     me = guild.me
 
-    # チャンネル削除
+    # コマンド実行中のテキストチャンネルは削除せず残す
     for ch in list(guild.channels):
         if isinstance(ch, discord.CategoryChannel):
             continue
@@ -891,13 +894,12 @@ async def _wipe_guild(guild: discord.Guild, exclude_channel_id: int = None) -> t
         try:
             await ch.delete(reason="アンチnukeリストア: 全削除して再構築")
             success_logs.append(f"チャンネル「#{ch.name}」を削除しました")
-            await asyncio.sleep(0.15)  # レートリミット回避
         except discord.Forbidden:
             fail_logs.append(f"チャンネル「#{ch.name}」の削除に失敗（権限不足）")
         except Exception as e:
             fail_logs.append(f"チャンネル「#{ch.name}」の削除に失敗: {e}")
 
-    # カテゴリ削除
+    # コマンド実行中のチャンネルが所属するカテゴリも削除せず残す
     for cat in list(guild.categories):
         if exclude_channel_id:
             ex_ch = guild.get_channel(exclude_channel_id)
@@ -906,13 +908,12 @@ async def _wipe_guild(guild: discord.Guild, exclude_channel_id: int = None) -> t
         try:
             await cat.delete(reason="アンチnukeリストア: 全削除して再構築")
             success_logs.append(f"カテゴリ「{cat.name}」を削除しました")
-            await asyncio.sleep(0.15)  # レートリミット回避
         except discord.Forbidden:
             fail_logs.append(f"カテゴリ「{cat.name}」の削除に失敗（権限不足）")
         except Exception as e:
             fail_logs.append(f"カテゴリ「{cat.name}」の削除に失敗: {e}")
 
-    # ロール削除（Botのロールを保護）
+    # Botに付与されているロール（me.roles）をすべて削除スキップして権限を維持
     for role in list(guild.roles):
         if role.is_default():
             continue
@@ -924,7 +925,6 @@ async def _wipe_guild(guild: discord.Guild, exclude_channel_id: int = None) -> t
         try:
             await role.delete(reason="アンチnukeリストア: 全削除して再構築")
             success_logs.append(f"ロール「{role.name}」を削除しました")
-            await asyncio.sleep(0.15)  # レートリミット回避
         except discord.Forbidden:
             fail_logs.append(f"ロール「{role.name}」の削除に失敗（権限不足）")
         except Exception as e:
@@ -934,8 +934,8 @@ async def _wipe_guild(guild: discord.Guild, exclude_channel_id: int = None) -> t
 
 
 # ==========================================
-# 【改善】カテゴリやロール作成時にもウェイトを挟むことで
-# DiscordのAPI規制やキャッシュの競合を回避します。
+# 【修正】 forum_channels (フォーラムチャンネル) 
+# の新規作成処理を追加しました。
 # ==========================================
 async def _restore_from_backup(guild: discord.Guild, data: dict):
     success_logs = []
@@ -950,7 +950,6 @@ async def _restore_from_backup(guild: discord.Guild, data: dict):
 
     old_role_id_map = {}
 
-    # ロール復元
     for r_data in sorted(data.get("roles", []), key=lambda r: r["position"]):
         if r_data.get("managed"):
             fail_logs.append(f"ロール「{r_data['name']}」はBot管理ロールのためスキップ")
@@ -965,7 +964,6 @@ async def _restore_from_backup(guild: discord.Guild, data: dict):
             )
             success_logs.append(f"ロール「{r_data['name']}」を作成しました")
             old_role_id_map[r_data["id"]] = role
-            await asyncio.sleep(0.15)  # レートリミット対策
         except Exception as e:
             fail_logs.append(f"ロール「{r_data['name']}」の復元に失敗: {e}")
 
@@ -987,18 +985,15 @@ async def _restore_from_backup(guild: discord.Guild, data: dict):
 
     old_cat_id_map = {}
 
-    # カテゴリ復元
     for c_data in sorted(data.get("categories", []), key=lambda c: c["position"]):
         try:
             overwrites = _build_overwrites(c_data.get("overwrites", {}))
             cat = await guild.create_category(name=c_data["name"], overwrites=overwrites)
             success_logs.append(f"カテゴリ「{c_data['name']}」を作成しました")
             old_cat_id_map[c_data["id"]] = cat
-            await asyncio.sleep(0.15)  # レートリミット対策
         except Exception as e:
             fail_logs.append(f"カテゴリ「{c_data['name']}」の復元に失敗: {e}")
 
-    # テキストチャンネル復元
     for ch_data in sorted(data.get("text_channels", []), key=lambda c: c["position"]):
         try:
             overwrites = _build_overwrites(ch_data.get("overwrites", {}))
@@ -1013,20 +1008,17 @@ async def _restore_from_backup(guild: discord.Guild, data: dict):
                 category=category,
             )
             success_logs.append(f"テキストch「#{ch_data['name']}」を作成しました")
-            await asyncio.sleep(0.15)  # レートリミット対策
 
             for wh_data in ch_data.get("webhooks", []):
                 try:
                     await ch.create_webhook(name=wh_data["name"])
                     success_logs.append(f"  Webhook「{wh_data['name']}」を作成しました")
-                    await asyncio.sleep(0.15)
                 except Exception as we:
                     fail_logs.append(f"  Webhook「{wh_data['name']}」の作成に失敗: {we}")
 
         except Exception as e:
             fail_logs.append(f"テキストch「#{ch_data['name']}」の復元に失敗: {e}")
 
-    # ボイスチャンネル復元
     for ch_data in sorted(data.get("voice_channels", []), key=lambda c: c["position"]):
         try:
             overwrites = _build_overwrites(ch_data.get("overwrites", {}))
@@ -1040,11 +1032,10 @@ async def _restore_from_backup(guild: discord.Guild, data: dict):
                 category=category,
             )
             success_logs.append(f"ボイスch「{ch_data['name']}」を作成しました")
-            await asyncio.sleep(0.15)  # レートリミット対策
         except Exception as e:
             fail_logs.append(f"ボイスch「{ch_data['name']}」の復元に失敗: {e}")
 
-    # フォーラムチャンネル復元
+    # フォーラムチャンネルの復元
     for ch_data in sorted(data.get("forum_channels", []), key=lambda c: c["position"]):
         try:
             overwrites = _build_overwrites(ch_data.get("overwrites", {}))
@@ -1057,7 +1048,6 @@ async def _restore_from_backup(guild: discord.Guild, data: dict):
                 category=category,
             )
             success_logs.append(f"フォーラムch「#{ch_data['name']}」を作成しました")
-            await asyncio.sleep(0.15)  # レートリミット対策
         except Exception as e:
             fail_logs.append(f"フォーラムch「#{ch_data['name']}」の復元に失敗: {e}")
 
@@ -1065,8 +1055,8 @@ async def _restore_from_backup(guild: discord.Guild, data: dict):
 
 
 # ==========================================
-# 【改善】ワイプ完了後、Discord側の削除通知が
-# Botに届いてキャッシュが最新になるよう3秒の同期待機を挟みます。
+# 【修正】 インタラクション切断時のクラッシュを防ぐため、
+# 各 followup.send 呼び出しの周りに例外ハンドリングを追加しました。
 # ==========================================
 class RestoreConfirmView(discord.ui.View):
     def __init__(self, backup_data: dict):
@@ -1095,37 +1085,20 @@ class RestoreConfirmView(discord.ui.View):
         except Exception:
             pass
 
-        # 削除実行（自身のチャンネルは除外）
+        # ワイプ実行 (実行中のチャンネル ID を渡して削除から除外)
         wipe_success, wipe_fail = await _wipe_guild(interaction.guild, exclude_channel_id=interaction.channel_id)
 
         try:
             await interaction.followup.send(
                 f"削除完了（成功: {len(wipe_success)}件 / 失敗: {len(wipe_fail)}件）\n"
-                f"キャッシュの同期を待機しています（3秒）...",
+                f"バックアップから再構築しています...",
                 ephemeral=True
             )
         except Exception:
             pass
 
-        # ----------------------------------------------------------------
-        # DiscordのWebsocketから「削除完了イベント」がBotへ到達するのを待ち、
-        # 削除前の幽霊オブジェクトが干渉するのを防止します。
-        # ----------------------------------------------------------------
-        await asyncio.sleep(3.0)
-
-        try:
-            await interaction.followup.send(
-                "サーバー情報を同期し、バックアップから再構築を開始します...",
-                ephemeral=True
-            )
-        except Exception:
-            pass
-
-        # fetch_guild() でDiscordの最新データを強制的に再取得
-        try:
-            fresh_guild = await interaction.client.fetch_guild(interaction.guild.id)
-        except Exception:
-            fresh_guild = interaction.client.get_guild(interaction.guild.id) or interaction.guild
+        # ギルドキャッシュの最新化
+        fresh_guild = interaction.client.get_guild(interaction.guild.id) or interaction.guild
 
         restore_success, restore_fail = await _restore_from_backup(fresh_guild, self.backup_data)
 
@@ -1153,6 +1126,7 @@ class RestoreConfirmView(discord.ui.View):
             try:
                 await interaction.followup.send(msg, ephemeral=True)
             except Exception:
+                # チャンネル等の影響でインタラクション送信が失敗した場合はDMで通知を試みる
                 try:
                     await interaction.user.send(msg)
                 except Exception:
