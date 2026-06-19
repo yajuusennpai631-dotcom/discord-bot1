@@ -765,8 +765,9 @@ class RestoreConfirmView(discord.ui.View):
     """サーバー再構築（リストア）の実行確認用ボタンビューです。"""
 
     def __init__(self, backup_data: dict):
-        super().__init__(timeout=120)
+        super().__init__(timeout=180)  # 180秒（大規模サーバーの復元に時間がかかるため余裕を持たせる）
         self.backup_data = backup_data
+        self._running = False  # 二重実行防止フラグ
 
     @discord.ui.button(label="全削除してリストアを実行する", style=discord.ButtonStyle.danger, emoji="⚠️")
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -774,41 +775,57 @@ class RestoreConfirmView(discord.ui.View):
         if not interaction.guild:
             return
 
-        await interaction.response.defer(ephemeral=True)
+        # 二重実行防止
+        if self._running:
+            await interaction.response.send_message("すでにリストア実行中です。しばらくお待ちください。", ephemeral=True)
+            return
+        self._running = True
 
-        # ボタンを即座に無効化（二重実行防止）
+        # ボタンを即座に無効化
         for item in self.children:
             item.disabled = True
+
+        # ephemeral=True で defer: 処理が長くても応答タイムアウトを回避
+        await interaction.response.defer(ephemeral=True)
+
         try:
             await interaction.edit_original_response(view=self)
         except Exception:
             pass
 
+        guild = interaction.guild
+        print(f"[リストア開始] サーバー: {guild.name} (by {interaction.user})")
+
         # Step 1: 既存チャンネル・ロールを全削除
         await interaction.followup.send(
-            "⏳ 既存のチャンネル・カテゴリ・ロールを削除しています...",
+            "⏳ **Step 1/2** 既存のチャンネル・カテゴリ・ロールを削除しています...",
             ephemeral=True
         )
-        wipe_success, wipe_fail = await _wipe_guild(interaction.guild)
+        wipe_success, wipe_fail = await _wipe_guild(guild)
+        print(f"[リストア] 全削除完了: 成功={len(wipe_success)}, 失敗={len(wipe_fail)}")
+
+        # 削除後にDiscordのキャッシュが更新されるよう少し待機
+        await asyncio.sleep(2)
 
         # Step 2: バックアップから再構築
         await interaction.followup.send(
             f"✅ 削除完了（成功: {len(wipe_success)}件 / 失敗: {len(wipe_fail)}件）\n"
-            "⏳ バックアップから再構築しています...",
+            "⏳ **Step 2/2** バックアップから再構築しています（時間がかかる場合があります）...",
             ephemeral=True
         )
 
         # 削除後にギルドオブジェクトを最新状態で取得
-        fresh_guild = interaction.client.get_guild(interaction.guild.id) or interaction.guild
+        fresh_guild = interaction.client.get_guild(guild.id) or guild
         restore_success, restore_fail = await _restore_from_backup(fresh_guild, self.backup_data)
+        print(f"[リストア] 復元完了: 成功={len(restore_success)}, 失敗={len(restore_fail)}")
 
         # 全ログをまとめて結果表示（2000文字制限を考慮して分割送信）
-        all_ok  = wipe_success + restore_success
-        all_ng  = wipe_fail    + restore_fail
+        all_ok = wipe_success + restore_success
+        all_ng = wipe_fail + restore_fail
 
         result_lines = (
-            [f"**✅ リストア完了** 成功: {len(all_ok)}件 / 失敗: {len(all_ng)}件\n"]
-            + [f"🟢 {s}" for s in all_ok]
+            [f"**✅ リストア完了！** 成功: {len(all_ok)}件 / 失敗: {len(all_ng)}件\n"]
+            + [f"🟢 {s}" for s in restore_success]  # 復元成功ログのみ表示（削除ログは省略）
             + [f"🔴 {f}" for f in all_ng]
         )
 
@@ -826,9 +843,14 @@ class RestoreConfirmView(discord.ui.View):
         for msg in messages:
             await interaction.followup.send(msg, ephemeral=True)
 
+        self._running = False
+
     @discord.ui.button(label="キャンセル", style=discord.ButtonStyle.secondary, emoji="✖️")
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
         """キャンセルボタンが押されたとき、リストアを中断します。"""
+        if self._running:
+            await interaction.response.send_message("リストアはすでに実行中のためキャンセルできません。", ephemeral=True)
+            return
         for item in self.children:
             item.disabled = True
         await interaction.response.edit_message(
@@ -1455,11 +1477,36 @@ async def _wipe_guild(guild: discord.Guild) -> tuple[list[str], list[str]]:
     return success_logs, fail_logs
 
 
+async def _safe_api_call(coro, fail_logs: list, label: str):
+    """
+    Discord API呼び出しをレート制限対応でラップします。
+    429エラー（レート制限）の場合はretry_afterだけ待機してリトライします。
+    """
+    for attempt in range(3):
+        try:
+            return await coro
+        except discord.HTTPException as e:
+            if e.status == 429:
+                # レート制限: retry_after秒待機してリトライ
+                retry_after = float(e.response.headers.get("Retry-After", 1.0))
+                print(f"[リストア] レート制限 - {retry_after:.1f}秒待機 ({label})")
+                await asyncio.sleep(retry_after + 0.5)
+            else:
+                fail_logs.append(f"{label} の操作に失敗: {e}")
+                return None
+        except Exception as e:
+            fail_logs.append(f"{label} の操作に失敗: {e}")
+            return None
+    fail_logs.append(f"{label} はリトライ上限に達しました")
+    return None
+
+
 async def _restore_from_backup(guild: discord.Guild, data: dict) -> tuple[list[str], list[str]]:
     """バックアップデータからロール・チャンネル構造・権限を再構成します。"""
     success_logs = []
     fail_logs    = []
 
+    # ① @everyone 権限の復元
     try:
         everyone_val = data.get("everyone_permissions", 0)
         await guild.default_role.edit(permissions=discord.Permissions(everyone_val))
@@ -1467,31 +1514,39 @@ async def _restore_from_backup(guild: discord.Guild, data: dict) -> tuple[list[s
     except Exception as e:
         fail_logs.append(f"@everyone 権限の復元に失敗: {e}")
 
+    # 旧ロールID → 新ロールオブジェクトのマッピング
     old_role_id_map = {}
 
+    # ② ロールの復元（APIレート制限対策: 各ロール作成後に少し待機）
     for r_data in sorted(data.get("roles", []), key=lambda r: r["position"]):
         if r_data.get("managed"):
             fail_logs.append(f"ロール「{r_data['name']}」はBot管理ロールのためスキップ")
             continue
-        try:
-            role = await guild.create_role(
+        label = f"ロール「{r_data['name']}」"
+        role = await _safe_api_call(
+            guild.create_role(
                 name=r_data["name"],
                 color=discord.Color(r_data["color"]),
                 hoist=r_data["hoist"],
                 mentionable=r_data["mentionable"],
                 permissions=discord.Permissions(r_data["permissions"]),
-            )
-            success_logs.append(f"ロール「{r_data['name']}」を作成しました")
+            ),
+            fail_logs, label
+        )
+        if role:
+            success_logs.append(f"{label} を作成しました")
             old_role_id_map[r_data["id"]] = role
-        except Exception as e:
-            fail_logs.append(f"ロール「{r_data['name']}」の復元に失敗: {e}")
+        # レート制限対策: ロール作成ごとに0.5秒待機
+        await asyncio.sleep(0.5)
 
     def _build_overwrites(raw: dict) -> dict:
+        """バックアップの権限上書き情報を discord.PermissionOverwrite 辞書に変換します。"""
         overwrites = {}
         for key, val in raw.items():
             kind, oid = key.split(":", 1)
             oid = int(oid)
             if kind == "role":
+                # 旧IDから新ロールへマッピング（見つからなければ現存ロールで試みる）
                 target = old_role_id_map.get(oid) or guild.get_role(oid)
             else:
                 target = guild.get_member(oid)
@@ -1502,58 +1557,70 @@ async def _restore_from_backup(guild: discord.Guild, data: dict) -> tuple[list[s
             overwrites[target] = discord.PermissionOverwrite.from_pair(allow, deny)
         return overwrites
 
+    # カテゴリID → 新カテゴリオブジェクトのマッピング
     old_cat_id_map = {}
 
+    # ③ カテゴリの復元
     for c_data in sorted(data.get("categories", []), key=lambda c: c["position"]):
-        try:
-            overwrites = _build_overwrites(c_data.get("overwrites", {}))
-            cat = await guild.create_category(name=c_data["name"], overwrites=overwrites)
-            success_logs.append(f"カテゴリ「{c_data['name']}」を作成しました")
+        label = f"カテゴリ「{c_data['name']}」"
+        overwrites = _build_overwrites(c_data.get("overwrites", {}))
+        cat = await _safe_api_call(
+            guild.create_category(name=c_data["name"], overwrites=overwrites),
+            fail_logs, label
+        )
+        if cat:
+            success_logs.append(f"{label} を作成しました")
             old_cat_id_map[c_data["id"]] = cat
-        except Exception as e:
-            fail_logs.append(f"カテゴリ「{c_data['name']}」の復元に失敗: {e}")
+        await asyncio.sleep(0.5)
 
+    # ④ テキストチャンネルの復元
     for ch_data in sorted(data.get("text_channels", []), key=lambda c: c["position"]):
-        try:
-            overwrites = _build_overwrites(ch_data.get("overwrites", {}))
-            category   = old_cat_id_map.get(ch_data.get("category_id"))
-
-            ch = await guild.create_text_channel(
+        label = f"テキストch「#{ch_data['name']}」"
+        overwrites = _build_overwrites(ch_data.get("overwrites", {}))
+        category   = old_cat_id_map.get(ch_data.get("category_id"))
+        ch = await _safe_api_call(
+            guild.create_text_channel(
                 name=ch_data["name"],
                 topic=ch_data.get("topic"),
                 nsfw=ch_data.get("nsfw", False),
                 slowmode_delay=ch_data.get("slowmode", 0),
                 overwrites=overwrites,
                 category=category,
-            )
-            success_logs.append(f"テキストch「#{ch_data['name']}」を作成しました")
-
+            ),
+            fail_logs, label
+        )
+        if ch:
+            success_logs.append(f"{label} を作成しました")
+            # Webhookの復元
             for wh_data in ch_data.get("webhooks", []):
-                try:
-                    await ch.create_webhook(name=wh_data["name"])
+                wh = await _safe_api_call(
+                    ch.create_webhook(name=wh_data["name"]),
+                    fail_logs, f"Webhook「{wh_data['name']}」"
+                )
+                if wh:
                     success_logs.append(f"  Webhook「{wh_data['name']}」を作成しました")
-                except Exception as we:
-                    fail_logs.append(f"  Webhook「{wh_data['name']}」の作成に失敗: {we}")
+        await asyncio.sleep(0.5)
 
-        except Exception as e:
-            fail_logs.append(f"テキストch「#{ch_data['name']}」の復元に失敗: {e}")
-
+    # ⑤ ボイスチャンネルの復元
     for ch_data in sorted(data.get("voice_channels", []), key=lambda c: c["position"]):
-        try:
-            overwrites = _build_overwrites(ch_data.get("overwrites", {}))
-            category   = old_cat_id_map.get(ch_data.get("category_id"))
-
-            await guild.create_voice_channel(
+        label = f"ボイスch「{ch_data['name']}」"
+        overwrites = _build_overwrites(ch_data.get("overwrites", {}))
+        category   = old_cat_id_map.get(ch_data.get("category_id"))
+        ch = await _safe_api_call(
+            guild.create_voice_channel(
                 name=ch_data["name"],
                 bitrate=min(ch_data.get("bitrate", 64000), guild.bitrate_limit),
                 user_limit=ch_data.get("user_limit", 0),
                 overwrites=overwrites,
                 category=category,
-            )
-            success_logs.append(f"ボイスch「{ch_data['name']}」を作成しました")
-        except Exception as e:
-            fail_logs.append(f"ボイスch「{ch_data['name']}」の復元に失敗: {e}")
+            ),
+            fail_logs, label
+        )
+        if ch:
+            success_logs.append(f"{label} を作成しました")
+        await asyncio.sleep(0.5)
 
+    print(f"[リストア完了] 成功: {len(success_logs)}件 / 失敗: {len(fail_logs)}件")
     return success_logs, fail_logs
 
 
