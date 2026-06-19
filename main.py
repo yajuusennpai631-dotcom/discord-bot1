@@ -13,6 +13,8 @@ import base64
 import requests
 import io          # ◆ 追加: バックアップJSONをファイルとして送信するため
 import datetime    # ◆ 追加: バックアップ日時の記録用
+import collections # ◆ 追加: アンチnukeの操作履歴管理に使用
+import time        # ◆ 追加: アンチnukeのタイムスタンプ管理に使用
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 
@@ -1340,7 +1342,9 @@ async def help_command(interaction: discord.Interaction):
                 "`/server_verify_setup` / `btn` : メンバー認証用パネルを設置します\n"
                 "`/server_mention_setup` / `reset` : 自動返信ロールメンションの設定と解除を行います\n"
                 "`/server_backup` : サーバーのロール・チャンネル・権限をJSONバックアップします\n"
-                "`/server_restore` : バックアップJSONからサーバー構成を復元します（nuke対策）"
+                "`/server_restore` : バックアップJSONからサーバー構成を復元します（nuke対策）\n"
+                "`/antinuke_setup` : 不審な操作の自動検出・自動対応を設定します\n"
+                "`/antinuke_status` : アンチnukeの現在の設定状況を確認します"
             ),
             inline=False
         )
@@ -2502,6 +2506,435 @@ async def owner_broadcast(interaction: discord.Interaction):
         view=view,
         ephemeral=True
     )
+
+
+
+# ==================== 【アンチnuke: 自動検出&自動対応】 ====================
+# server_backup / server_restore コマンドブロックの直後に貼り付けてください。
+# 必要な追加 import: collections（既存コードにない場合は先頭に追加）
+import collections   # 操作履歴の管理に使用
+import time           # タイムスタンプ管理に使用
+
+
+# ─────────────────────────────────────────────
+#  設定のデフォルト値 & 取得ヘルパー
+# ─────────────────────────────────────────────
+
+DEFAULT_ANTINUKE_CONFIG = {
+    "enabled":           False,
+    "threshold_count":   3,      # この回数以上
+    "threshold_seconds": 10,     # この秒数以内に発生したら検出
+    "action":            "role_strip",  # "role_strip" or "ban"
+    "exempt_roles":      [],     # 免除ロールID一覧
+    "log_channel":       None,   # 通知先チャンネルID（Noneならオーナーへのみ通知）
+}
+
+def get_antinuke_config(all_data, guild_id_str: str) -> dict:
+    cfg = get_guild_config(all_data, guild_id_str)
+    if "antinuke" not in cfg:
+        cfg["antinuke"] = DEFAULT_ANTINUKE_CONFIG.copy()
+    else:
+        # 既存データに新しいキーが無い場合に備えてデフォルトを補完
+        for k, v in DEFAULT_ANTINUKE_CONFIG.items():
+            if k not in cfg["antinuke"]:
+                cfg["antinuke"][k] = v
+    return cfg["antinuke"]
+
+
+# ─────────────────────────────────────────────
+#  操作履歴を保持するインメモリストア
+#  guild_id -> user_id -> action_type -> [timestamp, ...]
+# ─────────────────────────────────────────────
+
+_action_history: dict[int, dict[int, dict[str, list]]] = collections.defaultdict(
+    lambda: collections.defaultdict(lambda: collections.defaultdict(list))
+)
+
+# 既にロール剥奪/BAN処理を実行中のユーザーを記録（多重トリガー防止）
+_already_handled: set[tuple[int, int]] = set()
+
+
+def _record_action(guild_id: int, user_id: int, action_type: str) -> int:
+    """
+    アクションを記録し、直近 threshold_seconds 以内の同種アクション数を返す。
+    """
+    now = time.time()
+    history = _action_history[guild_id][user_id][action_type]
+    history.append(now)
+
+    # 古いタイムスタンプを削除（直近60秒だけ保持すれば十分）
+    cutoff = now - 60
+    while history and history[0] < cutoff:
+        history.pop(0)
+
+    return len(history)
+
+
+def _count_within_window(guild_id: int, user_id: int, action_type: str, window_seconds: int) -> int:
+    now = time.time()
+    history = _action_history[guild_id][user_id][action_type]
+    cutoff = now - window_seconds
+    return sum(1 for t in history if t >= cutoff)
+
+
+# ─────────────────────────────────────────────
+#  検出時の対応処理
+# ─────────────────────────────────────────────
+
+async def _handle_nuke_detected(guild: discord.Guild, suspect: discord.Member, action_type: str, cfg: dict):
+    """
+    nuke行為を検出した際の自動対応。
+    """
+    key = (guild.id, suspect.id)
+    if key in _already_handled:
+        return  # 既に対応済み（多重トリガー防止）
+    _already_handled.add(key)
+
+    action_label = {
+        "ban_member":     "メンバーBAN",
+        "channel_delete": "チャンネル削除",
+        "role_delete":    "ロール削除",
+        "webhook_create": "Webhook作成",
+    }.get(action_type, action_type)
+
+    result_text = ""
+
+    try:
+        if cfg["action"] == "ban":
+            try:
+                await guild.ban(suspect, reason=f"アンチnuke自動検出: {action_label}の連続実行")
+                result_text = f"🔨 **{suspect}** をサーバーからBANしました。"
+            except discord.Forbidden:
+                result_text = f"⚠️ **{suspect}** のBANに失敗しました（Bot権限不足）。代わりにロールを剥奪します。"
+                await _strip_roles(guild, suspect)
+            except Exception as e:
+                result_text = f"⚠️ **{suspect}** のBAN中にエラー: {e}\n代わりにロールを剥奪します。"
+                await _strip_roles(guild, suspect)
+        else:
+            await _strip_roles(guild, suspect)
+            result_text = f"🛡️ **{suspect}** の危険なロールを全て剥奪しました。"
+    except Exception as e:
+        result_text = f"❌ 自動対応中にエラーが発生しました: {e}"
+
+    # ── 通知 ──────────────────────────────
+    embed = discord.Embed(
+        title="🚨 アンチnuke: 不審な操作を検出しました",
+        description=(
+            f"**検出内容:** {action_label}が短時間に連続実行されました。\n"
+            f"**対象者:** {suspect.mention} (`{suspect.id}`)\n\n"
+            f"**実行した対応:**\n{result_text}"
+        ),
+        color=discord.Color.red()
+    )
+    embed.timestamp = discord.utils.utcnow()
+    embed.set_footer(text=f"サーバー: {guild.name}")
+
+    # サーバー内通知
+    all_data = load_data()
+    cfg_full = get_antinuke_config(all_data, str(guild.id))
+    log_ch_id = cfg_full.get("log_channel")
+    if log_ch_id:
+        ch = guild.get_channel(log_ch_id)
+        if ch:
+            try:
+                await ch.send(embed=embed)
+            except Exception:
+                pass
+
+    # オーナーDM通知
+    try:
+        client = guild._state._get_client()
+        if client.owner_id is None:
+            app_info = await client.application_info()
+            client.owner_id = app_info.owner.id
+        owner = client.get_user(client.owner_id) or await client.fetch_user(client.owner_id)
+        if owner:
+            await owner.send(embed=embed)
+    except Exception:
+        pass
+
+    print(f"[アンチnuke] {guild.name} で {suspect} による {action_label} の連続実行を検出し、対応しました。")
+
+    # 5分後に多重トリガー防止フラグを解除
+    await asyncio.sleep(300)
+    _already_handled.discard(key)
+
+
+async def _strip_roles(guild: discord.Guild, member: discord.Member):
+    """危険な権限を持つロールを全て剥奪する"""
+    dangerous_perms = [
+        "administrator", "manage_guild", "manage_channels", "manage_roles",
+        "ban_members", "kick_members", "manage_webhooks"
+    ]
+    roles_to_remove = []
+    for role in member.roles:
+        if role.is_default():
+            continue
+        if any(getattr(role.permissions, p, False) for p in dangerous_perms):
+            roles_to_remove.append(role)
+
+    if roles_to_remove:
+        try:
+            await member.remove_roles(*roles_to_remove, reason="アンチnuke自動検出による緊急剥奪")
+        except discord.Forbidden:
+            pass
+        except Exception:
+            pass
+
+
+def _is_exempt(member: discord.Member, guild: discord.Guild, cfg: dict, owner_id: int) -> bool:
+    """検出を免除すべき対象かどうかを判定する"""
+    if member.id == owner_id:
+        return True
+    if member.id == guild.owner_id:
+        return True
+    if member.bot:
+        return True
+    exempt_role_ids = set(cfg.get("exempt_roles", []))
+    if exempt_role_ids and any(r.id in exempt_role_ids for r in member.roles):
+        return True
+    return False
+
+
+# ─────────────────────────────────────────────
+#  監査ログ監視イベント
+# ─────────────────────────────────────────────
+
+@bot.event
+async def on_audit_log_entry_create(entry: discord.AuditLogEntry):
+    guild = entry.guild
+    if not guild:
+        return
+
+    all_data = load_data()
+    cfg = get_antinuke_config(all_data, str(guild.id))
+    if not cfg.get("enabled"):
+        return
+
+    # 監視対象アクションのマッピング
+    action_map = {
+        discord.AuditLogAction.ban:             "ban_member",
+        discord.AuditLogAction.channel_delete:  "channel_delete",
+        discord.AuditLogAction.role_delete:     "role_delete",
+        discord.AuditLogAction.webhook_create:  "webhook_create",
+    }
+    action_type = action_map.get(entry.action)
+    if action_type is None:
+        return
+
+    user = entry.user
+    if user is None:
+        return
+
+    member = guild.get_member(user.id)
+    if member is None:
+        return  # 既にサーバーを脱退している場合は対象外
+
+    # オーナーID確定
+    if bot.owner_id is None:
+        try:
+            app_info = await bot.application_info()
+            bot.owner_id = app_info.owner.id
+        except Exception:
+            pass
+
+    if _is_exempt(member, guild, cfg, bot.owner_id):
+        return
+
+    # アクションを記録し、閾値判定
+    count = _record_action(guild.id, member.id, action_type)
+    threshold_count   = cfg.get("threshold_count", 3)
+    threshold_seconds = cfg.get("threshold_seconds", 10)
+
+    recent_count = _count_within_window(guild.id, member.id, action_type, threshold_seconds)
+
+    if recent_count >= threshold_count:
+        asyncio.create_task(_handle_nuke_detected(guild, member, action_type, cfg))
+
+
+# ─────────────────────────────────────────────
+#  ロール選択UI（免除ロール設定用）
+# ─────────────────────────────────────────────
+
+class ExemptRoleSelect(discord.ui.RoleSelect):
+    def __init__(self):
+        super().__init__(
+            placeholder="免除ロールを選択（複数可、最大10個）...",
+            min_values=0,
+            max_values=10
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if not interaction.guild:
+            return
+
+        all_data = load_data()
+        cfg = get_antinuke_config(all_data, str(interaction.guild.id))
+        cfg["exempt_roles"] = [r.id for r in self.values]
+        save_data(all_data)
+
+        role_mentions = ", ".join(r.mention for r in self.values) if self.values else "なし"
+        await interaction.response.send_message(
+            f"免除ロールを更新しました: {role_mentions}",
+            ephemeral=True
+        )
+
+
+class ExemptRoleView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=180)
+        self.add_item(ExemptRoleSelect())
+
+
+# ─────────────────────────────────────────────
+#  スラッシュコマンド: /antinuke_setup
+# ─────────────────────────────────────────────
+
+@bot.tree.command(
+    name="antinuke_setup",
+    description="アンチnuke（自動検出）の有効化・閾値・対応レベルを設定します"
+)
+@discord.app_commands.choices(
+    enabled=[
+        discord.app_commands.Choice(name="有効にする", value="on"),
+        discord.app_commands.Choice(name="無効にする", value="off"),
+    ],
+    action=[
+        discord.app_commands.Choice(name="ロール剥奪のみ（安全重視・推奨）", value="role_strip"),
+        discord.app_commands.Choice(name="BANも試行（より厳格）", value="ban"),
+    ]
+)
+async def antinuke_setup(
+    interaction: discord.Interaction,
+    enabled: discord.app_commands.Choice[str] = None,
+    action: discord.app_commands.Choice[str] = None,
+    threshold_count: int = None,
+    threshold_seconds: int = None,
+    log_channel: discord.TextChannel = None,
+):
+    if not await is_guild_admin(interaction):
+        return
+    if not interaction.guild:
+        return
+
+    all_data = load_data()
+    cfg = get_antinuke_config(all_data, str(interaction.guild.id))
+
+    changed = []
+    if enabled is not None:
+        cfg["enabled"] = (enabled.value == "on")
+        changed.append(f"監視状態: {'✅ 有効' if cfg['enabled'] else '⛔ 無効'}")
+    if action is not None:
+        cfg["action"] = action.value
+        changed.append(f"対応レベル: {action.name}")
+    if threshold_count is not None:
+        if threshold_count < 1:
+            await interaction.response.send_message("threshold_count は1以上を指定してください。", ephemeral=True)
+            return
+        cfg["threshold_count"] = threshold_count
+        changed.append(f"検出回数: {threshold_count}回")
+    if threshold_seconds is not None:
+        if threshold_seconds < 1:
+            await interaction.response.send_message("threshold_seconds は1以上を指定してください。", ephemeral=True)
+            return
+        cfg["threshold_seconds"] = threshold_seconds
+        changed.append(f"検出時間幅: {threshold_seconds}秒")
+    if log_channel is not None:
+        cfg["log_channel"] = log_channel.id
+        changed.append(f"通知チャンネル: {log_channel.mention}")
+
+    save_data(all_data)
+
+    embed = discord.Embed(
+        title="🛡️ アンチnuke設定",
+        color=discord.Color.blue()
+    )
+
+    if changed:
+        embed.add_field(name="今回の変更", value="\n".join(changed), inline=False)
+    else:
+        embed.description = "パラメータを指定しなかったため、設定の変更はありません。現在の設定を表示します。"
+
+    log_ch_display = f"<#{cfg['log_channel']}>" if cfg.get('log_channel') else "未設定（オーナーDMのみ）"
+    embed.add_field(
+        name="現在の設定",
+        value=(
+            f"監視状態: {'✅ 有効' if cfg['enabled'] else '⛔ 無効'}\n"
+            f"対応レベル: {'BANも試行' if cfg['action'] == 'ban' else 'ロール剥奪のみ'}\n"
+            f"検出条件: {cfg['threshold_seconds']}秒間に{cfg['threshold_count']}回以上\n"
+            f"通知先: {log_ch_display}\n"
+            f"免除ロール数: {len(cfg.get('exempt_roles', []))}個"
+        ),
+        inline=False
+    )
+    embed.add_field(
+        name="免除ロールの設定方法",
+        value="下のメニューから免除したいロール（信頼できる管理者など）を選択してください。",
+        inline=False
+    )
+    embed.set_footer(text="監視対象: メンバーBAN・チャンネル削除・ロール削除・Webhook作成")
+
+    await interaction.response.send_message(embed=embed, view=ExemptRoleView(), ephemeral=True)
+
+
+# ─────────────────────────────────────────────
+#  スラッシュコマンド: /antinuke_status
+# ─────────────────────────────────────────────
+
+@bot.tree.command(
+    name="antinuke_status",
+    description="現在のアンチnuke設定状況を確認します"
+)
+async def antinuke_status(interaction: discord.Interaction):
+    if not await is_guild_admin(interaction):
+        return
+    if not interaction.guild:
+        return
+
+    all_data = load_data()
+    cfg = get_antinuke_config(all_data, str(interaction.guild.id))
+
+    embed = discord.Embed(
+        title=f"🛡️ {interaction.guild.name} - アンチnuke設定状況",
+        color=discord.Color.green() if cfg["enabled"] else discord.Color.greyple()
+    )
+    embed.add_field(name="監視状態", value="✅ 有効" if cfg["enabled"] else "⛔ 無効", inline=True)
+    embed.add_field(
+        name="対応レベル",
+        value="BANも試行" if cfg["action"] == "ban" else "ロール剥奪のみ",
+        inline=True
+    )
+    embed.add_field(
+        name="検出条件",
+        value=f"{cfg['threshold_seconds']}秒間に{cfg['threshold_count']}回以上",
+        inline=True
+    )
+
+    log_ch_id = cfg.get("log_channel")
+    log_ch = interaction.guild.get_channel(log_ch_id) if log_ch_id else None
+    embed.add_field(
+        name="通知先チャンネル",
+        value=log_ch.mention if log_ch else "未設定（オーナーDMのみ通知）",
+        inline=False
+    )
+
+    exempt_role_ids = cfg.get("exempt_roles", [])
+    exempt_roles = [interaction.guild.get_role(rid) for rid in exempt_role_ids]
+    exempt_roles = [r for r in exempt_roles if r]
+    embed.add_field(
+        name="免除ロール",
+        value=", ".join(r.mention for r in exempt_roles) if exempt_roles else "なし",
+        inline=False
+    )
+
+    embed.add_field(
+        name="監視対象アクション",
+        value="・メンバーBAN\n・チャンネル削除\n・ロール削除\n・Webhook作成",
+        inline=False
+    )
+    embed.set_footer(text="設定変更は /antinuke_setup を使用してください。")
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 bot.run(TOKEN)
