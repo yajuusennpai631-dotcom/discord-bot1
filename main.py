@@ -1,4 +1,4 @@
-python
+
 print("=== WINDOWS_TEST_0615_AUTO_STATUS_AND_PERMS ===")
 
 import os
