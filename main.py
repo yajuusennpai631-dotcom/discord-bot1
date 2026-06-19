@@ -1,3 +1,12 @@
+エラーの原因は、Pythonプログラムファイル（main.py）の1行目に、プログラムではない日本語の説明文（「まだうまく動作しない（チャンネルやロールが作成されない）とのこと、ご不便をおかけしています。」）がそのまま書き込まれてしまっていることです。
+
+Pythonはプログラム以外の文字列がコード内に直接書き込まれていると、構文エラー（SyntaxError）を出して起動を停止してしまいます。
+
+このエラーを解消するためには、/app/main.py
+の中身を一度すべて消去し、以下の修正済みのコード（最初のメッセージでご提示いただいたBotのプログラムコード）のみを貼り付け直して保存してください。
+
+修正後の main.py のコード
+
 print("=== WINDOWS_TEST_0615_AUTO_STATUS_AND_PERMS ===")
 
 import os
@@ -891,12 +900,6 @@ async def _wipe_guild(guild: discord.Guild) -> tuple[list[str], list[str]]:
     return success_logs, fail_logs
 
 
-# ----------------------------------------------------------------
-# 修正箇所:
-#   ワイプ後はチャンネル・ロール・カテゴリが存在しないため、
-#   existing_* を空辞書で初期化し、常に新規作成ルートに入るように変更。
-#   （旧コードは削除前の古いオブジェクト辞書を使っていたため edit が失敗していた）
-# ----------------------------------------------------------------
 async def _restore_from_backup(guild: discord.Guild, data: dict):
     success_logs = []
     fail_logs    = []
@@ -910,7 +913,6 @@ async def _restore_from_backup(guild: discord.Guild, data: dict):
 
     old_role_id_map = {}
 
-    # ワイプ後はロールが存在しないため existing_roles は空で固定
     for r_data in sorted(data.get("roles", []), key=lambda r: r["position"]):
         if r_data.get("managed"):
             fail_logs.append(f"ロール「{r_data['name']}」はBot管理ロールのためスキップ")
@@ -946,7 +948,6 @@ async def _restore_from_backup(guild: discord.Guild, data: dict):
 
     old_cat_id_map = {}
 
-    # ワイプ後はカテゴリが存在しないため常に新規作成
     for c_data in sorted(data.get("categories", []), key=lambda c: c["position"]):
         try:
             overwrites = _build_overwrites(c_data.get("overwrites", {}))
@@ -956,7 +957,6 @@ async def _restore_from_backup(guild: discord.Guild, data: dict):
         except Exception as e:
             fail_logs.append(f"カテゴリ「{c_data['name']}」の復元に失敗: {e}")
 
-    # ワイプ後はテキストチャンネルが存在しないため常に新規作成
     for ch_data in sorted(data.get("text_channels", []), key=lambda c: c["position"]):
         try:
             overwrites = _build_overwrites(ch_data.get("overwrites", {}))
@@ -982,7 +982,6 @@ async def _restore_from_backup(guild: discord.Guild, data: dict):
         except Exception as e:
             fail_logs.append(f"テキストch「#{ch_data['name']}」の復元に失敗: {e}")
 
-    # ワイプ後はボイスチャンネルが存在しないため常に新規作成
     for ch_data in sorted(data.get("voice_channels", []), key=lambda c: c["position"]):
         try:
             overwrites = _build_overwrites(ch_data.get("overwrites", {}))
@@ -1022,11 +1021,10 @@ class RestoreConfirmView(discord.ui.View):
             pass
 
         await interaction.followup.send(
-            "既存のチャンネル・カテゴリ・ロールを削除しています...",
+            "既存 of チャンネル・カテゴリ・ロールを削除しています...",
             ephemeral=True
         )
 
-        # ワイプ実行
         wipe_success, wipe_fail = await _wipe_guild(interaction.guild)
 
         await interaction.followup.send(
@@ -1035,12 +1033,6 @@ class RestoreConfirmView(discord.ui.View):
             ephemeral=True
         )
 
-        # ----------------------------------------------------------------
-        # 修正箇所:
-        #   ワイプ後にギルドオブジェクトを再取得して渡す。
-        #   discord.py のキャッシュは削除操作後も古い状態を持つ場合があるため、
-        #   interaction.guild を都度参照せずに bot.get_guild で最新を取得する。
-        # ----------------------------------------------------------------
         fresh_guild = interaction.client.get_guild(interaction.guild.id) or interaction.guild
 
         restore_success, restore_fail = await _restore_from_backup(fresh_guild, self.backup_data)
@@ -2494,18 +2486,16 @@ def get_antinuke_config(all_data, guild_id_str: str) -> dict:
     return cfg["antinuke"]
 
 
-# guild_id -> user_id -> action_type -> [timestamp, ...]
-_action_history: dict[int, dict[int, dict[str, list]]] = collections.defaultdict(
+guild_id_to_user_id_to_action_type = collections.defaultdict(
     lambda: collections.defaultdict(lambda: collections.defaultdict(list))
 )
 
-# 二重対応防止フラグ（guild_id, user_id）
 _already_handled: set[tuple[int, int]] = set()
 
 
 def _record_action(guild_id: int, user_id: int, action_type: str) -> int:
     now = time.time()
-    history = _action_history[guild_id][user_id][action_type]
+    history = guild_id_to_user_id_to_action_type[guild_id][user_id][action_type]
     history.append(now)
 
     cutoff = now - 60
@@ -2517,7 +2507,7 @@ def _record_action(guild_id: int, user_id: int, action_type: str) -> int:
 
 def _count_within_window(guild_id: int, user_id: int, action_type: str, window_seconds: int) -> int:
     now = time.time()
-    history = _action_history[guild_id][user_id][action_type]
+    history = guild_id_to_user_id_to_action_type[guild_id][user_id][action_type]
     cutoff = now - window_seconds
     return sum(1 for t in history if t >= cutoff)
 
