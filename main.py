@@ -1,31 +1,3 @@
-ご提示いただいたコードでサーバーリストアコマンドを使用した際、チャンネルやロールの生成（復元）が行われない原因として、主に以下の3点が発生していたと考えられます。
-
-主な原因
-
-1.  コマンド実行チャンネルの削除によるクラッシュ _wipe_guild
-    関数において、サーバー内のほぼ全てのチャンネルを削除する際、現在コマンド（/server_restore）を実行しているチャンネルも削除対象になっていました。このチャンネルが削除された直後に、Discord
-    APIとの接続情報（インタラクション）が無効化されるため、その後の interaction.followup.send
-    が「チャンネルが見つかりません」などのエラーで強制終了し、再構築処理（_restore_from_backup）へ到達していませんでした。
-
-2.  Bot自身の権限喪失 Botに手動で付与されていた管理者ロールなどが _wipe_guild
-    によって削除されてしまうと、ワイプの途中でBot自身が管理者権限を失います。その結果、その後の新規ロール作成やチャンネル作成が全て権限不足（403
-    Forbidden）で失敗していました。
-
-3.  フォーラムチャンネルの作成処理の不足 バックアップデータ（JSON）には forum_channels が保存されていますが、復元する関数である
-    _restore_from_backup の中にフォーラムチャンネルを作成する処理が実装されていませんでした。
-
-主な修正内容
-
-  - _wipe_guild に exclude_channel_id
-    引数を追加し、現在リストアを実行しているチャンネル、およびその属するカテゴリを削除対象から除外するようにしました。
-  - _wipe_guild のロール削除処理において、if me and role in me.roles:
-    の条件を適用し、Bot自身に付与されているすべてのロールを削除から除外することで、権限喪失を防ぐようにしました。
-  - 各種 followup.send（進捗送信など）の処理を try-except
-    で囲み、万が一インタラクションが切れた場合でも裏の復元処理自体は最後まで動き続けるようにエラー耐性を高めました。
-  - _restore_from_backup 内にフォーラムチャンネルの復元コードを実装しました。
-
-以下が、修正を適用した全体のソースコードです。
-
 print("=== WINDOWS_TEST_0615_AUTO_STATUS_AND_PERMS ===")
 
 import os
@@ -874,22 +846,14 @@ async def _build_backup(guild: discord.Guild) -> dict:
     }
 
 
-# ==========================================
-# 【修正】 exclude_channel_id 引数を追加し、
-# コマンド実行中のチャンネル（と所属カテゴリ）および
-# Bot自身が所持する権限ロールを保護するように変更しました。
-# ==========================================
-async def _wipe_guild(guild: discord.Guild, exclude_channel_id: int = None) -> tuple[list[str], list[str]]:
+async def _wipe_guild(guild: discord.Guild) -> tuple[list[str], list[str]]:
     success_logs: list[str] = []
     fail_logs:    list[str] = []
 
     me = guild.me
 
-    # コマンド実行中のテキストチャンネルは削除せず残す
     for ch in list(guild.channels):
         if isinstance(ch, discord.CategoryChannel):
-            continue
-        if exclude_channel_id and ch.id == exclude_channel_id:
             continue
         try:
             await ch.delete(reason="アンチnukeリストア: 全削除して再構築")
@@ -899,12 +863,7 @@ async def _wipe_guild(guild: discord.Guild, exclude_channel_id: int = None) -> t
         except Exception as e:
             fail_logs.append(f"チャンネル「#{ch.name}」の削除に失敗: {e}")
 
-    # コマンド実行中のチャンネルが所属するカテゴリも削除せず残す
     for cat in list(guild.categories):
-        if exclude_channel_id:
-            ex_ch = guild.get_channel(exclude_channel_id)
-            if ex_ch and ex_ch.category_id == cat.id:
-                continue
         try:
             await cat.delete(reason="アンチnukeリストア: 全削除して再構築")
             success_logs.append(f"カテゴリ「{cat.name}」を削除しました")
@@ -913,13 +872,12 @@ async def _wipe_guild(guild: discord.Guild, exclude_channel_id: int = None) -> t
         except Exception as e:
             fail_logs.append(f"カテゴリ「{cat.name}」の削除に失敗: {e}")
 
-    # Botに付与されているロール（me.roles）をすべて削除スキップして権限を維持
     for role in list(guild.roles):
         if role.is_default():
             continue
         if role.managed:
             continue
-        if me and role in me.roles:
+        if me and role in me.roles and role >= me.top_role:
             fail_logs.append(f"ロール「{role.name}」はBotの権限保持に必要なためスキップしました")
             continue
         try:
@@ -933,10 +891,12 @@ async def _wipe_guild(guild: discord.Guild, exclude_channel_id: int = None) -> t
     return success_logs, fail_logs
 
 
-# ==========================================
-# 【修正】 forum_channels (フォーラムチャンネル) 
-# の新規作成処理を追加しました。
-# ==========================================
+# ----------------------------------------------------------------
+# 修正箇所:
+#   ワイプ後はチャンネル・ロール・カテゴリが存在しないため、
+#   existing_* を空辞書で初期化し、常に新規作成ルートに入るように変更。
+#   （旧コードは削除前の古いオブジェクト辞書を使っていたため edit が失敗していた）
+# ----------------------------------------------------------------
 async def _restore_from_backup(guild: discord.Guild, data: dict):
     success_logs = []
     fail_logs    = []
@@ -950,6 +910,7 @@ async def _restore_from_backup(guild: discord.Guild, data: dict):
 
     old_role_id_map = {}
 
+    # ワイプ後はロールが存在しないため existing_roles は空で固定
     for r_data in sorted(data.get("roles", []), key=lambda r: r["position"]):
         if r_data.get("managed"):
             fail_logs.append(f"ロール「{r_data['name']}」はBot管理ロールのためスキップ")
@@ -985,6 +946,7 @@ async def _restore_from_backup(guild: discord.Guild, data: dict):
 
     old_cat_id_map = {}
 
+    # ワイプ後はカテゴリが存在しないため常に新規作成
     for c_data in sorted(data.get("categories", []), key=lambda c: c["position"]):
         try:
             overwrites = _build_overwrites(c_data.get("overwrites", {}))
@@ -994,6 +956,7 @@ async def _restore_from_backup(guild: discord.Guild, data: dict):
         except Exception as e:
             fail_logs.append(f"カテゴリ「{c_data['name']}」の復元に失敗: {e}")
 
+    # ワイプ後はテキストチャンネルが存在しないため常に新規作成
     for ch_data in sorted(data.get("text_channels", []), key=lambda c: c["position"]):
         try:
             overwrites = _build_overwrites(ch_data.get("overwrites", {}))
@@ -1019,6 +982,7 @@ async def _restore_from_backup(guild: discord.Guild, data: dict):
         except Exception as e:
             fail_logs.append(f"テキストch「#{ch_data['name']}」の復元に失敗: {e}")
 
+    # ワイプ後はボイスチャンネルが存在しないため常に新規作成
     for ch_data in sorted(data.get("voice_channels", []), key=lambda c: c["position"]):
         try:
             overwrites = _build_overwrites(ch_data.get("overwrites", {}))
@@ -1035,29 +999,9 @@ async def _restore_from_backup(guild: discord.Guild, data: dict):
         except Exception as e:
             fail_logs.append(f"ボイスch「{ch_data['name']}」の復元に失敗: {e}")
 
-    # フォーラムチャンネルの復元
-    for ch_data in sorted(data.get("forum_channels", []), key=lambda c: c["position"]):
-        try:
-            overwrites = _build_overwrites(ch_data.get("overwrites", {}))
-            category   = old_cat_id_map.get(ch_data.get("category_id"))
-
-            await guild.create_forum_channel(
-                name=ch_data["name"],
-                topic=ch_data.get("topic"),
-                overwrites=overwrites,
-                category=category,
-            )
-            success_logs.append(f"フォーラムch「#{ch_data['name']}」を作成しました")
-        except Exception as e:
-            fail_logs.append(f"フォーラムch「#{ch_data['name']}」の復元に失敗: {e}")
-
     return success_logs, fail_logs
 
 
-# ==========================================
-# 【修正】 インタラクション切断時のクラッシュを防ぐため、
-# 各 followup.send 呼び出しの周りに例外ハンドリングを追加しました。
-# ==========================================
 class RestoreConfirmView(discord.ui.View):
     def __init__(self, backup_data: dict):
         super().__init__(timeout=120)
@@ -1077,27 +1021,26 @@ class RestoreConfirmView(discord.ui.View):
         except Exception:
             pass
 
-        try:
-            await interaction.followup.send(
-                "既存のチャンネル・カテゴリ・ロールを削除しています...",
-                ephemeral=True
-            )
-        except Exception:
-            pass
+        await interaction.followup.send(
+            "既存のチャンネル・カテゴリ・ロールを削除しています...",
+            ephemeral=True
+        )
 
-        # ワイプ実行 (実行中のチャンネル ID を渡して削除から除外)
-        wipe_success, wipe_fail = await _wipe_guild(interaction.guild, exclude_channel_id=interaction.channel_id)
+        # ワイプ実行
+        wipe_success, wipe_fail = await _wipe_guild(interaction.guild)
 
-        try:
-            await interaction.followup.send(
-                f"削除完了（成功: {len(wipe_success)}件 / 失敗: {len(wipe_fail)}件）\n"
-                f"バックアップから再構築しています...",
-                ephemeral=True
-            )
-        except Exception:
-            pass
+        await interaction.followup.send(
+            f"削除完了（成功: {len(wipe_success)}件 / 失敗: {len(wipe_fail)}件）\n"
+            f"バックアップから再構築しています...",
+            ephemeral=True
+        )
 
-        # ギルドキャッシュの最新化
+        # ----------------------------------------------------------------
+        # 修正箇所:
+        #   ワイプ後にギルドオブジェクトを再取得して渡す。
+        #   discord.py のキャッシュは削除操作後も古い状態を持つ場合があるため、
+        #   interaction.guild を都度参照せずに bot.get_guild で最新を取得する。
+        # ----------------------------------------------------------------
         fresh_guild = interaction.client.get_guild(interaction.guild.id) or interaction.guild
 
         restore_success, restore_fail = await _restore_from_backup(fresh_guild, self.backup_data)
@@ -1123,14 +1066,7 @@ class RestoreConfirmView(discord.ui.View):
             messages.append(chunk)
 
         for msg in messages:
-            try:
-                await interaction.followup.send(msg, ephemeral=True)
-            except Exception:
-                # チャンネル等の影響でインタラクション送信が失敗した場合はDMで通知を試みる
-                try:
-                    await interaction.user.send(msg)
-                except Exception:
-                    pass
+            await interaction.followup.send(msg, ephemeral=True)
 
     @discord.ui.button(label="キャンセル", style=discord.ButtonStyle.secondary)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -2019,10 +1955,10 @@ async def server_restore(interaction: discord.Interaction, backup_file: discord.
         description=(
             "バックアップデータを確認しました。\n\n"
             "この操作を実行すると、現在のサーバーの以下が全て削除されます:\n"
-            "・全テキストチャンネル（実行中のチャンネルを除く）\n"
+            "・全テキストチャンネル\n"
             "・全ボイスチャンネル\n"
-            "・全カテゴリ（実行中のチャンネルが所属するものを除く）\n"
-            "・全ロール（@everyone・Bot連携ロール・Bot自身が持つロールを除く）\n\n"
+            "・全カテゴリ\n"
+            "・全ロール（@everyone・Bot連携ロールを除く）\n\n"
             "削除後、バックアップの内容で再構築します。\n"
             "この操作は取り消せません。"
         ),
@@ -2041,8 +1977,7 @@ async def server_restore(interaction: discord.Interaction, backup_file: discord.
             f"ロール: {len(backup_data.get('roles', []))}個\n"
             f"カテゴリ: {len(backup_data.get('categories', []))}個\n"
             f"テキストch: {len(backup_data.get('text_channels', []))}個\n"
-            f"ボイスch: {len(backup_data.get('voice_channels', []))}個\n"
-            f"フォーラムch: {len(backup_data.get('forum_channels', []))}個"
+            f"ボイスch: {len(backup_data.get('voice_channels', []))}個"
         ),
         inline=False
     )
