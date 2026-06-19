@@ -763,17 +763,20 @@ class VerifyButtonView(discord.ui.View):
 
 class RestoreConfirmView(discord.ui.View):
     """サーバー再構築（リストア）の実行確認用ボタンビューです。"""
+
     def __init__(self, backup_data: dict):
         super().__init__(timeout=120)
         self.backup_data = backup_data
 
-    @discord.ui.button(label="全削除してリストアを実行する", style=discord.ButtonStyle.danger)
+    @discord.ui.button(label="全削除してリストアを実行する", style=discord.ButtonStyle.danger, emoji="⚠️")
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """確認ボタンが押されたとき、全削除→バックアップから復元を実行します。"""
         if not interaction.guild:
             return
 
         await interaction.response.defer(ephemeral=True)
 
+        # ボタンを即座に無効化（二重実行防止）
         for item in self.children:
             item.disabled = True
         try:
@@ -781,30 +784,32 @@ class RestoreConfirmView(discord.ui.View):
         except Exception:
             pass
 
+        # Step 1: 既存チャンネル・ロールを全削除
         await interaction.followup.send(
-            "既存のチャンネル・カテゴリ・ロールを削除しています...",
+            "⏳ 既存のチャンネル・カテゴリ・ロールを削除しています...",
             ephemeral=True
         )
-
         wipe_success, wipe_fail = await _wipe_guild(interaction.guild)
 
+        # Step 2: バックアップから再構築
         await interaction.followup.send(
-            f"削除完了（成功: {len(wipe_success)}件 / 失敗: {len(wipe_fail)}件）\n"
-            "バックアップから再構築しています...",
+            f"✅ 削除完了（成功: {len(wipe_success)}件 / 失敗: {len(wipe_fail)}件）\n"
+            "⏳ バックアップから再構築しています...",
             ephemeral=True
         )
 
+        # 削除後にギルドオブジェクトを最新状態で取得
         fresh_guild = interaction.client.get_guild(interaction.guild.id) or interaction.guild
-
         restore_success, restore_fail = await _restore_from_backup(fresh_guild, self.backup_data)
 
-        success_logs = wipe_success + restore_success
-        fail_logs    = wipe_fail + restore_fail
+        # 全ログをまとめて結果表示（2000文字制限を考慮して分割送信）
+        all_ok  = wipe_success + restore_success
+        all_ng  = wipe_fail    + restore_fail
 
         result_lines = (
-            [f"**リストア完了** 成功: {len(success_logs)}件 / 失敗: {len(fail_logs)}件\n"]
-            + [f"OK {s}" for s in success_logs]
-            + [f"NG {f}" for f in fail_logs]
+            [f"**✅ リストア完了** 成功: {len(all_ok)}件 / 失敗: {len(all_ng)}件\n"]
+            + [f"🟢 {s}" for s in all_ok]
+            + [f"🔴 {f}" for f in all_ng]
         )
 
         chunk = ""
@@ -821,11 +826,14 @@ class RestoreConfirmView(discord.ui.View):
         for msg in messages:
             await interaction.followup.send(msg, ephemeral=True)
 
-    @discord.ui.button(label="キャンセル", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="キャンセル", style=discord.ButtonStyle.secondary, emoji="✖️")
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """キャンセルボタンが押されたとき、リストアを中断します。"""
         for item in self.children:
             item.disabled = True
-        await interaction.response.edit_message(content="リストアをキャンセルしました。", embed=None, view=self)
+        await interaction.response.edit_message(
+            content="リストアをキャンセルしました。", embed=None, view=self
+        )
 
 
 class GuildDetailSelect(discord.ui.Select):
