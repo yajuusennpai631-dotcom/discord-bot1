@@ -1,8 +1,4 @@
-
-
-### 修正後の `main.py` のコード
-
-```python
+python
 print("=== WINDOWS_TEST_0615_AUTO_STATUS_AND_PERMS ===")
 
 import os
@@ -1017,7 +1013,7 @@ class RestoreConfirmView(discord.ui.View):
             pass
 
         await interaction.followup.send(
-            "既存 of チャンネル・カテゴリ・ロールを削除しています...",
+            "既存のチャンネル・カテゴリ・ロールを削除しています...",
             ephemeral=True
         )
 
@@ -2855,4 +2851,3 @@ async def antinuke_status(interaction: discord.Interaction):
 
 
 bot.run(TOKEN)
-```
