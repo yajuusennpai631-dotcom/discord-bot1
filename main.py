@@ -772,7 +772,7 @@ class RestoreConfirmView(discord.ui.View):
         self.backup_data = backup_data
         self._running = False  # 二重実行防止フラグ
 
-    @discord.ui.button(label="段階的にリストアを実行する", style=discord.ButtonStyle.danger, emoji="🔄")
+    @discord.ui.button(label="段階的にリストアを実行する", style=discord.ButtonStyle.danger)
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
         """確認ボタンが押されたとき、段階的リストア（更新・追加・削除）を実行します。"""
         if not interaction.guild:
@@ -800,7 +800,7 @@ class RestoreConfirmView(discord.ui.View):
         print(f"[リストア開始] サーバー: {guild.name} (by {interaction.user})")
 
         await interaction.followup.send(
-            "🔄 **段階的リストアを開始します...**\n"
+            ">> 段階的リストアを開始します...\n"
             "既存のチャンネル・ロールを更新しながら、不足分を追加・余分を削除します。",
             ephemeral=True
         )
@@ -810,9 +810,9 @@ class RestoreConfirmView(discord.ui.View):
 
         # 結果を分割送信（2000文字制限対策）
         result_lines = (
-            [f"**✅ リストア完了！** 成功: {len(success_logs)}件 / 失敗: {len(fail_logs)}件\n"]
-            + [f"🟢 {s}" for s in success_logs]
-            + [f"🔴 {f}" for f in fail_logs]
+            [f"** リストア完了 ** 成功: {len(success_logs)}件 / 失敗: {len(fail_logs)}件\n"]
+            + [f"[OK] {s}" for s in success_logs]
+            + [f"[NG] {f}" for f in fail_logs]
         )
 
         chunk = ""
@@ -830,7 +830,7 @@ class RestoreConfirmView(discord.ui.View):
 
         self._running = False
 
-    @discord.ui.button(label="キャンセル", style=discord.ButtonStyle.secondary, emoji="✖️")
+    @discord.ui.button(label="キャンセル", style=discord.ButtonStyle.secondary)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
         """キャンセルボタンが押されたとき、リストアを中断します。"""
         if self._running:
@@ -3143,33 +3143,33 @@ async def server_restore(interaction: discord.Interaction, backup_file: discord.
     guild_match = meta.get("guild_id") == interaction.guild.id
 
     embed = discord.Embed(
-        title="🔄 サーバー段階的リストア確認",
+        title="[ サーバー段階的リストア確認 ]",
         description=(
             "バックアップデータを確認しました。\n\n"
-            "**この操作の動作（全削除はしません）:**\n"
-            "① バックアップにあるロール → 既存なら**更新**、なければ**新規作成**\n"
-            "② バックアップにないロール → **削除**（@everyone・Bot連携ロールを除く）\n"
-            "③ カテゴリも同様に更新・新規作成・削除\n"
-            "④ チャンネルも同様に更新・新規作成・削除\n\n"
-            "⚠️ バックアップにないチャンネル・ロールは削除されます。\n"
-            "この操作は取り消せません。"
+            "-- この操作の動作（全削除はしません） --\n"
+            "(1) バックアップにあるロール  -> 既存なら更新、なければ新規作成\n"
+            "(2) バックアップにないロール  -> 削除（@everyone・Bot連携ロールを除く）\n"
+            "(3) カテゴリも同様に 更新 / 新規作成 / 削除\n"
+            "(4) チャンネルも同様に 更新 / 新規作成 / 削除\n\n"
+            "* バックアップにないチャンネル・ロールは削除されます。\n"
+            "* この操作は取り消せません。"
         ),
         color=discord.Color.orange()
     )
     embed.add_field(name="バックアップ元サーバー", value=meta.get("guild_name", "不明"), inline=True)
     embed.add_field(
         name="サーバー一致",
-        value="✅ 同じサーバー" if guild_match else "⚠️ 別のサーバーのバックアップです",
+        value="[一致] 同じサーバー" if guild_match else "[注意] 別のサーバーのバックアップです",
         inline=True
     )
     embed.add_field(name="バックアップ日時", value=meta.get("backed_up_at", "不明")[:19].replace("T", " ") + " UTC", inline=False)
     embed.add_field(
         name="復元対象（バックアップ内容）",
         value=(
-            f"ロール: {len(backup_data.get('roles', []))}個\n"
-            f"カテゴリ: {len(backup_data.get('categories', []))}個\n"
+            f"ロール    : {len(backup_data.get('roles', []))}個\n"
+            f"カテゴリ  : {len(backup_data.get('categories', []))}個\n"
             f"テキストch: {len(backup_data.get('text_channels', []))}個\n"
-            f"ボイスch: {len(backup_data.get('voice_channels', []))}個"
+            f"ボイスch  : {len(backup_data.get('voice_channels', []))}個"
         ),
         inline=False
     )
