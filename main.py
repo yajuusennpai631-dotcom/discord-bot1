@@ -2431,19 +2431,21 @@ async def on_message(message: discord.Message):
                 if len(history) >= 5:
                     try:
                         await message.author.timeout(datetime.timedelta(minutes=10), reason="自動モデレーション: 短時間大量送信スパム")
-                        await message.channel.purge(limit=5, check=lambda m: m.author == message.author)
+                        # limitを増やして、短時間に送信されたすべてのスパムメッセージを確実に削除する
+                        await message.channel.purge(limit=20, check=lambda m: m.author == message.author)
                         bot.spam_cache[cache_key] = []
-                        await message.channel.send(f"⚠️ {message.author.mention} をスパム検知のため一時ミュートしました。")
+                        await message.channel.send(f"⚠️ {message.author.mention} をスパム検知のため一時ミュートし、メッセージを削除しました。")
                         return
                     except:
                         pass
 
             # 2. 自動モデレーション: 招待リンク削除
             if guild_config.get("automod_invite_enabled", False):
-                if "discord.gg/" in message.content or "discord.com/invite/" in message.content:
+                content_lower = message.content.lower()
+                if "discord.gg/" in content_lower or "discord.com/invite/" in content_lower or "discord.me/" in content_lower or "dsc.gg/" in content_lower:
                     try:
                         await message.delete()
-                        await message.channel.send(f"⚠️ {message.author.mention} 招待リンクの送信は許可されていません。", delete_after=10)
+                        await message.channel.send(f"⚠️ {message.author.mention} 招待リンクの送信は許可されていません。", delete_after=5)
                         return
                     except:
                         pass
@@ -2454,7 +2456,7 @@ async def on_message(message: discord.Message):
                 if any(ng in message.content for ng in ng_words if ng):
                     try:
                         await message.delete()
-                        await message.channel.send(f"⚠️ {message.author.mention} NGワードが含まれているため削除されました。", delete_after=10)
+                        await message.channel.send(f"⚠️ {message.author.mention} NGワードが含まれているため削除されました。", delete_after=5)
                         return
                     except:
                         pass
