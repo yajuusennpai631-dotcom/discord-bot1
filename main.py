@@ -102,11 +102,31 @@ def get_guild_config(all_data: dict, guild_id_str: str) -> dict:
             "mention_target_role": None,
             "mention_custom_message": None,
             "approval_status": "pending",
-            "approval_panel_channel_id": None
+            "approval_panel_channel_id": None,
+            "warnings": {},
+            "automod_spam_enabled": False,
+            "automod_invite_enabled": False,
+            "automod_ng_words_enabled": False,
+            "ng_words": [],
+            "mod_log_channel_id": None
         }
-    if "approval_status" not in all_data[guild_id_str]:
-        all_data[guild_id_str]["approval_status"] = "pending"
-    return all_data[guild_id_str]
+    
+    # 既存データへの互換性のためキーが無ければ追加
+    cfg = all_data[guild_id_str]
+    if "approval_status" not in cfg:
+        cfg["approval_status"] = "pending"
+    for key, default in [
+        ("warnings", {}),
+        ("automod_spam_enabled", False),
+        ("automod_invite_enabled", False),
+        ("automod_ng_words_enabled", False),
+        ("ng_words", []),
+        ("mod_log_channel_id", None)
+    ]:
+        if key not in cfg:
+            cfg[key] = default
+
+    return cfg
 
 
 def is_guild_approved(all_data: dict, guild_id_str: str) -> bool:
@@ -240,6 +260,41 @@ async def is_admin_or_allowed(interaction: discord.Interaction) -> bool:
         return True
         
     await interaction.response.send_message("このコマンドを実行する権限がありません（管理者または許可ユーザー専用）。", ephemeral=True)
+    return False
+
+
+async def is_moderator(interaction: discord.Interaction) -> bool:
+    """
+    実行者が「Botオーナー」「グローバル信頼ユーザー」「サーバー管理者」「サーバー内許可ユーザー」
+    のいずれかに該当するかどうかを判定します（管理・モデレーションコマンド用）。
+    """
+    if interaction.client.owner_id is None:
+        app_info = await interaction.client.application_info()
+        interaction.client.owner_id = app_info.owner.id
+
+    user_id = interaction.user.id
+    if user_id == interaction.client.owner_id:
+        return True
+
+    all_data = load_data()
+    global_cfg = get_global_config(all_data)
+    if user_id in global_cfg.get("trusted_users", []):
+        return True
+
+    if not interaction.guild:
+        await interaction.response.send_message("このコマンドはサーバー内で実行してください。", ephemeral=True)
+        return False
+
+    if interaction.user.guild_permissions.administrator:
+        return True
+
+    cfg = get_guild_config(all_data, str(interaction.guild.id))
+    if user_id in cfg.get("allowed_users", []):
+        return True
+
+    await interaction.response.send_message(
+        "このコマンドを実行する権限がありません（モデレーター権限が必要です）。", ephemeral=True
+    )
     return False
 
 
@@ -2348,12 +2403,69 @@ async def on_message(message: discord.Message):
     if guild_id_str in all_data:
         guild_config = all_data[guild_id_str]
 
+        # モデレーターはAuto-Modの対象外
+        is_mod = False
+        if message.author.guild_permissions.administrator:
+            is_mod = True
+        elif message.author.id in guild_config.get("allowed_users", []):
+            is_mod = True
+        elif message.author.id == bot.owner_id:
+            is_mod = True
+        else:
+            global_cfg = get_global_config(all_data)
+            if message.author.id in global_cfg.get("trusted_users", []):
+                is_mod = True
+
+        if not is_mod:
+            # 1. 自動モデレーション: スパム検知 (5秒以内に5回でタイムアウト)
+            if guild_config.get("automod_spam_enabled", False):
+                now = datetime.datetime.now().timestamp()
+                cache_key = f"{message.guild.id}-{message.author.id}"
+                if not hasattr(bot, "spam_cache"):
+                    bot.spam_cache = {}
+                history = bot.spam_cache.get(cache_key, [])
+                history = [t for t in history if now - t < 5.0]
+                history.append(now)
+                bot.spam_cache[cache_key] = history
+
+                if len(history) >= 5:
+                    try:
+                        await message.author.timeout(datetime.timedelta(minutes=10), reason="自動モデレーション: 短時間大量送信スパム")
+                        await message.channel.purge(limit=5, check=lambda m: m.author == message.author)
+                        bot.spam_cache[cache_key] = []
+                        await message.channel.send(f"⚠️ {message.author.mention} をスパム検知のため一時ミュートしました。")
+                        return
+                    except:
+                        pass
+
+            # 2. 自動モデレーション: 招待リンク削除
+            if guild_config.get("automod_invite_enabled", False):
+                if "discord.gg/" in message.content or "discord.com/invite/" in message.content:
+                    try:
+                        await message.delete()
+                        await message.channel.send(f"⚠️ {message.author.mention} 招待リンクの送信は許可されていません。", delete_after=10)
+                        return
+                    except:
+                        pass
+
+            # 3. 自動モデレーション: NGワード検知
+            if guild_config.get("automod_ng_words_enabled", False):
+                ng_words = guild_config.get("ng_words", [])
+                if any(ng in message.content for ng in ng_words if ng):
+                    try:
+                        await message.delete()
+                        await message.channel.send(f"⚠️ {message.author.mention} NGワードが含まれているため削除されました。", delete_after=10)
+                        return
+                    except:
+                        pass
+
+
         # 承認済みサーバーでない場合は、!コマンド処理のみ受け付けてメッセージ処理はスルー
         if guild_config.get("approval_status") != "approved":
             await bot.process_commands(message)
             return
         
-        # 1. メッセージ自動転送処理
+        # 4. メッセージ自動転送処理
         from_id = guild_config.get("from_channel")
         to_id = guild_config.get("to_channel")
         if from_id and to_id and message.channel.id == from_id:
@@ -2362,7 +2474,7 @@ async def on_message(message: discord.Message):
                 if to_channel:
                     await to_channel.send(message.content)
                 
-        # 2. 自動返信ロールメンション処理
+        # 5. 自動返信ロールメンション処理
         trigger_ch_id = guild_config.get("mention_trigger_channel")
         target_role_id = guild_config.get("mention_target_role")
         custom_msg = guild_config.get("mention_custom_message", "新しい書き込みがありました！")
@@ -2381,22 +2493,57 @@ async def on_message(message: discord.Message):
                         full_reply_text, 
                         allowed_mentions=discord.AllowedMentions(roles=[role])
                     )
-                    print(f"[自動返信成功] ch: #{message.channel.name} でロール @{role.name} 宛てに送信しました。")
                 except discord.Forbidden:
                     try:
                         await message.channel.send(
                             full_reply_text,
                             allowed_mentions=discord.AllowedMentions(roles=[role])
                         )
-                        print("[自動返信フォールバック] 返信権限がないため、通常メッセージとして送信しました。")
-                    except Exception as e:
-                        print(f"[自動返信エラー] 通常送信も失敗しました。Botの権限を確認してください: {e}")
-                except Exception as e:
-                    print(f"[自動返信エラー] 不明なエラーが発生しました: {e}")
+                    except:
+                        pass
 
     await bot.process_commands(message)
 
 
+async def _send_mod_log(guild: discord.Guild, embed: discord.Embed):
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(guild.id))
+    log_ch_id = cfg.get("mod_log_channel_id")
+    if log_ch_id:
+        ch = guild.get_channel(log_ch_id)
+        if ch:
+            try:
+                await ch.send(embed=embed)
+            except:
+                pass
+
+@bot.event
+async def on_message_delete(message: discord.Message):
+    if message.author.bot or not message.guild: return
+    embed = discord.Embed(title="[ログ] メッセージ削除", description=f"**送信者:** {message.author.mention}\n**チャンネル:** {message.channel.mention}", color=discord.Color.red())
+    embed.add_field(name="内容", value=message.content or "（内容なし / Embed・画像など）", inline=False)
+    await _send_mod_log(message.guild, embed)
+
+@bot.event
+async def on_message_edit(before: discord.Message, after: discord.Message):
+    if before.author.bot or not before.guild or before.content == after.content: return
+    embed = discord.Embed(title="[ログ] メッセージ編集", description=f"**送信者:** {before.author.mention}\n**チャンネル:** {before.channel.mention}\n[メッセージへジャンプ]({after.jump_url})", color=discord.Color.yellow())
+    embed.add_field(name="編集前", value=before.content or "（なし）", inline=False)
+    embed.add_field(name="編集後", value=after.content or "（なし）", inline=False)
+    await _send_mod_log(before.guild, embed)
+
+@bot.event
+async def on_member_join(member: discord.Member):
+    embed = discord.Embed(title="[ログ] メンバー参加", description=f"{member.mention} (`{member.id}`)", color=discord.Color.green())
+    embed.set_thumbnail(url=member.display_avatar.url)
+    embed.add_field(name="アカウント作成日時", value=member.created_at.strftime("%Y/%m/%d %H:%M:%S UTC"), inline=False)
+    await _send_mod_log(member.guild, embed)
+
+@bot.event
+async def on_member_remove(member: discord.Member):
+    embed = discord.Embed(title="[ログ] メンバー退出", description=f"{member.mention} (`{member.id}`)", color=discord.Color.dark_gray())
+    embed.set_thumbnail(url=member.display_avatar.url)
+    await _send_mod_log(member.guild, embed)
 @bot.event
 async def on_audit_log_entry_create(entry: discord.AuditLogEntry):
     """監査ログ作成時に呼び出されます。短期間の連続操作を検知して緊急処置を起動します。"""
@@ -3519,7 +3666,156 @@ async def antinuke_status(interaction: discord.Interaction):
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
+# --------------------------------------------------------------------
+# 6. モデレーション＆管理 (Moderation) コマンド
+# --------------------------------------------------------------------
 
+@bot.tree.command(name="warn", description="【モデレーター専用】ユーザーに警告を与えます")
+async def warn(interaction: discord.Interaction, user: discord.Member, reason: str = "理由なし"):
+    if not await is_moderator(interaction): return
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(interaction.guild.id))
+    warnings = cfg.setdefault("warnings", {})
+    user_warnings = warnings.setdefault(str(user.id), [])
+    
+    timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    user_warnings.append({"reason": reason, "date": timestamp, "moderator": interaction.user.id})
+    save_data(all_data)
+    
+    await interaction.response.send_message(f"[警告] {user.mention} に警告を与えました。\n理由: {reason}")
+    try:
+        await user.send(f"[警告] **{interaction.guild.name}** で警告を受けました。\n理由: {reason}")
+    except:
+        pass
+
+
+@bot.tree.command(name="warnings", description="【モデレーター専用】ユーザーの警告履歴を確認します")
+async def warnings(interaction: discord.Interaction, user: discord.Member):
+    if not await is_moderator(interaction): return
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(interaction.guild.id))
+    user_warnings = cfg.get("warnings", {}).get(str(user.id), [])
+    
+    if not user_warnings:
+        await interaction.response.send_message(f"{user.mention} には警告履歴がありません。", ephemeral=True)
+        return
+        
+    embed = discord.Embed(title=f"[ 警告履歴: {user.display_name} ]", color=discord.Color.orange())
+    for i, w in enumerate(user_warnings, 1):
+        date = w["date"][:19].replace("T", " ")
+        embed.add_field(name=f"警告 {i} ({date})", value=f"理由: {w['reason']}\n担当: <@{w['moderator']}>", inline=False)
+        
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="mute", description="【モデレーター専用】ユーザーを一時的にミュート（タイムアウト）します")
+async def mute(interaction: discord.Interaction, user: discord.Member, minutes: int, reason: str = "理由なし"):
+    if not await is_moderator(interaction): return
+    try:
+        duration = datetime.timedelta(minutes=minutes)
+        await user.timeout(duration, reason=reason)
+        await interaction.response.send_message(f"[ミュート] {user.mention} を {minutes} 分間ミュートしました。\n理由: {reason}")
+    except discord.Forbidden:
+        await interaction.response.send_message("権限が不足しているためミュートできません。", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"エラーが発生しました: {e}", ephemeral=True)
+
+
+@bot.tree.command(name="ban", description="【モデレーター専用】ユーザーをBANします")
+async def ban(interaction: discord.Interaction, user: discord.Member, reason: str = "理由なし"):
+    if not await is_moderator(interaction): return
+    try:
+        await user.ban(reason=reason)
+        await interaction.response.send_message(f"[BAN] {user.mention} をBANしました。\n理由: {reason}")
+    except discord.Forbidden:
+        await interaction.response.send_message("権限が不足しているためBANできません。", ephemeral=True)
+
+
+@bot.tree.command(name="kick", description="【モデレーター専用】ユーザーをキックします")
+async def kick(interaction: discord.Interaction, user: discord.Member, reason: str = "理由なし"):
+    if not await is_moderator(interaction): return
+    try:
+        await user.kick(reason=reason)
+        await interaction.response.send_message(f"[KICK] {user.mention} をキックしました。\n理由: {reason}")
+    except discord.Forbidden:
+        await interaction.response.send_message("権限が不足しているためキックできません。", ephemeral=True)
+
+
+@bot.tree.command(name="purge", description="【モデレーター専用】現在のチャンネルのメッセージを一括削除します")
+async def purge(interaction: discord.Interaction, amount: int):
+    if not await is_moderator(interaction): return
+    if amount < 1 or amount > 100:
+        await interaction.response.send_message("1〜100の範囲で指定してください。", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    try:
+        deleted = await interaction.channel.purge(limit=amount)
+        await interaction.followup.send(f"[一括削除] {len(deleted)} 件のメッセージを削除しました。", ephemeral=True)
+    except discord.Forbidden:
+        await interaction.followup.send("権限が不足しているため削除できません。", ephemeral=True)
+
+
+@bot.tree.command(name="automod_toggle", description="【モデレーター専用】自動モデレーションのON/OFFを切り替えます")
+@discord.app_commands.choices(機能=[
+    discord.app_commands.Choice(name="スパム検知", value="spam"),
+    discord.app_commands.Choice(name="招待リンク削除", value="invite"),
+    discord.app_commands.Choice(name="NGワード検知", value="ngword")
+])
+async def automod_toggle(interaction: discord.Interaction, 機能: discord.app_commands.Choice[str], 有効化: bool):
+    if not await is_moderator(interaction): return
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(interaction.guild.id))
+    
+    key = f"automod_{機能.value}_enabled"
+    if 機能.value == "ngword":
+        key = "automod_ng_words_enabled"
+        
+    cfg[key] = 有効化
+    save_data(all_data)
+    
+    status = "ON" if 有効化 else "OFF"
+    await interaction.response.send_message(f"[設定変更] 自動モデレーション「{機能.name}」を **{status}** に設定しました。", ephemeral=True)
+
+
+@bot.tree.command(name="automod_ngword_add", description="【モデレーター専用】NGワードを追加します")
+async def automod_ngword_add(interaction: discord.Interaction, word: str):
+    if not await is_moderator(interaction): return
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(interaction.guild.id))
+    ng_words = set(cfg.get("ng_words", []))
+    ng_words.add(word)
+    cfg["ng_words"] = list(ng_words)
+    save_data(all_data)
+    await interaction.response.send_message(f"[追加] NGワードに「{word}」を追加しました。", ephemeral=True)
+
+
+@bot.tree.command(name="automod_ngword_remove", description="【モデレーター専用】NGワードを削除します")
+async def automod_ngword_remove(interaction: discord.Interaction, word: str):
+    if not await is_moderator(interaction): return
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(interaction.guild.id))
+    ng_words = set(cfg.get("ng_words", []))
+    ng_words.discard(word)
+    cfg["ng_words"] = list(ng_words)
+    save_data(all_data)
+    await interaction.response.send_message(f"[削除] NGワードから「{word}」を削除しました。", ephemeral=True)
+
+
+@bot.tree.command(name="modlog_set", description="【モデレーター専用】監査ログの出力先チャンネルを設定します")
+async def modlog_set(interaction: discord.Interaction, channel: discord.TextChannel = None):
+    if not await is_moderator(interaction): return
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(interaction.guild.id))
+    
+    if channel:
+        cfg["mod_log_channel_id"] = channel.id
+        msg = f"[設定完了] 監査ログの出力先を {channel.mention} に設定しました。"
+    else:
+        cfg["mod_log_channel_id"] = None
+        msg = "[設定解除] 監査ログの出力を無効にしました。"
+        
+    save_data(all_data)
+    await interaction.response.send_message(msg, ephemeral=True)
 # --------------------------------------------------------------------
 # 6. BOT所有者専用コマンド (オーナー限定)
 # --------------------------------------------------------------------
