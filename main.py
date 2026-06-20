@@ -1010,134 +1010,135 @@ class ServerCopyConfirmView(discord.ui.View):
 
 
 # ====================================================================
-# 謝罪コマンド用 UI部品（ここに追加）
+# 謝罪コマンド用 UI部品（高自由度・絵文字なし・自然な文体版）
 # ====================================================================
 
-class ApologyCustomModal(discord.ui.Modal):
-    """自由入力用のモーダル"""
-    def __init__(self, part: str, view: "ApologySelectView"):
-        self.part = part
-        self.view = view
-        title = {"action": "行動", "pointed": "指摘", "improve": "改善"}.get(part, "入力")
-        super().__init__(title=f"謝罪文 - {title}を自由入力")
-
-        self.input_text = discord.ui.TextInput(
-            label=f"{title}の内容",
-            style=discord.TextStyle.paragraph,
-            max_length=500,
-            required=True
-        )
-        self.add_item(self.input_text)
+class FullCustomApologyModal(discord.ui.Modal, title="完全自由入力で謝罪文を作成"):
+    """一番自由に書けるモード"""
+    content = discord.ui.TextInput(
+        label="謝罪文を自由に書いてください",
+        style=discord.TextStyle.paragraph,
+        placeholder="ここに全文を入力...（主要部分を自由に変更可能）",
+        max_length=3900,
+        required=True
+    )
 
     async def on_submit(self, interaction: discord.Interaction):
-        value = self.input_text.value.strip()
-        if self.part == "action":
-            self.view.action = value
-        elif self.part == "pointed":
-            self.view.pointed = value
-        else:
-            self.view.improve = value
-
-        await self.view.update_preview(interaction)
-
-
-class ApologySelectView(discord.ui.View):
-    """謝罪コマンドのメイン選択ビュー"""
-    def __init__(self):
-        super().__init__(timeout=300)
-        self.action = "ミスをしてしまいました"
-        self.pointed = "指摘を受けました"
-        self.improve = "今後気をつけます"
-
-    def get_preview_embed(self) -> discord.Embed:
         embed = discord.Embed(
-            title="謝罪文プレビュー",
-            description="以下の内容で送信されます。",
+            title="謝罪いたします",
+            description=self.content.value,
             color=discord.Color.orange()
         )
-        embed.add_field(name="① 行動", value=self.action, inline=False)
-        embed.add_field(name="② 指摘", value=self.pointed, inline=False)
-        embed.add_field(name="③ 改善", value=self.improve, inline=False)
-        embed.set_footer(text="内容を確認して「送信」ボタンを押してください")
-        return embed
+        embed.set_author(name=interaction.user.display_name, icon_url=interaction.user.display_avatar.url)
+        embed.timestamp = discord.utils.utcnow()
 
-    async def update_preview(self, interaction: discord.Interaction):
-        await interaction.response.edit_message(
-            embed=self.get_preview_embed(),
-            view=self
-        )
+        await interaction.response.send_message(embed=embed)
 
-    @discord.ui.select(
-        placeholder="① 何をしましたか？（行動）",
-        options=[
-            discord.SelectOption(label="ミスをしてしまいました", value="ミスをしてしまいました"),
-            discord.SelectOption(label="不適切な発言をしてしまいました", value="不適切な発言をしてしまいました"),
-            discord.SelectOption(label="ルールを破ってしまいました", value="ルールを破ってしまいました"),
-            discord.SelectOption(label="自由入力", value="custom"),
-        ]
+
+class StructuredApologyModal(discord.ui.Modal, title="主要部分を分けて編集"):
+    """主要部分を分けつつ自由に変更できるモード"""
+    action = discord.ui.TextInput(
+        label="1. 何をしてしまったか",
+        style=discord.TextStyle.paragraph,
+        max_length=500,
+        required=True
     )
-    async def select_action(self, interaction: discord.Interaction, select: discord.ui.Select):
-        if select.values[0] == "custom":
-            await interaction.response.send_modal(ApologyCustomModal("action", self))
-        else:
-            self.action = select.values[0]
-            await self.update_preview(interaction)
-
-    @discord.ui.select(
-        placeholder="② 誰かに指摘されましたか？",
-        options=[
-            discord.SelectOption(label="指摘を受けました", value="指摘を受けました"),
-            discord.SelectOption(label="ご迷惑をおかけしました", value="ご迷惑をおかけしました"),
-            discord.SelectOption(label="不快な思いをさせてしまいました", value="不快な思いをさせてしまいました"),
-            discord.SelectOption(label="自由入力", value="custom"),
-        ]
+    
+    pointed = discord.ui.TextInput(
+        label="2. 指摘されたこと / 相手の気持ち",
+        style=discord.TextStyle.paragraph,
+        max_length=400,
+        required=True
     )
-    async def select_pointed(self, interaction: discord.Interaction, select: discord.ui.Select):
-        if select.values[0] == "custom":
-            await interaction.response.send_modal(ApologyCustomModal("pointed", self))
-        else:
-            self.pointed = select.values[0]
-            await self.update_preview(interaction)
-
-    @discord.ui.select(
-        placeholder="③ 今後どうしますか？（改善）",
-        options=[
-            discord.SelectOption(label="今後気をつけます", value="今後気をつけます"),
-            discord.SelectOption(label="二度と繰り返しません", value="二度と繰り返しません"),
-            discord.SelectOption(label="注意して行動します", value="注意して行動します"),
-            discord.SelectOption(label="自由入力", value="custom"),
-        ]
+    
+    reflection = discord.ui.TextInput(
+        label="3. 自分の反省・気づき",
+        style=discord.TextStyle.paragraph,
+        max_length=500,
+        required=True
     )
-    async def select_improve(self, interaction: discord.Interaction, select: discord.ui.Select):
-        if select.values[0] == "custom":
-            await interaction.response.send_modal(ApologyCustomModal("improve", self))
-        else:
-            self.improve = select.values[0]
-            await self.update_preview(interaction)
+    
+    improvement = discord.ui.TextInput(
+        label="4. 今後どうするか（改善策）",
+        style=discord.TextStyle.paragraph,
+        max_length=500,
+        required=True
+    )
 
-    @discord.ui.button(label="送信する", style=discord.ButtonStyle.success, row=3)
-    async def send_apology(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def on_submit(self, interaction: discord.Interaction):
         embed = discord.Embed(
             title="謝罪いたします",
             color=discord.Color.orange()
         )
-        embed.add_field(name="① 行動", value=self.action, inline=False)
-        embed.add_field(name="② 指摘", value=self.pointed, inline=False)
-        embed.add_field(name="③ 改善", value=self.improve, inline=False)
+        embed.add_field(name="1. 行動", value=self.action.value, inline=False)
+        embed.add_field(name="2. 指摘", value=self.pointed.value, inline=False)
+        embed.add_field(name="3. 反省", value=self.reflection.value, inline=False)
+        embed.add_field(name="4. 改善", value=self.improvement.value, inline=False)
         embed.set_author(name=interaction.user.display_name, icon_url=interaction.user.display_avatar.url)
         embed.timestamp = discord.utils.utcnow()
 
-        await interaction.response.edit_message(
-            content="謝罪文を送信しました。",
-            embed=self.get_preview_embed(),
-            view=None
+        await interaction.response.send_message(embed=embed)
+
+
+class ApologyView(discord.ui.View):
+    """謝罪コマンド メインビュー"""
+    def __init__(self):
+        super().__init__(timeout=300)
+
+    @discord.ui.button(label="完全自由入力", style=discord.ButtonStyle.primary, row=0)
+    async def full_custom(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(FullCustomApologyModal())
+
+    @discord.ui.button(label="主要部分を分けて編集", style=discord.ButtonStyle.primary, row=0)
+    async def structured(self, interaction: discord.Interaction, button: discord.ui.Button):
+        modal = StructuredApologyModal()
+        modal.action.default = "動画を見てる途中でつい何も考えずにコメント欄を開けてしまいました"
+        modal.pointed.default = "コメントをすぐ開くなという指摘"
+        modal.reflection.default = "自分の配慮が全然足りてなくて、軽率だったなと反省しています"
+        modal.improvement.default = "今後は動画をちゃんと最後まで見てから行動するようにします。一度立ち止まって考える癖もつけていきます"
+        await interaction.response.send_modal(modal)
+
+    @discord.ui.button(label="動画コメント謝罪テンプレート", style=discord.ButtonStyle.gray, row=1)
+    async def video_template(self, interaction: discord.Interaction, button: discord.ui.Button):
+        template = """今回の件、本当に申し訳ありませんでした。
+
+動画を見てる途中でつい何も考えずにコメント欄を開けてしまって、周りの人に不快な思いをさせてしまいました。
+
+ちゃんと最後まで見てから行動するべきだったのに、完全に軽率でした。「コメントすぐ開くな」っていう指摘もその通りで、自分の配慮の足りなさを痛感しています。
+
+今後は動画の内容にしっかり集中して、人の気持ちも考えて行動するようにします。衝動的に動く癖も直していきたいと思います。
+
+このたびは本当にごめんなさい。次からは気をつけます。"""
+
+        embed = discord.Embed(
+            title="謝罪いたします",
+            description=template,
+            color=discord.Color.orange()
         )
-        await interaction.channel.send(embed=embed)
+        embed.set_author(name=interaction.user.display_name, icon_url=interaction.user.display_avatar.url)
+        embed.timestamp = discord.utils.utcnow()
 
-    @discord.ui.button(label="キャンセル", style=discord.ButtonStyle.gray, row=3)
-    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.edit_message(content="謝罪をキャンセルしました。", embed=None, view=None)
+        await interaction.response.send_message(embed=embed)
 
+
+# ====================================================================
+# 謝罪コマンド
+# ====================================================================
+
+@bot.tree.command(name="apology", description="謝罪文を作って送るやつです")
+async def apology(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="謝罪文作成",
+        description=(
+            "主要な部分を自分で変えられます。\n\n"
+            "・完全自由入力 → 1つの欄で好きに全文を書けます\n"
+            "・主要部分を分けて編集 → 行動・指摘・反省・改善をそれぞれ変えられます\n"
+            "・動画コメント謝罪テンプレート → そのまま使えます"
+        ),
+        color=discord.Color.orange()
+    )
+    view = ApologyView()
+    await interaction.response.send_message(embed=embed, view=view, ephemeral=False)
 
 
 
