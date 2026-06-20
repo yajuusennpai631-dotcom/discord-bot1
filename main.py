@@ -1009,6 +1009,138 @@ class ServerCopyConfirmView(discord.ui.View):
         )
 
 
+# ====================================================================
+# 謝罪コマンド用 UI部品（ここに追加）
+# ====================================================================
+
+class ApologyCustomModal(discord.ui.Modal):
+    """自由入力用のモーダル"""
+    def __init__(self, part: str, view: "ApologySelectView"):
+        self.part = part
+        self.view = view
+        title = {"action": "行動", "pointed": "指摘", "improve": "改善"}.get(part, "入力")
+        super().__init__(title=f"謝罪文 - {title}を自由入力")
+
+        self.input_text = discord.ui.TextInput(
+            label=f"{title}の内容",
+            style=discord.TextStyle.paragraph,
+            max_length=500,
+            required=True
+        )
+        self.add_item(self.input_text)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        value = self.input_text.value.strip()
+        if self.part == "action":
+            self.view.action = value
+        elif self.part == "pointed":
+            self.view.pointed = value
+        else:
+            self.view.improve = value
+
+        await self.view.update_preview(interaction)
+
+
+class ApologySelectView(discord.ui.View):
+    """謝罪コマンドのメイン選択ビュー"""
+    def __init__(self):
+        super().__init__(timeout=300)
+        self.action = "ミスをしてしまいました"
+        self.pointed = "指摘を受けました"
+        self.improve = "今後気をつけます"
+
+    def get_preview_embed(self) -> discord.Embed:
+        embed = discord.Embed(
+            title="謝罪文プレビュー",
+            description="以下の内容で送信されます。",
+            color=discord.Color.orange()
+        )
+        embed.add_field(name="① 行動", value=self.action, inline=False)
+        embed.add_field(name="② 指摘", value=self.pointed, inline=False)
+        embed.add_field(name="③ 改善", value=self.improve, inline=False)
+        embed.set_footer(text="内容を確認して「送信」ボタンを押してください")
+        return embed
+
+    async def update_preview(self, interaction: discord.Interaction):
+        await interaction.response.edit_message(
+            embed=self.get_preview_embed(),
+            view=self
+        )
+
+    @discord.ui.select(
+        placeholder="① 何をしましたか？（行動）",
+        options=[
+            discord.SelectOption(label="ミスをしてしまいました", value="ミスをしてしまいました"),
+            discord.SelectOption(label="不適切な発言をしてしまいました", value="不適切な発言をしてしまいました"),
+            discord.SelectOption(label="ルールを破ってしまいました", value="ルールを破ってしまいました"),
+            discord.SelectOption(label="自由入力", value="custom"),
+        ]
+    )
+    async def select_action(self, interaction: discord.Interaction, select: discord.ui.Select):
+        if select.values[0] == "custom":
+            await interaction.response.send_modal(ApologyCustomModal("action", self))
+        else:
+            self.action = select.values[0]
+            await self.update_preview(interaction)
+
+    @discord.ui.select(
+        placeholder="② 誰かに指摘されましたか？",
+        options=[
+            discord.SelectOption(label="指摘を受けました", value="指摘を受けました"),
+            discord.SelectOption(label="ご迷惑をおかけしました", value="ご迷惑をおかけしました"),
+            discord.SelectOption(label="不快な思いをさせてしまいました", value="不快な思いをさせてしまいました"),
+            discord.SelectOption(label="自由入力", value="custom"),
+        ]
+    )
+    async def select_pointed(self, interaction: discord.Interaction, select: discord.ui.Select):
+        if select.values[0] == "custom":
+            await interaction.response.send_modal(ApologyCustomModal("pointed", self))
+        else:
+            self.pointed = select.values[0]
+            await self.update_preview(interaction)
+
+    @discord.ui.select(
+        placeholder="③ 今後どうしますか？（改善）",
+        options=[
+            discord.SelectOption(label="今後気をつけます", value="今後気をつけます"),
+            discord.SelectOption(label="二度と繰り返しません", value="二度と繰り返しません"),
+            discord.SelectOption(label="注意して行動します", value="注意して行動します"),
+            discord.SelectOption(label="自由入力", value="custom"),
+        ]
+    )
+    async def select_improve(self, interaction: discord.Interaction, select: discord.ui.Select):
+        if select.values[0] == "custom":
+            await interaction.response.send_modal(ApologyCustomModal("improve", self))
+        else:
+            self.improve = select.values[0]
+            await self.update_preview(interaction)
+
+    @discord.ui.button(label="送信する", style=discord.ButtonStyle.success, row=3)
+    async def send_apology(self, interaction: discord.Interaction, button: discord.ui.Button):
+        embed = discord.Embed(
+            title="謝罪いたします",
+            color=discord.Color.orange()
+        )
+        embed.add_field(name="① 行動", value=self.action, inline=False)
+        embed.add_field(name="② 指摘", value=self.pointed, inline=False)
+        embed.add_field(name="③ 改善", value=self.improve, inline=False)
+        embed.set_author(name=interaction.user.display_name, icon_url=interaction.user.display_avatar.url)
+        embed.timestamp = discord.utils.utcnow()
+
+        await interaction.response.edit_message(
+            content="謝罪文を送信しました。",
+            embed=self.get_preview_embed(),
+            view=None
+        )
+        await interaction.channel.send(embed=embed)
+
+    @discord.ui.button(label="キャンセル", style=discord.ButtonStyle.gray, row=3)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(content="謝罪をキャンセルしました。", embed=None, view=None)
+
+
+
+
 class GuildDetailSelect(discord.ui.Select):
     """サーバー詳細確認用セレクトメニューです。"""
     def __init__(self, guilds: list):
@@ -2845,6 +2977,21 @@ async def my_scan(interaction: discord.Interaction, target_user: discord.User = 
         embed.add_field(name="サーバー作成日", value=discord.utils.format_dt(g.created_at, style="F"), inline=False)
 
     await interaction.response.send_message(embed=embed, ephemeral=False)
+
+# ====================================================================
+# 謝罪コマンド（ここに追加）
+# ====================================================================
+
+@bot.tree.command(name="apology", description="丁寧な謝罪文を作成して送信します")
+async def apology(interaction: discord.Interaction):
+    """謝罪コマンド"""
+    view = ApologySelectView()
+    await interaction.response.send_message(
+        embed=view.get_preview_embed(),
+        view=view,
+        ephemeral=False
+    )
+
 
 
 # --------------------------------------------------------------------
