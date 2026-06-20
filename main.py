@@ -177,6 +177,15 @@ bot = commands.Bot(
 )
 
 
+def get_global_config(all_data: dict) -> dict:
+    """グローバル設定（信頼できるユーザーなど）を取得します。"""
+    if "global_config" not in all_data:
+        all_data["global_config"] = {
+            "trusted_users": []
+        }
+    return all_data["global_config"]
+
+
 async def is_owner_check(interaction: discord.Interaction) -> bool:
     """インタラクションの実行者がBotのオーナーかどうかを判定します。"""
     if interaction.client.owner_id is None:
@@ -187,6 +196,27 @@ async def is_owner_check(interaction: discord.Interaction) -> bool:
         await interaction.response.send_message("このコマンドはアプリの所有者（オーナー）専用です。", ephemeral=True)
         return False
     return True
+
+
+async def is_trusted_user(interaction: discord.Interaction) -> bool:
+    """実行者がBotのオーナー、またはオーナーによって許可されたユーザーか判定します。"""
+    if interaction.client.owner_id is None:
+        app_info = await interaction.client.application_info()
+        interaction.client.owner_id = app_info.owner.id
+
+    user_id = interaction.user.id
+    if user_id == interaction.client.owner_id:
+        return True
+
+    all_data = load_data()
+    global_cfg = get_global_config(all_data)
+    if user_id in global_cfg.get("trusted_users", []):
+        return True
+
+    await interaction.response.send_message(
+        "このコマンドはBotの所有者、または許可されたユーザー専用です。", ephemeral=True
+    )
+    return False
 
 
 async def is_admin_or_allowed(interaction: discord.Interaction) -> bool:
@@ -842,6 +872,85 @@ class RestoreConfirmView(discord.ui.View):
             item.disabled = True
         await interaction.response.edit_message(
             content="リストアをキャンセルしました。", embed=None, view=self
+        )
+
+
+class ServerCopyConfirmView(discord.ui.View):
+    """
+    サーバーコピーの実行確認用ボタンビューです。
+    """
+
+    def __init__(self, source_guild_name: str, backup_data: dict):
+        super().__init__(timeout=300)
+        self.source_guild_name = source_guild_name
+        self.backup_data = backup_data
+        self._running = False
+
+    @discord.ui.button(label="段階的にコピーを実行する", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.guild:
+            return
+
+        if self._running:
+            await interaction.response.send_message(
+                "すでにコピー実行中です。しばらくお待ちください。", ephemeral=True
+            )
+            return
+        self._running = True
+
+        for item in self.children:
+            item.disabled = True
+
+        await interaction.response.defer(ephemeral=True)
+        try:
+            await interaction.edit_original_response(view=self)
+        except Exception:
+            pass
+
+        guild = interaction.guild
+        print(f"[サーバーコピー開始] コピー元: {self.source_guild_name} -> コピー先: {guild.name} (by {interaction.user})")
+
+        await interaction.followup.send(
+            ">> 段階的コピーを開始します...\n"
+            f"「{self.source_guild_name}」の構造をもとに、既存のチャンネル・ロールを更新・追加・削除します。",
+            ephemeral=True
+        )
+
+        success_logs, fail_logs = await _smart_restore_from_backup(guild, self.backup_data)
+        print(f"[サーバーコピー] 完了: 成功={len(success_logs)}, 失敗={len(fail_logs)}")
+
+        result_lines = (
+            [f"** コピー完了 ** 成功: {len(success_logs)}件 / 失敗: {len(fail_logs)}件\n"]
+            + [f"[OK] {s}" for s in success_logs]
+            + [f"[NG] {f}" for f in fail_logs]
+        )
+
+        chunk = ""
+        messages = []
+        for line in result_lines:
+            if len(chunk) + len(line) + 1 > 1900:
+                messages.append(chunk)
+                chunk = line + "\n"
+            else:
+                chunk += line + "\n"
+        if chunk:
+            messages.append(chunk)
+        for msg in messages:
+            await interaction.followup.send(msg, ephemeral=True)
+
+        self._running = False
+
+    @discord.ui.button(label="キャンセル", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self._running:
+            await interaction.response.send_message(
+                "コピーはすでに実行中のためキャンセルできません。", ephemeral=True
+            )
+            return
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(
+            content="サーバーコピーをキャンセルしました。", embed=None, view=self
         )
 
 
@@ -3180,6 +3289,77 @@ async def server_restore(interaction: discord.Interaction, backup_file: discord.
     print(f"[リストア確認] {interaction.guild.name} でリストア確認画面を表示 (by {interaction.user})")
 
 
+@bot.tree.command(
+    name="server_copy",
+    description="【許可制】指定した別のサーバーの構成（ロール・チャンネル等）をこのサーバーに上書きコピーします"
+)
+async def server_copy(interaction: discord.Interaction, コピー元のサーバーid: str):
+    """Botが参加している別のサーバーから現在のサーバーへ、構造のコピー（段階的リストア）を行います。"""
+    if not await is_trusted_user(interaction):
+        return
+    if not interaction.guild:
+        return
+
+    try:
+        source_guild_id = int(コピー元のサーバーid)
+    except ValueError:
+        await interaction.response.send_message("サーバーIDは数値で入力してください。", ephemeral=True)
+        return
+
+    source_guild = interaction.client.get_guild(source_guild_id)
+    if not source_guild:
+        await interaction.response.send_message(
+            f"指定されたIDのサーバーが見つかりません。Botがそのサーバーに参加しているか確認してください。",
+            ephemeral=True
+        )
+        return
+
+    if source_guild.id == interaction.guild.id:
+        await interaction.response.send_message(
+            "コピー元とコピー先（現在のサーバー）が同じです。", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        # メモリ上でコピー元のバックアップデータを生成
+        backup_data = await _build_backup(source_guild)
+    except Exception as e:
+        await interaction.followup.send(f"コピー元サーバーのデータ取得に失敗しました: {e}", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title="[ サーバーコピー確認 ]",
+        description=(
+            f"コピー元サーバー「**{source_guild.name}**」の構造データを取得しました。\n\n"
+            "-- この操作の動作（全削除はしません） --\n"
+            "(1) コピー元にあるロール  -> 既存なら更新、なければ新規作成\n"
+            "(2) コピー元にないロール  -> 削除（@everyone・Bot連携ロールを除く）\n"
+            "(3) カテゴリも同様に 更新 / 新規作成 / 削除\n"
+            "(4) チャンネルも同様に 更新 / 新規作成 / 削除\n\n"
+            "* コピー元にないチャンネル・ロールは削除されます。\n"
+            "* この操作は取り消せません。"
+        ),
+        color=discord.Color.red()
+    )
+    embed.add_field(name="コピー元", value=f"{source_guild.name} ({source_guild.id})", inline=False)
+    embed.add_field(
+        name="コピーされる内容",
+        value=(
+            f"ロール    : {len(backup_data.get('roles', []))}個\n"
+            f"カテゴリ  : {len(backup_data.get('categories', []))}個\n"
+            f"テキストch: {len(backup_data.get('text_channels', []))}個\n"
+            f"ボイスch  : {len(backup_data.get('voice_channels', []))}個"
+        ),
+        inline=False
+    )
+    embed.set_footer(text="「段階的にコピーを実行する」を押すと処理が開始されます。サーバーが空になることはありません。")
+
+    view = ServerCopyConfirmView(source_guild.name, backup_data)
+    await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+    print(f"[サーバーコピー確認] {interaction.guild.name} でコピー確認画面を表示 (by {interaction.user})")
+
 # --------------------------------------------------------------------
 # 5. 荒らし対策 (Anti-nuke) コマンド
 # --------------------------------------------------------------------
@@ -3424,6 +3604,77 @@ async def owner_broadcast(interaction: discord.Interaction):
         view=view,
         ephemeral=True
     )
+
+
+# ====================================================================
+# セクション 7: 信頼されたユーザー（Trusted Users）管理コマンド
+# ====================================================================
+
+@bot.tree.command(name="owner_trust_add", description="【オーナー限定】強力なコマンドを実行できる信頼ユーザーを追加します")
+@app_commands.allowed_contexts(guilds=False, dms=True, private_channels=False)
+@app_commands.allowed_installs(guilds=True, users=False)
+async def owner_trust_add(interaction: discord.Interaction, user: discord.User):
+    """【オーナー限定】指定したユーザーに、server_copy などの強力なコマンドを実行する権限を付与します。"""
+    if not await is_owner_check(interaction):
+        return
+
+    all_data = load_data()
+    global_cfg = get_global_config(all_data)
+    trusted = global_cfg.setdefault("trusted_users", [])
+
+    if user.id in trusted:
+        await interaction.response.send_message(f"{user.mention} は既に信頼リストに追加されています。", ephemeral=True)
+        return
+
+    trusted.append(user.id)
+    save_data(all_data)
+    await interaction.response.send_message(f"{user.mention} を信頼リストに追加しました。", ephemeral=True)
+
+
+@bot.tree.command(name="owner_trust_remove", description="【オーナー限定】信頼ユーザーリストから削除します")
+@app_commands.allowed_contexts(guilds=False, dms=True, private_channels=False)
+@app_commands.allowed_installs(guilds=True, users=False)
+async def owner_trust_remove(interaction: discord.Interaction, user: discord.User):
+    """【オーナー限定】指定したユーザーから、強力なコマンドの実行権限を剥奪します。"""
+    if not await is_owner_check(interaction):
+        return
+
+    all_data = load_data()
+    global_cfg = get_global_config(all_data)
+    trusted = global_cfg.get("trusted_users", [])
+
+    if user.id not in trusted:
+        await interaction.response.send_message(f"{user.mention} は信頼リストに存在しません。", ephemeral=True)
+        return
+
+    trusted.remove(user.id)
+    save_data(all_data)
+    await interaction.response.send_message(f"{user.mention} を信頼リストから削除しました。", ephemeral=True)
+
+
+@bot.tree.command(name="owner_trust_list", description="【オーナー限定】現在の信頼ユーザー一覧を表示します")
+@app_commands.allowed_contexts(guilds=False, dms=True, private_channels=False)
+@app_commands.allowed_installs(guilds=True, users=False)
+async def owner_trust_list(interaction: discord.Interaction):
+    """【オーナー限定】現在強力なコマンドを実行できるユーザーの一覧を表示します。"""
+    if not await is_owner_check(interaction):
+        return
+
+    all_data = load_data()
+    global_cfg = get_global_config(all_data)
+    trusted = global_cfg.get("trusted_users", [])
+
+    if not trusted:
+        await interaction.response.send_message("現在、信頼されたユーザーは登録されていません。", ephemeral=True)
+        return
+
+    mentions = [f"<@{uid}> (`{uid}`)" for uid in trusted]
+    embed = discord.Embed(
+        title="[ 信頼されたユーザー一覧 ]",
+        description="\n".join(mentions),
+        color=discord.Color.blue()
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 # ====================================================================
