@@ -2,7 +2,5 @@
   "python": {
     "version": "3.12.7"
   },
-  "packages": {
-    "apt": ["ffmpeg"]
-  }
+  "aptPackages": ["ffmpeg"]
 }
