@@ -1008,6 +1008,7 @@ class ServerCopyConfirmView(discord.ui.View):
             content="サーバーコピーをキャンセルしました。", embed=None, view=self
         )
 
+
 class GuildDetailSelect(discord.ui.Select):
     """サーバー詳細確認用セレクトメニューです。"""
     def __init__(self, guilds: list):
@@ -1454,6 +1455,307 @@ class BroadcastGuildView(discord.ui.View):
     def __init__(self, guilds: list):
         super().__init__(timeout=300)
         self.add_item(BroadcastGuildSelect(guilds))
+
+
+# --------------------------------------------------------------------
+# 謝罪コマンド用 UI コンポーネント
+# --------------------------------------------------------------------
+# 3つの可変部分（①やってしまった行動 / ②指摘された一言 / ③今後の改善行動）を
+# セレクトメニューで選択 → プレビューを自動更新 → ボタンで送信、という流れを実現する。
+# 各セレクトには「自由入力で入力する」を用意し、選択するとモーダルが開く。
+
+APOLOGY_TEMPLATE = (
+    "今回の件について深く反省しています。{action_text}、その行動が周囲に不快感を"
+    "与えてしまったことを理解しました。本来であれば、内容をしっかりと受け止めた上で"
+    "行動するべきであり、軽率な振る舞いだったと痛感しています。"
+    "「{comment_text}」という指摘はもっともであり、自分の配慮の足りなさを"
+    "恥ずかしく思っています。今後は同じことを繰り返さないよう、{improvement_text}。"
+    "また、衝動的に動くのではなく、一度立ち止まって考える習慣を身につけていきます。"
+    "このたびは不快な思いをさせてしまい、本当に申し訳ありませんでした。"
+    "今後はより慎重に行動し、信頼を損なわないよう努力していきます。"
+)
+
+# value: (表示用ラベル, テンプレート埋め込み用テキスト)
+APOLOGY_ACTION_OPTIONS = [
+    ("act_comment", "動画視聴中にすぐコメント欄を開いた",
+     "動画を視聴している最中に、何も考えずすぐにコメント欄を開いてしまい"),
+    ("act_talk", "話の途中で割り込んでしまった",
+     "人が話している最中に、最後まで聞かずに割り込んでしまい"),
+    ("act_ignore", "注意・指示を聞き流してしまった",
+     "注意や指示を受けたにもかかわらず、それをきちんと聞かずに行動してしまい"),
+    ("act_loud", "周囲を考えずに大きな声・音を出してしまった",
+     "周囲の状況を考えずに、大きな声や音を出してしまい"),
+    ("act_late", "連絡・報告をせずに行動してしまった",
+     "事前の連絡や報告をせずに、自分の判断だけで行動してしまい"),
+    ("act_free", "自由入力で入力する", None),
+]
+
+APOLOGY_COMMENT_OPTIONS = [
+    ("cmt_open", "コメントをすぐ開くな"),
+    ("cmt_listen", "最後まで話を聞きなさい"),
+    ("cmt_think", "もう少し考えて行動して"),
+    ("cmt_quiet", "周りのことも考えて"),
+    ("cmt_report", "先に一声かけてほしい"),
+    ("cmt_free", "自由入力で入力する"),
+]
+
+APOLOGY_IMPROVEMENT_OPTIONS = [
+    ("imp_focus", "動画や話の内容に集中する",
+     "まずは動画の内容に集中し、周囲の状況や気持ちを考えた行動を心がけます"),
+    ("imp_listen", "最後まで話を聞く", "まずは相手の話を最後まで聞き、自分の行動を見直すよう心がけます"),
+    ("imp_check", "行動前に一度確認・相談する",
+     "行動する前に一度確認や相談をしてから動くよう心がけます"),
+    ("imp_quiet", "周囲への配慮を意識する",
+     "まずは周囲の状況に目を向け、配慮を欠かさないよう心がけます"),
+    ("imp_report", "事前に報告・連絡をする",
+     "行動する前に必ず報告や連絡を入れるよう心がけます"),
+    ("imp_free", "自由入力で入力する", None),
+]
+
+
+class ApologyFreeTextModal(discord.ui.Modal, title="自由入力"):
+    """謝罪文の各パーツを自由入力するための汎用モーダルです。"""
+
+    def __init__(self, parent_view: "ApologyBuilderView", field: str, label: str, placeholder: str):
+        super().__init__(title=f"自由入力: {label}")
+        self.parent_view = parent_view
+        self.field = field
+        self.text_input = discord.ui.TextInput(
+            label=label,
+            style=discord.TextStyle.paragraph,
+            placeholder=placeholder,
+            max_length=200,
+            required=True
+        )
+        self.add_item(self.text_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        value = self.text_input.value.strip()
+        self.parent_view.set_value(self.field, value, is_custom=True)
+        await interaction.response.edit_message(
+            embed=self.parent_view.build_preview_embed(),
+            view=self.parent_view
+        )
+
+
+class ApologyActionSelect(discord.ui.Select):
+    """謝罪文①「やってしまった行動」を選ぶセレクトメニューです。"""
+    def __init__(self, parent_view: "ApologyBuilderView"):
+        self.parent_view = parent_view
+        options = [
+            discord.SelectOption(label=label, value=value)
+            for value, label, _ in APOLOGY_ACTION_OPTIONS
+        ]
+        super().__init__(placeholder="① やってしまった行動を選択...", options=options, row=0)
+
+    async def callback(self, interaction: discord.Interaction):
+        choice = self.values[0]
+        if choice == "act_free":
+            await interaction.response.send_modal(
+                ApologyFreeTextModal(
+                    self.parent_view, "action", "やってしまった行動",
+                    "例: 動画を視聴している最中に、何も考えずすぐにコメント欄を開いてしまい"
+                )
+            )
+            return
+
+        text = next(t for v, _, t in APOLOGY_ACTION_OPTIONS if v == choice)
+        self.parent_view.set_value("action", text, is_custom=False)
+        await interaction.response.edit_message(
+            embed=self.parent_view.build_preview_embed(),
+            view=self.parent_view
+        )
+
+
+class ApologyCommentSelect(discord.ui.Select):
+    """謝罪文②「指摘された一言」を選ぶセレクトメニューです。"""
+    def __init__(self, parent_view: "ApologyBuilderView"):
+        self.parent_view = parent_view
+        options = [
+            discord.SelectOption(label=label, value=value)
+            for value, label in APOLOGY_COMMENT_OPTIONS
+        ]
+        super().__init__(placeholder="② 指摘された一言を選択...", options=options, row=1)
+
+    async def callback(self, interaction: discord.Interaction):
+        choice = self.values[0]
+        if choice == "cmt_free":
+            await interaction.response.send_modal(
+                ApologyFreeTextModal(
+                    self.parent_view, "comment", "指摘された一言",
+                    "例: コメントをすぐ開くな"
+                )
+            )
+            return
+
+        text = next(label for v, label in APOLOGY_COMMENT_OPTIONS if v == choice)
+        self.parent_view.set_value("comment", text, is_custom=False)
+        await interaction.response.edit_message(
+            embed=self.parent_view.build_preview_embed(),
+            view=self.parent_view
+        )
+
+
+class ApologyImprovementSelect(discord.ui.Select):
+    """謝罪文③「今後の改善行動」を選ぶセレクトメニューです。"""
+    def __init__(self, parent_view: "ApologyBuilderView"):
+        self.parent_view = parent_view
+        options = [
+            discord.SelectOption(label=label, value=value)
+            for value, label, _ in APOLOGY_IMPROVEMENT_OPTIONS
+        ]
+        super().__init__(placeholder="③ 今後の改善行動を選択...", options=options, row=2)
+
+    async def callback(self, interaction: discord.Interaction):
+        choice = self.values[0]
+        if choice == "imp_free":
+            await interaction.response.send_modal(
+                ApologyFreeTextModal(
+                    self.parent_view, "improvement", "今後の改善行動",
+                    "例: まずは動画の内容に集中し、周囲の状況や気持ちを考えた行動を心がけます"
+                )
+            )
+            return
+
+        text = next(t for v, _, t in APOLOGY_IMPROVEMENT_OPTIONS if v == choice)
+        self.parent_view.set_value("improvement", text, is_custom=False)
+        await interaction.response.edit_message(
+            embed=self.parent_view.build_preview_embed(),
+            view=self.parent_view
+        )
+
+
+class ApologySendButton(discord.ui.Button):
+    """完成した謝罪文をチャンネルに送信するボタンです。"""
+    def __init__(self, parent_view: "ApologyBuilderView"):
+        super().__init__(label="この内容で送信する", style=discord.ButtonStyle.danger, row=3)
+        self.parent_view = parent_view
+
+    async def callback(self, interaction: discord.Interaction):
+        view = self.parent_view
+        if not view.is_ready():
+            await interaction.response.send_message(
+                "①②③のすべての項目を選択（または自由入力）してから送信してください。",
+                ephemeral=True
+            )
+            return
+
+        final_text = view.build_final_text()
+
+        for item in view.children:
+            item.disabled = True
+        await interaction.response.edit_message(
+            content="謝罪文を送信しました。",
+            embed=None,
+            view=view
+        )
+
+        try:
+            await interaction.channel.send(f"{interaction.user.mention}\n{final_text}")
+        except discord.Forbidden:
+            await interaction.followup.send("このチャンネルへの送信権限がないため、送信に失敗しました。", ephemeral=True)
+        except Exception as e:
+            await interaction.followup.send(f"送信中にエラーが発生しました: {e}", ephemeral=True)
+
+
+class ApologyResetButton(discord.ui.Button):
+    """①②③の選択内容をすべてリセットするボタンです。"""
+    def __init__(self, parent_view: "ApologyBuilderView"):
+        super().__init__(label="選択をリセット", style=discord.ButtonStyle.secondary, row=3)
+        self.parent_view = parent_view
+
+    async def callback(self, interaction: discord.Interaction):
+        view = self.parent_view
+        view.action_text = None
+        view.comment_text = None
+        view.improvement_text = None
+        view.action_is_custom = False
+        view.comment_is_custom = False
+        view.improvement_is_custom = False
+        await interaction.response.edit_message(embed=view.build_preview_embed(), view=view)
+
+
+class ApologyCancelButton(discord.ui.Button):
+    """謝罪文の作成をキャンセルするボタンです。"""
+    def __init__(self, parent_view: "ApologyBuilderView"):
+        super().__init__(label="キャンセル", style=discord.ButtonStyle.secondary, row=4)
+        self.parent_view = parent_view
+
+    async def callback(self, interaction: discord.Interaction):
+        for item in self.parent_view.children:
+            item.disabled = True
+        await interaction.response.edit_message(
+            content="謝罪文の作成をキャンセルしました。",
+            embed=None,
+            view=self.parent_view
+        )
+
+
+class ApologyBuilderView(discord.ui.View):
+    """
+    謝罪文の①行動・②指摘・③改善の3点をセレクトメニューで選び、
+    プレビューを更新しながら最終的にボタンで送信するビューです。
+    """
+    def __init__(self, author: discord.abc.User):
+        super().__init__(timeout=600)
+        self.author = author
+        self.action_text = None
+        self.comment_text = None
+        self.improvement_text = None
+        self.action_is_custom = False
+        self.comment_is_custom = False
+        self.improvement_is_custom = False
+
+        self.add_item(ApologyActionSelect(self))
+        self.add_item(ApologyCommentSelect(self))
+        self.add_item(ApologyImprovementSelect(self))
+        self.add_item(ApologySendButton(self))
+        self.add_item(ApologyResetButton(self))
+        self.add_item(ApologyCancelButton(self))
+
+    def set_value(self, field: str, text: str, is_custom: bool):
+        if field == "action":
+            self.action_text = text
+            self.action_is_custom = is_custom
+        elif field == "comment":
+            self.comment_text = text
+            self.comment_is_custom = is_custom
+        elif field == "improvement":
+            self.improvement_text = text
+            self.improvement_is_custom = is_custom
+
+    def is_ready(self) -> bool:
+        return bool(self.action_text and self.comment_text and self.improvement_text)
+
+    def build_final_text(self) -> str:
+        return APOLOGY_TEMPLATE.format(
+            action_text=self.action_text,
+            comment_text=self.comment_text,
+            improvement_text=self.improvement_text
+        )
+
+    def build_preview_embed(self) -> discord.Embed:
+        embed = discord.Embed(
+            title="謝罪文プレビュー",
+            color=discord.Color.orange() if not self.is_ready() else discord.Color.green()
+        )
+
+        def fmt(text, is_custom):
+            if text is None:
+                return "（未選択）"
+            return f"{text}" + ("（自由入力）" if is_custom else "")
+
+        embed.add_field(name="① やってしまった行動", value=fmt(self.action_text, self.action_is_custom), inline=False)
+        embed.add_field(name="② 指摘された一言", value=fmt(self.comment_text, self.comment_is_custom), inline=False)
+        embed.add_field(name="③ 今後の改善行動", value=fmt(self.improvement_text, self.improvement_is_custom), inline=False)
+
+        if self.is_ready():
+            embed.add_field(name="完成文プレビュー", value=self.build_final_text()[:1024], inline=False)
+            embed.set_footer(text="内容を確認し、「この内容で送信する」を押すとこのチャンネルに投稿されます。")
+        else:
+            embed.set_footer(text="①②③をすべて選択（または自由入力）すると完成文が表示されます。")
+
+        return embed
 
 
 # ====================================================================
@@ -2692,7 +2994,8 @@ async def help_command(interaction: discord.Interaction):
             "`/help` : このコマンド一覧をあなただけに表示します\n"
             "`/hello` : Botが挨拶を返します\n"
             "`/search` : 各種検索サイトやWikipediaのリンク・概要を生成します\n"
-            "`/my_scan` : サーバー情報、または指定ユーザーの基本情報を確認します"
+            "`/my_scan` : サーバー情報、または指定ユーザーの基本情報を確認します\n"
+            "`/apology` : セレクトメニューから謝罪文を組み立てて送信します"
         ),
         inline=False
     )
@@ -2845,20 +3148,20 @@ async def my_scan(interaction: discord.Interaction, target_user: discord.User = 
 
     await interaction.response.send_message(embed=embed, ephemeral=False)
 
-# ====================================================================
-# 謝罪コマンド（ここに追加）
-# ====================================================================
 
-@bot.tree.command(name="apology", description="丁寧な謝罪文を作成して送信します")
+@bot.tree.command(name="apology", description="セレクトメニューから謝罪文を組み立てて送信します")
 async def apology(interaction: discord.Interaction):
-    """謝罪コマンド"""
-    view = ApologySelectView()
+    """
+    ①やってしまった行動 / ②指摘された一言 / ③今後の改善行動 をセレクトメニューで選択し、
+    プレビューを確認しながら謝罪文を組み立てて、このチャンネルに送信するコマンドです。
+    各項目は「自由入力で入力する」を選ぶとモーダルが開き、好きな文章を入力できます。
+    """
+    view = ApologyBuilderView(author=interaction.user)
     await interaction.response.send_message(
-        embed=view.get_preview_embed(),
+        embed=view.build_preview_embed(),
         view=view,
-        ephemeral=False
+        ephemeral=True
     )
-
 
 
 # --------------------------------------------------------------------
