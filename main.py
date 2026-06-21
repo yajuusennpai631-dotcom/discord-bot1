@@ -4032,5 +4032,3 @@ async def owner_trust_list(interaction: discord.Interaction):
 # ====================================================================
 
 bot.run(TOKEN)
-ENDOFFILE
-echo "書き込み完了: $(wc -l /mnt/user-data/outputs/main.py) 行"
