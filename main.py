@@ -170,13 +170,8 @@ class ApprovalCommandTree(app_commands.CommandTree):
 
         client = interaction.client
 
-        # BotのオーナーIDの解決
-        if client.owner_id is None:
-            try:
-                app_info = await client.application_info()
-                client.owner_id = app_info.owner.id
-            except Exception:
-                pass
+        # BotのオーナーIDの解決（個人所有 / Team所有の両方に対応）
+        await resolve_owner_id(client)
 
         # Botオーナー本人の実行であれば無条件で許可
         if interaction.user.id == client.owner_id:
@@ -252,13 +247,47 @@ def get_global_config(all_data: dict) -> dict:
     return all_data["global_config"]
 
 
+async def resolve_owner_id(client) -> int | None:
+    """
+    Botの「オーナー」として扱うDiscordユーザーIDを解決します。
+
+    - 個人所有アプリ（Team未使用）の場合:
+        application_info().owner.id がそのまま個人ユーザーIDになります。
+    - Team所有アプリ（Discord Developer Portalで「Team」に移行した場合）の場合:
+        application_info().owner は個人ではなく Team を指すため、
+        application_info().team.owner_id（＝そのTeamを作成した個人のユーザーID）を
+        優先的にオーナーIDとして採用します。
+        これにより、Bot認証（Verification）等の都合でアプリをTeam所有に切り替えても、
+        オーナー専用コマンド（!sync, /owner_* , /customtrigger_* , /customcmd_add 等）を
+        従来どおりチームオーナー本人が実行できます。
+
+    解決済みの値は client.owner_id にキャッシュされ、以後はAPI呼び出しなしで再利用されます。
+    """
+    if client.owner_id is not None:
+        return client.owner_id
+
+    try:
+        app_info = await client.application_info()
+    except Exception as e:
+        print(f"[警告] application_info の取得に失敗しました: {e}")
+        return None
+
+    # Team所有アプリかどうかを判定
+    team = getattr(app_info, "team", None)
+    if team is not None and getattr(team, "owner_id", None):
+        client.owner_id = team.owner_id
+        print(f"[システム] Team所有アプリを検出しました。Teamオーナー（{team.owner_id}）をBotオーナーとして採用します。")
+    else:
+        client.owner_id = app_info.owner.id
+
+    return client.owner_id
+
+
 async def is_owner_check(interaction: discord.Interaction) -> bool:
     """インタラクションの実行者がBotのオーナーかどうかを判定します。"""
-    if interaction.client.owner_id is None:
-        app_info = await interaction.client.application_info()
-        interaction.client.owner_id = app_info.owner.id
-    
-    if interaction.user.id != interaction.client.owner_id:
+    owner_id = await resolve_owner_id(interaction.client)
+
+    if interaction.user.id != owner_id:
         await interaction.response.send_message("このコマンドはアプリの所有者（オーナー）専用です。", ephemeral=True)
         return False
     return True
@@ -266,12 +295,10 @@ async def is_owner_check(interaction: discord.Interaction) -> bool:
 
 async def is_trusted_user(interaction: discord.Interaction) -> bool:
     """実行者がBotのオーナー、またはオーナーによって許可されたユーザーか判定します。"""
-    if interaction.client.owner_id is None:
-        app_info = await interaction.client.application_info()
-        interaction.client.owner_id = app_info.owner.id
+    owner_id = await resolve_owner_id(interaction.client)
 
     user_id = interaction.user.id
-    if user_id == interaction.client.owner_id:
+    if user_id == owner_id:
         return True
 
     all_data = load_data()
@@ -287,11 +314,9 @@ async def is_trusted_user(interaction: discord.Interaction) -> bool:
 
 async def is_admin_or_allowed(interaction: discord.Interaction) -> bool:
     """実行者がサーバー管理者、または設定された『コマンド許可ユーザー』かどうかを判定します。"""
-    if interaction.client.owner_id is None:
-        app_info = await interaction.client.application_info()
-        interaction.client.owner_id = app_info.owner.id
+    owner_id = await resolve_owner_id(interaction.client)
 
-    if interaction.user.id == interaction.client.owner_id:
+    if interaction.user.id == owner_id:
         return True
 
     if not interaction.guild:
@@ -314,12 +339,10 @@ async def is_moderator(interaction: discord.Interaction) -> bool:
     実行者が「Botオーナー」「グローバル信頼ユーザー」「サーバー管理者」「サーバー内許可ユーザー」
     のいずれかに該当するかどうかを判定します（管理・モデレーションコマンド用）。
     """
-    if interaction.client.owner_id is None:
-        app_info = await interaction.client.application_info()
-        interaction.client.owner_id = app_info.owner.id
+    owner_id = await resolve_owner_id(interaction.client)
 
     user_id = interaction.user.id
-    if user_id == interaction.client.owner_id:
+    if user_id == owner_id:
         return True
 
     all_data = load_data()
@@ -346,11 +369,9 @@ async def is_moderator(interaction: discord.Interaction) -> bool:
 
 async def is_guild_admin(interaction: discord.Interaction) -> bool:
     """実行者がサーバーの管理者（Administrator）かどうかを判定します。"""
-    if interaction.client.owner_id is None:
-        app_info = await interaction.client.application_info()
-        interaction.client.owner_id = app_info.owner.id
+    owner_id = await resolve_owner_id(interaction.client)
 
-    if interaction.user.id == interaction.client.owner_id:
+    if interaction.user.id == owner_id:
         return True
 
     if not interaction.guild:
@@ -475,12 +496,10 @@ class ApprovalRequestView(discord.ui.View):
         await interaction.response.defer(ephemeral=True)
 
         client = interaction.client
-        if client.owner_id is None:
-            app_info = await client.application_info()
-            client.owner_id = app_info.owner.id
+        owner_id = await resolve_owner_id(client)
 
         try:
-            owner = client.get_user(client.owner_id) or await client.fetch_user(client.owner_id)
+            owner = client.get_user(owner_id) or await client.fetch_user(owner_id)
         except Exception:
             owner = None
 
@@ -556,10 +575,8 @@ class ApprovalDecisionView(discord.ui.View):
     @discord.ui.button(label="許可する", style=discord.ButtonStyle.success, custom_id="approve_guild")
     async def approve(self, interaction: discord.Interaction, button: discord.ui.Button):
         client = interaction.client
-        if client.owner_id is None:
-            app_info = await client.application_info()
-            client.owner_id = app_info.owner.id
-        if interaction.user.id != client.owner_id:
+        owner_id = await resolve_owner_id(client)
+        if interaction.user.id != owner_id:
             await interaction.response.send_message("このボタンはBOT所有者専用です。", ephemeral=True)
             return
 
@@ -587,10 +604,8 @@ class ApprovalDecisionView(discord.ui.View):
     @discord.ui.button(label="拒否する", style=discord.ButtonStyle.danger, custom_id="reject_guild")
     async def reject(self, interaction: discord.Interaction, button: discord.ui.Button):
         client = interaction.client
-        if client.owner_id is None:
-            app_info = await client.application_info()
-            client.owner_id = app_info.owner.id
-        if interaction.user.id != client.owner_id:
+        owner_id = await resolve_owner_id(client)
+        if interaction.user.id != owner_id:
             await interaction.response.send_message("このボタンはBOT所有者専用です。", ephemeral=True)
             return
 
@@ -2534,10 +2549,8 @@ async def _handle_nuke_detected(guild: discord.Guild, suspect: discord.Member, a
 
     try:
         client = guild._state._get_client()
-        if client.owner_id is None:
-            app_info = await client.application_info()
-            client.owner_id = app_info.owner.id
-        owner = client.get_user(client.owner_id) or await client.fetch_user(client.owner_id)
+        owner_id = await resolve_owner_id(client)
+        owner = client.get_user(owner_id) or await client.fetch_user(owner_id)
         if owner:
             await owner.send(embed=embed)
     except Exception:
@@ -2620,13 +2633,11 @@ async def on_ready():
         except Exception:
             pass
 
-    if bot.owner_id is None:
-        try:
-            app_info = await bot.application_info()
-            bot.owner_id = app_info.owner.id
-            print(f"[システム] オーナーIDを確定しました: {bot.owner_id}")
-        except Exception as e:
-            print(f"[警告] オーナー情報の取得に失敗しました: {e}")
+    resolved_owner_id = await resolve_owner_id(bot)
+    if resolved_owner_id is not None:
+        print(f"[システム] オーナーIDを確定しました: {resolved_owner_id}")
+    else:
+        print("[警告] オーナー情報の取得に失敗しました。")
 
     try:
         await update_bot_status(bot)
@@ -2681,6 +2692,11 @@ def _is_automod_target(author: discord.Member, guild_config: dict, all_data: dic
     """
     メッセージ送信者がAutoModの対象かどうかを判定します。
     管理者・許可ユーザー・Botオーナー・信頼ユーザーはすべてスキップします。
+
+    注: ここでは同期関数の制約上 resolve_owner_id() を呼べないため、
+    bot.owner_id を直接参照します。on_ready() 内で起動時に
+    resolve_owner_id(bot) を実行しキャッシュ済みのため、通常稼働中は
+    Team所有アプリでも正しいオーナーID（Teamオーナー）が入っています。
     """
     if author.guild_permissions.administrator:
         return False
@@ -2971,14 +2987,9 @@ async def on_audit_log_entry_create(entry: discord.AuditLogEntry):
     if member is None:
         return
 
-    if bot.owner_id is None:
-        try:
-            app_info = await bot.application_info()
-            bot.owner_id = app_info.owner.id
-        except Exception:
-            pass
+    owner_id_for_exempt = await resolve_owner_id(bot)
 
-    if _is_exempt(member, guild, cfg, bot.owner_id):
+    if _is_exempt(member, guild, cfg, owner_id_for_exempt):
         return
 
     _record_action(guild.id, member.id, action_type)
@@ -3051,12 +3062,8 @@ async def sync_command_error(ctx, error):
 
 @bot.tree.command(name="help", description="利用可能なコマンド一覧をカテゴリ別に表示します")
 async def help_command(interaction: discord.Interaction):
-    is_owner = False
-    if interaction.client.owner_id is None:
-        app_info = await interaction.client.application_info()
-        interaction.client.owner_id = app_info.owner.id
-    if interaction.user.id == interaction.client.owner_id:
-        is_owner = True
+    owner_id = await resolve_owner_id(interaction.client)
+    is_owner = (interaction.user.id == owner_id)
 
     is_admin = False
     is_allowed = False
