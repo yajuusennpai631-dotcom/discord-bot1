@@ -111,7 +111,9 @@ def get_guild_config(all_data: dict, guild_id_str: str) -> dict:
             "automod_invite_enabled": False,
             "automod_ng_words_enabled": False,
             "ng_words": [],
-            "mod_log_channel_id": None
+            "mod_log_channel_id": None,
+            "custom_triggers": [],
+            "custom_commands": {}
         }
     
     # 既存データへの互換性のためキーが無ければ追加
@@ -124,7 +126,9 @@ def get_guild_config(all_data: dict, guild_id_str: str) -> dict:
         ("automod_invite_enabled", False),
         ("automod_ng_words_enabled", False),
         ("ng_words", []),
-        ("mod_log_channel_id", None)
+        ("mod_log_channel_id", None),
+        ("custom_triggers", []),
+        ("custom_commands", {})
     ]:
         if key not in cfg:
             cfg[key] = default
@@ -747,6 +751,83 @@ class GuildListView(discord.ui.View):
         self.update_buttons(self.guilds)
         embed = build_guild_list_embed(self.guilds, self.page)
         await interaction.response.edit_message(embed=embed, view=self)
+
+
+class CustomTriggerDeleteSelect(discord.ui.Select):
+    """カスタムトリガー（単語自動返信）の削除用セレクトメニューです。"""
+    def __init__(self, triggers: list, guild_id: int):
+        self.guild_id = guild_id
+        options = []
+        for i, t in enumerate(triggers):
+            short_trigger = t["trigger"] if len(t["trigger"]) <= 40 else t["trigger"][:37] + "..."
+            match_label = "完全一致" if t.get("match_type") == "exact" else "部分一致"
+            options.append(discord.SelectOption(
+                label=f"{i+1}. {short_trigger}"[:100],
+                description=f"({match_label}) -> {t['response'][:50]}",
+                value=str(i)
+            ))
+            if i >= 24:
+                break
+        super().__init__(placeholder="削除するトリガーを選択してください", options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        all_data = load_data()
+        cfg = get_guild_config(all_data, str(self.guild_id))
+        triggers = cfg.get("custom_triggers", [])
+
+        idx = int(self.values[0])
+        if idx < len(triggers):
+            removed = triggers.pop(idx)
+            save_data(all_data)
+            await interaction.response.send_message(
+                f"カスタムトリガーを削除しました:\n`{removed['trigger']}` -> `{removed['response']}`",
+                ephemeral=True
+            )
+        else:
+            await interaction.response.send_message("エラー: トリガーの削除に失敗しました。", ephemeral=True)
+
+
+class CustomTriggerDeleteView(discord.ui.View):
+    """カスタムトリガー削除用セレクトメニューを保持するビューです。"""
+    def __init__(self, triggers: list, guild_id: int):
+        super().__init__(timeout=180)
+        self.add_item(CustomTriggerDeleteSelect(triggers, guild_id))
+
+
+class CustomCommandDeleteSelect(discord.ui.Select):
+    """カスタムコマンド（/customcmd 名前）の削除用セレクトメニューです。"""
+    def __init__(self, commands_dict: dict, guild_id: int):
+        self.guild_id = guild_id
+        options = []
+        for i, (name, response) in enumerate(commands_dict.items()):
+            options.append(discord.SelectOption(
+                label=name[:100],
+                description=response[:80] if response else "",
+                value=name
+            ))
+            if i >= 24:
+                break
+        super().__init__(placeholder="削除するカスタムコマンドを選択してください", options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        all_data = load_data()
+        cfg = get_guild_config(all_data, str(self.guild_id))
+        commands_dict = cfg.get("custom_commands", {})
+
+        name = self.values[0]
+        if name in commands_dict:
+            del commands_dict[name]
+            save_data(all_data)
+            await interaction.response.send_message(f"カスタムコマンド `/customcmd {name}` を削除しました。", ephemeral=True)
+        else:
+            await interaction.response.send_message("エラー: カスタムコマンドの削除に失敗しました。", ephemeral=True)
+
+
+class CustomCommandDeleteView(discord.ui.View):
+    """カスタムコマンド削除用セレクトメニューを保持するビューです。"""
+    def __init__(self, commands_dict: dict, guild_id: int):
+        super().__init__(timeout=180)
+        self.add_item(CustomCommandDeleteSelect(commands_dict, guild_id))
 
 
 class MemoDeleteSelect(discord.ui.Select):
@@ -2652,6 +2733,38 @@ async def _run_automod_checks(message: discord.Message, guild_config: dict) -> b
     return False
 
 
+async def _run_custom_triggers(message: discord.Message, guild_config: dict):
+    """
+    登録されたカスタムトリガー（単語自動返信）をチェックし、一致した場合に返信します。
+    完全一致(exact)・部分一致(contains)の両方に対応します。
+    最初に一致したトリガー1件のみ返信します。
+    """
+    triggers = guild_config.get("custom_triggers", [])
+    if not triggers:
+        return
+
+    content = message.content
+    content_lower = content.lower()
+
+    for t in triggers:
+        trigger_word = t.get("trigger", "")
+        if not trigger_word:
+            continue
+        match_type = t.get("match_type", "contains")
+
+        if match_type == "exact":
+            is_match = content_lower == trigger_word.lower()
+        else:
+            is_match = trigger_word.lower() in content_lower
+
+        if is_match:
+            try:
+                await message.channel.send(t.get("response", ""))
+            except Exception:
+                pass
+            return
+
+
 @bot.event
 async def on_message(message: discord.Message):
     """
@@ -2730,6 +2843,9 @@ async def on_message(message: discord.Message):
                         )
                     except Exception:
                         pass
+
+        # 5. カスタムトリガー自動返信処理
+        await _run_custom_triggers(message, guild_config)
 
     await bot.process_commands(message)
 
@@ -2964,7 +3080,8 @@ async def help_command(interaction: discord.Interaction):
             "`/hello` : Botが挨拶を返します\n"
             "`/search` : 各種検索サイトやWikipediaのリンク・概要を生成します\n"
             "`/my_scan` : サーバー情報、または指定ユーザーの基本情報を確認します\n"
-            "`/apology` : セレクトメニューから謝罪文を組み立てて送信します"
+            "`/apology` : セレクトメニューから謝罪文を組み立てて送信します\n"
+            "`/customcmd <名前>` : サーバーに登録されたカスタムコマンドを実行します"
         ),
         inline=False
     )
@@ -3018,6 +3135,19 @@ async def help_command(interaction: discord.Interaction):
                 "`/owner_guilds` : 導入中のサーバー一覧を確認し、任意のサーバーから脱退できます\n"
                 "`/owner_guild_detail` : サーバーの詳細情報（ch数・ロール数・Bot設定状況）と招待リンクを取得します\n"
                 "`/owner_broadcast` : 指定サーバーにEmbedでお知らせを一斉送信します"
+            ),
+            inline=False
+        )
+        embed.add_field(
+            name="BOT所有者専用 - カスタムコマンド機能",
+            value=(
+                "`/customtrigger_add` : 特定の単語に自動返信するトリガーを追加します\n"
+                "`/customtrigger_remove` : 登録済みトリガーを選択して削除します\n"
+                "`/customtrigger_list` : 登録済みトリガー一覧を表示します\n"
+                "`/customcmd_add` : 「/customcmd 名前」で動くカスタムコマンドを追加します\n"
+                "`/customcmd_remove` : 登録済みカスタムコマンドを選択して削除します\n"
+                "`/customcmd_list` : 登録済みカスタムコマンド一覧を表示します\n"
+                "`/customcmd <名前>` : 登録したカスタムコマンドを実行します（誰でも使用可）"
             ),
             inline=False
         )
@@ -4025,6 +4155,228 @@ async def owner_trust_list(interaction: discord.Interaction):
         color=discord.Color.blue()
     )
     await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# ====================================================================
+# セクション 9: カスタムコマンド機能（BOT所有者専用）
+# ====================================================================
+# ① customtrigger : メッセージ内の特定の単語に自動返信するトリガー
+# ② customcmd     : 「/customcmd 名前」で動く疑似スラッシュコマンド
+#    （実際のスラッシュコマンドを動的追加するとDiscord側のsync負荷や
+#      コマンド数制限の問題が出やすいため、1つのコマンドの引数として
+#      名前を渡す方式にしています）
+# ====================================================================
+
+@bot.tree.command(name="customtrigger_add", description="【オーナー限定】特定の単語に自動返信するカスタムトリガーを追加します")
+@discord.app_commands.choices(一致方法=[
+    discord.app_commands.Choice(name="部分一致（文章にこの単語が含まれていれば反応）", value="contains"),
+    discord.app_commands.Choice(name="完全一致（メッセージ全体がこの単語と同じ場合のみ反応）", value="exact"),
+])
+async def customtrigger_add(
+    interaction: discord.Interaction,
+    トリガー: str,
+    返信内容: str,
+    一致方法: discord.app_commands.Choice[str]
+):
+    if not await is_owner_check(interaction):
+        return
+    if not interaction.guild:
+        await interaction.response.send_message("このコマンドはサーバー内で実行してください。", ephemeral=True)
+        return
+
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(interaction.guild.id))
+    triggers = cfg.setdefault("custom_triggers", [])
+
+    # 同じトリガー文字列・一致方法の組み合わせが既にあれば上書き
+    for t in triggers:
+        if t["trigger"] == トリガー and t.get("match_type", "contains") == 一致方法.value:
+            t["response"] = 返信内容
+            save_data(all_data)
+            await interaction.response.send_message(
+                f"既存のトリガー「{トリガー}」（{一致方法.name}）の返信内容を更新しました。",
+                ephemeral=True
+            )
+            return
+
+    triggers.append({
+        "trigger": トリガー,
+        "response": 返信内容,
+        "match_type": 一致方法.value
+    })
+    save_data(all_data)
+    await interaction.response.send_message(
+        f"カスタムトリガーを追加しました。\n"
+        f"・トリガー: `{トリガー}`\n"
+        f"・一致方法: {一致方法.name}\n"
+        f"・返信内容: `{返信内容}`\n\n"
+        "対象チャンネルで誰かがこの単語を含むメッセージを送信すると、Botが自動で返信します。",
+        ephemeral=True
+    )
+
+
+@bot.tree.command(name="customtrigger_remove", description="【オーナー限定】登録済みのカスタムトリガーを選択して削除します")
+async def customtrigger_remove(interaction: discord.Interaction):
+    if not await is_owner_check(interaction):
+        return
+    if not interaction.guild:
+        await interaction.response.send_message("このコマンドはサーバー内で実行してください。", ephemeral=True)
+        return
+
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(interaction.guild.id))
+    triggers = cfg.get("custom_triggers", [])
+    if not triggers:
+        await interaction.response.send_message("削除できるカスタムトリガーがありません。", ephemeral=True)
+        return
+
+    view = CustomTriggerDeleteView(triggers, interaction.guild.id)
+    await interaction.response.send_message("削除したいカスタムトリガーをメニューから選んでください：", view=view, ephemeral=True)
+
+
+@bot.tree.command(name="customtrigger_list", description="【オーナー限定】登録済みのカスタムトリガー一覧を表示します")
+async def customtrigger_list(interaction: discord.Interaction):
+    if not await is_owner_check(interaction):
+        return
+    if not interaction.guild:
+        await interaction.response.send_message("このコマンドはサーバー内で実行してください。", ephemeral=True)
+        return
+
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(interaction.guild.id))
+    triggers = cfg.get("custom_triggers", [])
+
+    embed = discord.Embed(
+        title=f"{interaction.guild.name} - カスタムトリガー一覧",
+        color=discord.Color.blue()
+    )
+    if not triggers:
+        embed.description = "登録されているカスタムトリガーはありません。\n`/customtrigger_add` で追加できます。"
+    else:
+        for i, t in enumerate(triggers, 1):
+            match_label = "完全一致" if t.get("match_type") == "exact" else "部分一致"
+            embed.add_field(
+                name=f"{i}. 「{t['trigger']}」（{match_label}）",
+                value=f"返信: {t['response'][:200]}",
+                inline=False
+            )
+        embed.set_footer(text=f"登録数: {len(triggers)}件")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="customcmd_add", description="【オーナー限定】「/customcmd 名前」で動くカスタムコマンドを追加します")
+async def customcmd_add(interaction: discord.Interaction, 名前: str, 返信内容: str):
+    if not await is_owner_check(interaction):
+        return
+    if not interaction.guild:
+        await interaction.response.send_message("このコマンドはサーバー内で実行してください。", ephemeral=True)
+        return
+
+    名前 = 名前.strip().lower()
+    if not 名前 or len(名前) > 80:
+        await interaction.response.send_message("コマンド名は1〜80文字で指定してください。", ephemeral=True)
+        return
+
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(interaction.guild.id))
+    commands_dict = cfg.setdefault("custom_commands", {})
+
+    is_update = 名前 in commands_dict
+    commands_dict[名前] = 返信内容
+    save_data(all_data)
+
+    if is_update:
+        await interaction.response.send_message(
+            f"カスタムコマンド `/customcmd {名前}` の内容を更新しました。",
+            ephemeral=True
+        )
+    else:
+        await interaction.response.send_message(
+            f"カスタムコマンドを追加しました。\n"
+            f"`/customcmd {名前}` と入力すると以下の内容が返信されます：\n`{返信内容}`",
+            ephemeral=True
+        )
+
+
+@bot.tree.command(name="customcmd_remove", description="【オーナー限定】登録済みのカスタムコマンドを選択して削除します")
+async def customcmd_remove(interaction: discord.Interaction):
+    if not await is_owner_check(interaction):
+        return
+    if not interaction.guild:
+        await interaction.response.send_message("このコマンドはサーバー内で実行してください。", ephemeral=True)
+        return
+
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(interaction.guild.id))
+    commands_dict = cfg.get("custom_commands", {})
+    if not commands_dict:
+        await interaction.response.send_message("削除できるカスタムコマンドがありません。", ephemeral=True)
+        return
+
+    view = CustomCommandDeleteView(commands_dict, interaction.guild.id)
+    await interaction.response.send_message("削除したいカスタムコマンドをメニューから選んでください：", view=view, ephemeral=True)
+
+
+@bot.tree.command(name="customcmd_list", description="【オーナー限定】登録済みのカスタムコマンド一覧を表示します")
+async def customcmd_list(interaction: discord.Interaction):
+    if not await is_owner_check(interaction):
+        return
+    if not interaction.guild:
+        await interaction.response.send_message("このコマンドはサーバー内で実行してください。", ephemeral=True)
+        return
+
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(interaction.guild.id))
+    commands_dict = cfg.get("custom_commands", {})
+
+    embed = discord.Embed(
+        title=f"{interaction.guild.name} - カスタムコマンド一覧",
+        color=discord.Color.blue()
+    )
+    if not commands_dict:
+        embed.description = "登録されているカスタムコマンドはありません。\n`/customcmd_add` で追加できます。"
+    else:
+        for name, response in commands_dict.items():
+            embed.add_field(name=f"/customcmd {name}", value=response[:200], inline=False)
+        embed.set_footer(text=f"登録数: {len(commands_dict)}件")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+async def customcmd_name_autocomplete(interaction: discord.Interaction, current: str):
+    """/customcmd の名前引数オートコンプリート用関数です。"""
+    if not interaction.guild:
+        return []
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(interaction.guild.id))
+    commands_dict = cfg.get("custom_commands", {})
+    current_lower = current.lower()
+    matches = [name for name in commands_dict.keys() if current_lower in name.lower()]
+    return [
+        discord.app_commands.Choice(name=name, value=name)
+        for name in matches[:25]
+    ]
+
+
+@bot.tree.command(name="customcmd", description="登録されたカスタムコマンドを実行します")
+@discord.app_commands.autocomplete(名前=customcmd_name_autocomplete)
+async def customcmd(interaction: discord.Interaction, 名前: str):
+    if not interaction.guild:
+        await interaction.response.send_message("このコマンドはサーバー内で実行してください。", ephemeral=True)
+        return
+
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(interaction.guild.id))
+    commands_dict = cfg.get("custom_commands", {})
+
+    response = commands_dict.get(名前.strip().lower())
+    if response is None:
+        await interaction.response.send_message(
+            f"カスタムコマンド「{名前}」は見つかりませんでした。`/customcmd_list` で登録済みコマンドを確認できます。",
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.send_message(response)
 
 
 # ====================================================================
