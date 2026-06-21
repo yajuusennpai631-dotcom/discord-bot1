@@ -2626,6 +2626,8 @@ async def on_ready():
     for guild_id_str, config in all_data.items():
         if guild_id_str in ("user_apps", "global_config"):
             continue
+        if not isinstance(config, dict):
+            continue
         try:
             bot.add_view(ApprovalRequestView(guild_id=int(guild_id_str)))
             panel_ch_id = config.get("approval_panel_channel_id") or 0
@@ -2648,7 +2650,14 @@ async def on_ready():
     for guild_id_str, config in all_data.items():
         if guild_id_str in ("user_apps", "global_config"):
             continue
-        guild = bot.get_guild(int(guild_id_str))
+        if not isinstance(config, dict):
+            continue
+        try:
+            guild_id_int = int(guild_id_str)
+        except ValueError:
+            print(f"[警告] 不正なサーバーIDキーをスキップしました: {guild_id_str}")
+            continue
+        guild = bot.get_guild(guild_id_int)
         guild_name = guild.name if guild else "不明なサーバー"
         print(f"サーバー: {guild_name} (ID: {guild_id_str})")
         print(f"  > 承認状態: {config.get('approval_status', 'pending')}")
