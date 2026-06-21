@@ -3093,6 +3093,17 @@ async def help_command(interaction: discord.Interaction):
         inline=False
     )
     embed.add_field(
+        name="ボイスチャンネル再生機能",
+        value=(
+            "`/voice_join` : あなたのいるボイスチャンネルにBotを参加させます\n"
+            "`/voice_leave` : ボイスチャンネルから退出させます\n"
+            "`/voice_play` : 音声ファイル（添付 または 登録名）を再生します。再生中は一時停止・音量調整・切断ができるパネルが表示されます\n"
+            "`/voice_sound_list` : 登録済み音源の一覧を表示します\n"
+            "`/voice_sound_add` / `voice_sound_remove` : 音源の登録・削除（オーナー限定）"
+        ),
+        inline=False
+    )
+    embed.add_field(
         name="個人用プライベート機能 (他の人には見えません)",
         value=(
             "`/my_memo` : あなた専用の個人メモを追加・一覧表示・削除・全消去します\n"
@@ -4384,6 +4395,430 @@ async def customcmd(interaction: discord.Interaction, 名前: str):
         return
 
     await interaction.response.send_message(response)
+
+
+# ====================================================================
+# セクション 10: ボイスチャンネル再生機能
+# ====================================================================
+# ① /voice_join  : ボイスチャンネルに参加
+# ② /voice_leave : ボイスチャンネルから退出
+# ③ /voice_play  : 添付ファイルまたは登録済み音源を再生（コントロールパネル付き）
+# ④ /voice_sound_add / remove / list : サーバーごとの登録済み音源管理（オーナー限定）
+# ====================================================================
+
+# 音声機能用の保存先ディレクトリ（登録済みmp3の保存場所）
+if os.path.exists("/app/data"):
+    SOUNDS_DIR = "/app/data/sounds"
+else:
+    SOUNDS_DIR = "sounds"
+
+ALLOWED_AUDIO_EXTENSIONS = (".mp3", ".wav", ".ogg", ".m4a")
+MAX_AUDIO_FILE_SIZE = 15 * 1024 * 1024  # 15MB
+
+
+def get_guild_sounds_dir(guild_id: int) -> str:
+    """サーバーごとの音源保存ディレクトリを取得し、なければ作成します。"""
+    path = os.path.join(SOUNDS_DIR, str(guild_id))
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def get_registered_sounds(all_data: dict, guild_id_str: str) -> dict:
+    """登録済み音源の名前 -> ファイルパス の辞書を取得します。"""
+    cfg = get_guild_config(all_data, guild_id_str)
+    if "registered_sounds" not in cfg:
+        cfg["registered_sounds"] = {}
+    return cfg["registered_sounds"]
+
+
+class VoiceControlView(discord.ui.View):
+    """
+    再生中にチャンネルへ表示するコントロールパネルです。
+    一時停止/再開・音量調整・停止（切断）に対応します。
+    """
+    def __init__(self, voice_client: discord.VoiceClient, source: discord.PCMVolumeTransformer, source_label: str, requester: discord.abc.User):
+        super().__init__(timeout=600)
+        self.voice_client = voice_client
+        self.source = source
+        self.source_label = source_label
+        self.requester = requester
+        self.paused = False
+        self._update_pause_button_label()
+
+    def _update_pause_button_label(self):
+        self.pause_button.label = "再開" if self.paused else "一時停止"
+        self.pause_button.style = discord.ButtonStyle.success if self.paused else discord.ButtonStyle.secondary
+
+    def build_status_embed(self) -> discord.Embed:
+        vol_percent = int(self.source.volume * 100)
+        status_label = "一時停止中" if self.paused else "再生中"
+        embed = discord.Embed(
+            title="ボイス再生コントロール",
+            description=f"再生ファイル: `{self.source_label}`",
+            color=discord.Color.green() if not self.paused else discord.Color.greyple()
+        )
+        embed.add_field(name="状態", value=status_label, inline=True)
+        embed.add_field(name="音量", value=f"{vol_percent}%", inline=True)
+        embed.add_field(name="再生先チャンネル", value=self.voice_client.channel.mention, inline=True)
+        embed.set_footer(text=f"リクエスト: {self.requester}")
+        return embed
+
+    async def _check_still_connected(self, interaction: discord.Interaction) -> bool:
+        if not self.voice_client.is_connected():
+            for item in self.children:
+                item.disabled = True
+            await interaction.response.edit_message(
+                content="Botはすでにボイスチャンネルから切断されています。",
+                embed=None,
+                view=self
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="一時停止", style=discord.ButtonStyle.secondary, row=0)
+    async def pause_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._check_still_connected(interaction):
+            return
+        if self.paused:
+            if self.voice_client.is_paused():
+                self.voice_client.resume()
+            self.paused = False
+        else:
+            if self.voice_client.is_playing():
+                self.voice_client.pause()
+            self.paused = True
+        self._update_pause_button_label()
+        await interaction.response.edit_message(embed=self.build_status_embed(), view=self)
+
+    @discord.ui.button(label="音量 -10%", style=discord.ButtonStyle.primary, row=0)
+    async def volume_down(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._check_still_connected(interaction):
+            return
+        self.source.volume = max(0.0, round(self.source.volume - 0.1, 2))
+        await interaction.response.edit_message(embed=self.build_status_embed(), view=self)
+
+    @discord.ui.button(label="音量 +10%", style=discord.ButtonStyle.primary, row=0)
+    async def volume_up(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._check_still_connected(interaction):
+            return
+        self.source.volume = min(2.0, round(self.source.volume + 0.1, 2))
+        await interaction.response.edit_message(embed=self.build_status_embed(), view=self)
+
+    @discord.ui.button(label="停止して切断", style=discord.ButtonStyle.danger, row=1)
+    async def stop_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.voice_client.is_connected():
+            self.voice_client.stop()
+            await self.voice_client.disconnect()
+        for item in self.children:
+            item.disabled = True
+        embed = self.build_status_embed()
+        embed.title = "ボイス再生を停止しました"
+        embed.color = discord.Color.greyple()
+        await interaction.response.edit_message(embed=embed, view=self)
+
+
+async def _ensure_voice_connected(interaction: discord.Interaction) -> discord.VoiceClient | None:
+    """
+    実行者が参加しているボイスチャンネルにBotを接続（または移動）します。
+    失敗時はNoneを返し、エラーメッセージを送信済みの状態にします。
+    """
+    if not interaction.guild:
+        await interaction.response.send_message("このコマンドはサーバー内で実行してください。", ephemeral=True)
+        return None
+
+    member = interaction.guild.get_member(interaction.user.id)
+    if not member or not member.voice or not member.voice.channel:
+        await interaction.response.send_message("先にボイスチャンネルに参加してから実行してください。", ephemeral=True)
+        return None
+
+    target_channel = member.voice.channel
+    voice_client = interaction.guild.voice_client
+
+    try:
+        if voice_client is None:
+            voice_client = await target_channel.connect()
+        elif voice_client.channel.id != target_channel.id:
+            await voice_client.move_to(target_channel)
+    except discord.ClientException as e:
+        await interaction.response.send_message(f"ボイス接続でエラーが発生しました: {e}", ephemeral=True)
+        return None
+    except Exception as e:
+        await interaction.response.send_message(f"ボイスチャンネルへの接続に失敗しました: {e}", ephemeral=True)
+        return None
+
+    return voice_client
+
+
+@bot.tree.command(name="voice_join", description="あなたが参加しているボイスチャンネルにBotを参加させます")
+async def voice_join(interaction: discord.Interaction):
+    voice_client = await _ensure_voice_connected(interaction)
+    if voice_client is None:
+        return
+    await interaction.response.send_message(f"{voice_client.channel.mention} に参加しました。", ephemeral=True)
+
+
+@bot.tree.command(name="voice_leave", description="ボイスチャンネルからBotを退出させます")
+async def voice_leave(interaction: discord.Interaction):
+    if not interaction.guild or not interaction.guild.voice_client:
+        await interaction.response.send_message("Botは現在どのボイスチャンネルにも参加していません。", ephemeral=True)
+        return
+    channel_name = interaction.guild.voice_client.channel.name
+    await interaction.guild.voice_client.disconnect()
+    await interaction.response.send_message(f"「{channel_name}」から退出しました。", ephemeral=True)
+
+
+@bot.tree.command(name="voice_play", description="ボイスチャンネルで音声ファイルを再生します（添付または登録済み音源）")
+async def voice_play(
+    interaction: discord.Interaction,
+    添付ファイル: discord.Attachment = None,
+    登録名: str = None,
+    音量: app_commands.Range[int, 1, 200] = 100
+):
+    if not interaction.guild:
+        await interaction.response.send_message("このコマンドはサーバー内で実行してください。", ephemeral=True)
+        return
+
+    if not 添付ファイル and not 登録名:
+        await interaction.response.send_message(
+            "「添付ファイル」または「登録名」のどちらかを指定してください。\n"
+            "登録済み音源の名前は `/voice_sound_list` で確認できます。",
+            ephemeral=True
+        )
+        return
+
+    if 添付ファイル and 登録名:
+        await interaction.response.send_message("添付ファイルと登録名は同時に指定できません。どちらか一方にしてください。", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=False)
+
+    # --- 再生対象ファイルの決定 ---
+    if 添付ファイル:
+        if not 添付ファイル.filename.lower().endswith(ALLOWED_AUDIO_EXTENSIONS):
+            await interaction.followup.send(
+                f"対応していないファイル形式です。対応形式: {', '.join(ALLOWED_AUDIO_EXTENSIONS)}",
+                ephemeral=True
+            )
+            return
+        if 添付ファイル.size > MAX_AUDIO_FILE_SIZE:
+            await interaction.followup.send("ファイルサイズが大きすぎます（上限: 15MB）。", ephemeral=True)
+            return
+
+        temp_dir = os.path.join("temp_audio")
+        os.makedirs(temp_dir, exist_ok=True)
+        safe_name = f"{interaction.id}_{添付ファイル.filename}"
+        audio_path = os.path.join(temp_dir, safe_name)
+        try:
+            await 添付ファイル.save(audio_path)
+        except Exception as e:
+            await interaction.followup.send(f"ファイルの保存に失敗しました: {e}", ephemeral=True)
+            return
+        source_label = 添付ファイル.filename
+        is_temp_file = True
+    else:
+        all_data = load_data()
+        sounds = get_registered_sounds(all_data, str(interaction.guild.id))
+        if 登録名 not in sounds:
+            await interaction.followup.send(
+                f"登録名「{登録名}」が見つかりません。`/voice_sound_list` で確認してください。",
+                ephemeral=True
+            )
+            return
+        audio_path = sounds[登録名]
+        if not os.path.exists(audio_path):
+            await interaction.followup.send("登録された音源ファイルがサーバー上に見つかりませんでした。再登録してください。", ephemeral=True)
+            return
+        source_label = 登録名
+        is_temp_file = False
+
+    # --- ボイス接続 ---
+    member = interaction.guild.get_member(interaction.user.id)
+    if not member or not member.voice or not member.voice.channel:
+        await interaction.followup.send("先にボイスチャンネルに参加してから実行してください。", ephemeral=True)
+        if is_temp_file and os.path.exists(audio_path):
+            os.remove(audio_path)
+        return
+
+    target_channel = member.voice.channel
+    voice_client = interaction.guild.voice_client
+    try:
+        if voice_client is None:
+            voice_client = await target_channel.connect()
+        elif voice_client.channel.id != target_channel.id:
+            await voice_client.move_to(target_channel)
+    except Exception as e:
+        await interaction.followup.send(f"ボイスチャンネルへの接続に失敗しました: {e}", ephemeral=True)
+        if is_temp_file and os.path.exists(audio_path):
+            os.remove(audio_path)
+        return
+
+    if voice_client.is_playing() or voice_client.is_paused():
+        voice_client.stop()
+
+    # --- 再生開始 ---
+    try:
+        ffmpeg_source = discord.FFmpegPCMAudio(audio_path)
+        volume_source = discord.PCMVolumeTransformer(ffmpeg_source, volume=音量 / 100)
+    except Exception as e:
+        await interaction.followup.send(
+            f"音声ファイルの読み込みに失敗しました（FFmpegが利用できない可能性があります）: {e}",
+            ephemeral=True
+        )
+        if is_temp_file and os.path.exists(audio_path):
+            os.remove(audio_path)
+        return
+
+    def _after_play(error):
+        if error:
+            print(f"[ボイス再生エラー] {error}")
+        if is_temp_file and os.path.exists(audio_path):
+            try:
+                os.remove(audio_path)
+            except Exception:
+                pass
+
+    voice_client.play(volume_source, after=_after_play)
+
+    view = VoiceControlView(
+        voice_client=voice_client,
+        source=volume_source,
+        source_label=source_label,
+        requester=interaction.user
+    )
+    await interaction.followup.send(embed=view.build_status_embed(), view=view)
+
+
+@bot.tree.command(name="voice_sound_add", description="【オーナー限定】サーバーで使い回せる音源を名前付きで登録します")
+async def voice_sound_add(interaction: discord.Interaction, 登録名: str, ファイル: discord.Attachment):
+    if not await is_owner_check(interaction):
+        return
+    if not interaction.guild:
+        await interaction.response.send_message("このコマンドはサーバー内で実行してください。", ephemeral=True)
+        return
+
+    登録名 = 登録名.strip()
+    if not 登録名 or len(登録名) > 50:
+        await interaction.response.send_message("登録名は1〜50文字で指定してください。", ephemeral=True)
+        return
+
+    if not ファイル.filename.lower().endswith(ALLOWED_AUDIO_EXTENSIONS):
+        await interaction.response.send_message(
+            f"対応していないファイル形式です。対応形式: {', '.join(ALLOWED_AUDIO_EXTENSIONS)}",
+            ephemeral=True
+        )
+        return
+    if ファイル.size > MAX_AUDIO_FILE_SIZE:
+        await interaction.response.send_message("ファイルサイズが大きすぎます（上限: 15MB）。", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    sounds_dir = get_guild_sounds_dir(interaction.guild.id)
+    ext = os.path.splitext(ファイル.filename)[1].lower()
+    save_path = os.path.join(sounds_dir, f"{登録名}{ext}")
+
+    try:
+        await ファイル.save(save_path)
+    except Exception as e:
+        await interaction.followup.send(f"ファイルの保存に失敗しました: {e}", ephemeral=True)
+        return
+
+    all_data = load_data()
+    sounds = get_registered_sounds(all_data, str(interaction.guild.id))
+    is_update = 登録名 in sounds
+    sounds[登録名] = save_path
+    save_data(all_data)
+
+    if is_update:
+        await interaction.followup.send(f"登録名「{登録名}」の音源を更新しました。", ephemeral=True)
+    else:
+        await interaction.followup.send(
+            f"音源を登録しました。\n`/voice_play 登録名:{登録名}` で再生できます。",
+            ephemeral=True
+        )
+
+
+@bot.tree.command(name="voice_sound_remove", description="【オーナー限定】登録済みの音源を削除します")
+async def voice_sound_remove(interaction: discord.Interaction, 登録名: str):
+    if not await is_owner_check(interaction):
+        return
+    if not interaction.guild:
+        await interaction.response.send_message("このコマンドはサーバー内で実行してください。", ephemeral=True)
+        return
+
+    all_data = load_data()
+    sounds = get_registered_sounds(all_data, str(interaction.guild.id))
+    if 登録名 not in sounds:
+        await interaction.response.send_message(f"登録名「{登録名}」は見つかりませんでした。", ephemeral=True)
+        return
+
+    file_path = sounds.pop(登録名)
+    save_data(all_data)
+    if os.path.exists(file_path):
+        try:
+            os.remove(file_path)
+        except Exception:
+            pass
+
+    await interaction.response.send_message(f"登録名「{登録名}」を削除しました。", ephemeral=True)
+
+
+@bot.tree.command(name="voice_sound_list", description="登録済みの音源一覧を表示します")
+async def voice_sound_list(interaction: discord.Interaction):
+    if not interaction.guild:
+        await interaction.response.send_message("このコマンドはサーバー内で実行してください。", ephemeral=True)
+        return
+
+    all_data = load_data()
+    sounds = get_registered_sounds(all_data, str(interaction.guild.id))
+
+    embed = discord.Embed(
+        title=f"{interaction.guild.name} - 登録済み音源一覧",
+        color=discord.Color.blue()
+    )
+    if not sounds:
+        embed.description = "登録されている音源はありません。\n`/voice_sound_add` で登録できます（オーナー限定）。"
+    else:
+        embed.description = "\n".join([f"・`{name}`" for name in sounds.keys()])
+        embed.set_footer(text=f"登録数: {len(sounds)}件 | /voice_play 登録名:<名前> で再生できます")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+async def voice_sound_name_autocomplete(interaction: discord.Interaction, current: str):
+    """登録名引数のオートコンプリート用関数です。"""
+    if not interaction.guild:
+        return []
+    all_data = load_data()
+    sounds = get_registered_sounds(all_data, str(interaction.guild.id))
+    current_lower = current.lower()
+    matches = [name for name in sounds.keys() if current_lower in name.lower()]
+    return [discord.app_commands.Choice(name=name, value=name) for name in matches[:25]]
+
+
+voice_play.autocomplete("登録名")(voice_sound_name_autocomplete)
+voice_sound_remove.autocomplete("登録名")(voice_sound_name_autocomplete)
+
+
+@bot.event
+async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
+    """
+    Botだけがボイスチャンネルに取り残された場合、自動的に切断します（リソース節約のため）。
+    """
+    if member.bot:
+        return
+    if not member.guild.voice_client:
+        return
+    voice_client = member.guild.voice_client
+    channel = voice_client.channel
+    # チャンネル内の人間メンバー数をチェック
+    human_members = [m for m in channel.members if not m.bot]
+    if len(human_members) == 0:
+        await asyncio.sleep(60)  # 1分待って誰も戻らなければ切断
+        if voice_client.is_connected():
+            human_members_recheck = [m for m in voice_client.channel.members if not m.bot]
+            if len(human_members_recheck) == 0:
+                await voice_client.disconnect()
+                print(f"[ボイス自動切断] {member.guild.name} で誰もいなくなったため切断しました。")
 
 
 # ====================================================================
