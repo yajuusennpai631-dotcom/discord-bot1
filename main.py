@@ -17,6 +17,8 @@ import collections
 import time
 import discord
 from discord.ext import commands
+import aiohttp
+import io
 from discord import app_commands
 
 # .env ファイルからの環境変数読み込み (ローカル開発用)
@@ -31,6 +33,7 @@ except ImportError:
 # ====================================================================
 
 TOKEN = os.getenv("DISCORD_TOKEN")
+OCR_SPACE_API_KEY = os.getenv("OCR_SPACE_API_KEY")
 ROBLOX_API_KEY = os.getenv("ROBLOX_API_KEY")
 ROBLOX_UNIVERSE_ID = os.getenv("ROBLOX_UNIVERSE_ID")
 
@@ -195,6 +198,45 @@ bot = commands.Bot(
     intents=intents,
     tree_cls=ApprovalCommandTree
 )
+
+async def extract_text_from_image(image_url):
+    try:
+        async with aiohttp.ClientSession() as session:
+
+            async with session.get(image_url) as image_response:
+                image_data = await image_response.read()
+
+            form = aiohttp.FormData()
+            form.add_field(
+                "file",
+                image_data,
+                filename="image.png"
+            )
+
+            async with session.post(
+                "https://api.ocr.space/parse/image",
+                data=form,
+                headers={
+                    "apikey": OCR_SPACE_API_KEY
+                }
+            ) as response:
+
+                result = await response.json()
+
+                if not result.get("ParsedResults"):
+                    return ""
+
+                text = ""
+
+                for item in result["ParsedResults"]:
+                    text += item.get("ParsedText", "")
+
+                return text.lower()
+
+    except Exception as e:
+        print(f"OCR Error: {e}")
+        return ""
+
 
 
 def get_global_config(all_data: dict) -> dict:
@@ -2750,6 +2792,46 @@ async def on_message(message: discord.Message):
                         return
                     except:
                         pass
+
+            # OCR画像招待リンク検知
+            if guild_config.get("automod_invite_enabled", False):
+
+                for attachment in message.attachments:
+
+                    if not attachment.content_type:
+                        continue
+
+                    if not attachment.content_type.startswith("image"):
+                        continue
+
+                    text = await extract_text_from_image(
+                        attachment.url
+                    )
+
+                    invite_patterns = [
+                        "discord.gg/",
+                        "discord.com/invite/",
+                        "discord.me/",
+                        "dsc.gg/"
+                    ]
+
+                    if any(
+                        pattern in text
+                        for pattern in invite_patterns
+                    ):
+
+                        try:
+                            await message.delete()
+
+                            await message.channel.send(
+                                f"⚠️ {message.author.mention} 画像内の招待リンクを検出したため削除しました。",
+                                delete_after=5
+                            )
+
+                            return
+
+                        except:
+                            pass
 
             # 3. 自動モデレーション: NGワード検知
             if guild_config.get("automod_ng_words_enabled", False):
