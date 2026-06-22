@@ -2620,6 +2620,36 @@ def _build_antinuke_status_embed(guild: discord.Guild, cfg: dict) -> discord.Emb
 @bot.event
 async def on_ready():
     """Bot起動完了時に呼び出されます。ビューの永続化再登録やプレゼンス設定を行います。"""
+
+    # Opusライブラリを自動検索してロードする（Nixpacks環境対応）
+    if not discord.opus.is_loaded():
+        import ctypes.util
+        import glob
+        opus_candidates = (
+            glob.glob("/root/.nix-profile/lib/libopus*")
+            + glob.glob("/nix/store/*/lib/libopus*")
+            + glob.glob("/usr/lib/*/libopus*")
+            + glob.glob("/usr/lib/libopus*")
+        )
+        opus_path = next((p for p in opus_candidates if p.endswith(".so") or ".so." in p), None)
+        if opus_path:
+            try:
+                discord.opus.load_opus(opus_path)
+                print(f"[システム] Opusをロードしました: {opus_path}")
+            except Exception as e:
+                print(f"[警告] Opusのロードに失敗しました: {e}")
+        else:
+            # ctypes.util.find_library でも試みる
+            lib = ctypes.util.find_library("opus")
+            if lib:
+                try:
+                    discord.opus.load_opus(lib)
+                    print(f"[システム] Opusをロードしました (ctypes): {lib}")
+                except Exception as e:
+                    print(f"[警告] Opusのロードに失敗しました (ctypes): {e}")
+            else:
+                print("[警告] Opusライブラリが見つかりませんでした。音声機能が使えない可能性があります。")
+
     bot.add_view(VerifyButtonView())
     all_data = load_data()
 
