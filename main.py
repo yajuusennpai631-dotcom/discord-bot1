@@ -4456,27 +4456,108 @@ def get_registered_sounds(all_data: dict, guild_id_str: str) -> dict:
     return cfg["registered_sounds"]
 
 
+class VoiceNextSelect(discord.ui.Select):
+    """曲切り替え用：登録済み音源から次の曲を選ぶセレクトメニューです。"""
+    def __init__(self, guild: discord.Guild, parent_view: "VoiceControlView"):
+        self.parent_view = parent_view
+        all_data = load_data()
+        sounds = get_registered_sounds(all_data, str(guild.id))
+        options = [
+            discord.SelectOption(label=name, value=name)
+            for name in list(sounds.keys())[:25]
+        ]
+        if not options:
+            options = [discord.SelectOption(label="（登録済み音源なし）", value="__none__")]
+        super().__init__(placeholder="次に再生する音源を選択...", options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        if self.values[0] == "__none__":
+            await interaction.response.send_message("登録済み音源がありません。/voice_sound_add で登録してください。", ephemeral=True)
+            return
+        name = self.values[0]
+        all_data = load_data()
+        sounds = get_registered_sounds(all_data, str(interaction.guild.id))
+        audio_path = sounds.get(name)
+        if not audio_path or not os.path.exists(audio_path):
+            await interaction.response.send_message("音源ファイルが見つかりませんでした。再登録してください。", ephemeral=True)
+            return
+
+        view = self.parent_view
+        if not view.voice_client.is_connected():
+            await interaction.response.send_message("Botはすでにボイスチャンネルから切断されています。", ephemeral=True)
+            return
+
+        # 現在の再生を止めて新しい曲を再生
+        if view.voice_client.is_playing() or view.voice_client.is_paused():
+            view.voice_client.stop()
+
+        import shutil
+        ffmpeg_path = shutil.which("ffmpeg") or "ffmpeg"
+        ffmpeg_source = discord.FFmpegPCMAudio(audio_path, executable=ffmpeg_path)
+        volume_source = discord.PCMVolumeTransformer(ffmpeg_source, volume=view.source.volume)
+
+        # 状態を更新
+        view.source = volume_source
+        view.source_label = name
+        view.audio_path = audio_path
+        view.is_temp_file = False
+        view.paused = False
+        view._update_pause_button_label()
+
+        def _after_play(error):
+            if error:
+                print(f"[ボイス再生エラー] {error}")
+            if view.loop:
+                asyncio.run_coroutine_threadsafe(view._replay(), interaction.client.loop)
+
+        view.voice_client.play(volume_source, after=_after_play)
+
+        # セレクトを除いたビューに戻す（行4を削除）
+        for item in list(view.children):
+            if isinstance(item, VoiceNextSelect):
+                view.remove_item(item)
+
+        await interaction.response.edit_message(embed=view.build_status_embed(), view=view)
+
+
 class VoiceControlView(discord.ui.View):
     """
     再生中にチャンネルへ表示するコントロールパネルです。
-    一時停止/再開・音量調整・停止（切断）に対応します。
+    一時停止/再開・音量調整・ループ・曲切り替え・停止（切断）に対応します。
     """
-    def __init__(self, voice_client: discord.VoiceClient, source: discord.PCMVolumeTransformer, source_label: str, requester: discord.abc.User):
+    def __init__(
+        self,
+        voice_client: discord.VoiceClient,
+        source: discord.PCMVolumeTransformer,
+        source_label: str,
+        requester: discord.abc.User,
+        audio_path: str = "",
+        is_temp_file: bool = False,
+    ):
         super().__init__(timeout=600)
         self.voice_client = voice_client
         self.source = source
         self.source_label = source_label
         self.requester = requester
+        self.audio_path = audio_path
+        self.is_temp_file = is_temp_file
         self.paused = False
+        self.loop = False
         self._update_pause_button_label()
+        self._update_loop_button_label()
 
     def _update_pause_button_label(self):
         self.pause_button.label = "再開" if self.paused else "一時停止"
         self.pause_button.style = discord.ButtonStyle.success if self.paused else discord.ButtonStyle.secondary
 
+    def _update_loop_button_label(self):
+        self.loop_button.label = "ループ: ON" if self.loop else "ループ: OFF"
+        self.loop_button.style = discord.ButtonStyle.success if self.loop else discord.ButtonStyle.secondary
+
     def build_status_embed(self) -> discord.Embed:
         vol_percent = int(self.source.volume * 100)
         status_label = "一時停止中" if self.paused else "再生中"
+        loop_label = "ON" if self.loop else "OFF"
         embed = discord.Embed(
             title="ボイス再生コントロール",
             description=f"再生ファイル: `{self.source_label}`",
@@ -4484,9 +4565,33 @@ class VoiceControlView(discord.ui.View):
         )
         embed.add_field(name="状態", value=status_label, inline=True)
         embed.add_field(name="音量", value=f"{vol_percent}%", inline=True)
-        embed.add_field(name="再生先チャンネル", value=self.voice_client.channel.mention, inline=True)
+        embed.add_field(name="ループ", value=loop_label, inline=True)
+        embed.add_field(name="再生先チャンネル", value=self.voice_client.channel.mention, inline=False)
         embed.set_footer(text=f"リクエスト: {self.requester}")
         return embed
+
+    async def _replay(self):
+        """ループ再生時に同じファイルを再再生します。"""
+        if not self.loop or not self.voice_client.is_connected():
+            return
+        if not self.audio_path or not os.path.exists(self.audio_path):
+            return
+        import shutil
+        ffmpeg_path = shutil.which("ffmpeg") or "ffmpeg"
+        try:
+            ffmpeg_source = discord.FFmpegPCMAudio(self.audio_path, executable=ffmpeg_path)
+            volume_source = discord.PCMVolumeTransformer(ffmpeg_source, volume=self.source.volume)
+            self.source = volume_source
+
+            def _after_play(error):
+                if error:
+                    print(f"[ボイス再生エラー（ループ）] {error}")
+                if self.loop:
+                    asyncio.run_coroutine_threadsafe(self._replay(), self.voice_client._state.loop)
+
+            self.voice_client.play(volume_source, after=_after_play)
+        except Exception as e:
+            print(f"[ループ再生エラー] {e}")
 
     async def _check_still_connected(self, interaction: discord.Interaction) -> bool:
         if not self.voice_client.is_connected():
@@ -4529,8 +4634,33 @@ class VoiceControlView(discord.ui.View):
         self.source.volume = min(2.0, round(self.source.volume + 0.1, 2))
         await interaction.response.edit_message(embed=self.build_status_embed(), view=self)
 
-    @discord.ui.button(label="停止して切断", style=discord.ButtonStyle.danger, row=1)
+    @discord.ui.button(label="ループ: OFF", style=discord.ButtonStyle.secondary, row=1)
+    async def loop_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._check_still_connected(interaction):
+            return
+        self.loop = not self.loop
+        self._update_loop_button_label()
+        await interaction.response.edit_message(embed=self.build_status_embed(), view=self)
+
+    @discord.ui.button(label="曲を切り替え", style=discord.ButtonStyle.primary, row=1)
+    async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._check_still_connected(interaction):
+            return
+        if not interaction.guild:
+            return
+        # 既にセレクトが表示されている場合は削除
+        for item in list(self.children):
+            if isinstance(item, VoiceNextSelect):
+                self.remove_item(item)
+        # 登録済み音源セレクトを row=3 に追加
+        select = VoiceNextSelect(interaction.guild, self)
+        select.row = 3
+        self.add_item(select)
+        await interaction.response.edit_message(embed=self.build_status_embed(), view=self)
+
+    @discord.ui.button(label="停止して切断", style=discord.ButtonStyle.danger, row=2)
     async def stop_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.loop = False
         if self.voice_client.is_connected():
             self.voice_client.stop()
             await self.voice_client.disconnect()
@@ -4698,23 +4828,29 @@ async def voice_play(
             os.remove(audio_path)
         return
 
-    def _after_play(error):
-        if error:
-            print(f"[ボイス再生エラー] {error}")
-        if is_temp_file and os.path.exists(audio_path):
-            try:
-                os.remove(audio_path)
-            except Exception:
-                pass
-
-    voice_client.play(volume_source, after=_after_play)
-
     view = VoiceControlView(
         voice_client=voice_client,
         source=volume_source,
         source_label=source_label,
-        requester=interaction.user
+        requester=interaction.user,
+        audio_path=audio_path,
+        is_temp_file=is_temp_file,
     )
+
+    def _after_play(error):
+        if error:
+            print(f"[ボイス再生エラー] {error}")
+        if view.loop:
+            asyncio.run_coroutine_threadsafe(view._replay(), voice_client._state.loop)
+        else:
+            if is_temp_file and os.path.exists(audio_path):
+                try:
+                    os.remove(audio_path)
+                except Exception:
+                    pass
+
+    voice_client.play(volume_source, after=_after_play)
+
     await interaction.followup.send(embed=view.build_status_embed(), view=view)
 
 
