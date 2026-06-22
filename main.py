@@ -3138,7 +3138,8 @@ async def help_command(interaction: discord.Interaction):
             "`/voice_leave` : ボイスチャンネルから退出させます\n"
             "`/voice_play` : 音声ファイル（添付 または 登録名）を再生します。再生中は一時停止・音量調整・切断ができるパネルが表示されます\n"
             "`/voice_sound_list` : 登録済み音源の一覧を表示します\n"
-            "`/voice_sound_add` / `voice_sound_remove` : 音源の登録・削除（オーナー限定）"
+            "`/voice_sound_add` : 音源ファイルを名前付きで登録します（誰でも使用可能）\n"
+            "`/voice_sound_remove` : 登録済み音源を削除します（オーナー限定）"
         ),
         inline=False
     )
@@ -4854,10 +4855,8 @@ async def voice_play(
     await interaction.followup.send(embed=view.build_status_embed(), view=view)
 
 
-@bot.tree.command(name="voice_sound_add", description="【オーナー限定】サーバーで使い回せる音源を名前付きで登録します")
+@bot.tree.command(name="voice_sound_add", description="サーバーで使い回せる音源を名前付きで登録します（誰でも使用可能）")
 async def voice_sound_add(interaction: discord.Interaction, 登録名: str, ファイル: discord.Attachment):
-    if not await is_owner_check(interaction):
-        return
     if not interaction.guild:
         await interaction.response.send_message("このコマンドはサーバー内で実行してください。", ephemeral=True)
         return
@@ -4943,7 +4942,7 @@ async def voice_sound_list(interaction: discord.Interaction):
         color=discord.Color.blue()
     )
     if not sounds:
-        embed.description = "登録されている音源はありません。\n`/voice_sound_add` で登録できます（オーナー限定）。"
+        embed.description = "登録されている音源はありません。\n`/voice_sound_add` で登録できます。"
     else:
         embed.description = "\n".join([f"・`{name}`" for name in sounds.keys()])
         embed.set_footer(text=f"登録数: {len(sounds)}件 | /voice_play 登録名:<名前> で再生できます")
