@@ -4060,8 +4060,6 @@ async def modlog_set(interaction: discord.Interaction, channel: discord.TextChan
 
 
 @bot.tree.command(name="owner_status", description="【オーナー限定】Botの視聴中ステータスの文字をリアルタイムで変更します")
-@app_commands.allowed_contexts(guilds=False, dms=True, private_channels=False)
-@app_commands.allowed_installs(guilds=True, users=False)
 async def owner_status(interaction: discord.Interaction, text: str):
     if not await is_owner_check(interaction): return
     try:
@@ -4078,8 +4076,6 @@ async def owner_status(interaction: discord.Interaction, text: str):
 
 
 @bot.tree.command(name="owner_guilds", description="【オーナー限定】導入中のサーバー一覧を表示し、任意のサーバーから脱退できます")
-@app_commands.allowed_contexts(guilds=False, dms=True, private_channels=False)
-@app_commands.allowed_installs(guilds=True, users=False)
 async def owner_guilds(interaction: discord.Interaction):
     if not await is_owner_check(interaction):
         return
@@ -4093,8 +4089,6 @@ async def owner_guilds(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="owner_guild_detail", description="【オーナー限定】サーバーの詳細情報と招待リンクを取得します")
-@app_commands.allowed_contexts(guilds=False, dms=True, private_channels=False)
-@app_commands.allowed_installs(guilds=True, users=False)
 async def owner_guild_detail(interaction: discord.Interaction):
     if not await is_owner_check(interaction):
         return
@@ -4112,8 +4106,6 @@ async def owner_guild_detail(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="owner_broadcast", description="【オーナー限定】指定サーバーにEmbedでおお知らせを一斉送信します")
-@app_commands.allowed_contexts(guilds=False, dms=True, private_channels=False)
-@app_commands.allowed_installs(guilds=True, users=False)
 async def owner_broadcast(interaction: discord.Interaction):
     if not await is_owner_check(interaction):
         return
@@ -4130,8 +4122,6 @@ async def owner_broadcast(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="owner_trust_add", description="【オーナー限定】強力なコマンドを実行できる信頼ユーザーを追加します")
-@app_commands.allowed_contexts(guilds=False, dms=True, private_channels=False)
-@app_commands.allowed_installs(guilds=True, users=False)
 async def owner_trust_add(interaction: discord.Interaction, user: discord.User):
     if not await is_owner_check(interaction):
         return
@@ -4147,8 +4137,6 @@ async def owner_trust_add(interaction: discord.Interaction, user: discord.User):
 
 
 @bot.tree.command(name="owner_trust_remove", description="【オーナー限定】信頼ユーザーリストから削除します")
-@app_commands.allowed_contexts(guilds=False, dms=True, private_channels=False)
-@app_commands.allowed_installs(guilds=True, users=False)
 async def owner_trust_remove(interaction: discord.Interaction, user: discord.User):
     if not await is_owner_check(interaction):
         return
@@ -4164,8 +4152,6 @@ async def owner_trust_remove(interaction: discord.Interaction, user: discord.Use
 
 
 @bot.tree.command(name="owner_trust_list", description="【オーナー限定】現在の信頼ユーザー一覧を表示します")
-@app_commands.allowed_contexts(guilds=False, dms=True, private_channels=False)
-@app_commands.allowed_installs(guilds=True, users=False)
 async def owner_trust_list(interaction: discord.Interaction):
     if not await is_owner_check(interaction):
         return
@@ -4665,8 +4651,13 @@ async def voice_play(
         voice_client.stop()
 
     # --- 再生開始 ---
+    # FFmpegのパスを自動検索（Nixpacks環境では /nix/store 以下に置かれる場合があるため）
+    import shutil
+    ffmpeg_path = shutil.which("ffmpeg") or "ffmpeg"
+    print(f"[ボイス] FFmpegパス: {ffmpeg_path}")
+
     try:
-        ffmpeg_source = discord.FFmpegPCMAudio(audio_path)
+        ffmpeg_source = discord.FFmpegPCMAudio(audio_path, executable=ffmpeg_path)
         volume_source = discord.PCMVolumeTransformer(ffmpeg_source, volume=音量 / 100)
     except Exception as e:
         await interaction.followup.send(
