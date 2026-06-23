@@ -5255,6 +5255,183 @@ async def eval_command(interaction: discord.Interaction, コード: str):
 
 
 # ====================================================================
+# セクション 12: /eval_help コマンド（オーナー限定・コード例一覧）
+# ====================================================================
+
+EVAL_EXAMPLES = {
+    "Bot管理・デバッグ": [
+        {
+            "title": "Bot起動時間・レイテンシ確認",
+            "code": "f'レイテンシ: {round(bot.latency * 1000)}ms'",
+            "desc": "BotのWebSocketレイテンシをミリ秒で確認します。"
+        },
+        {
+            "title": "導入サーバー数を確認",
+            "code": "f'導入サーバー数: {len(bot.guilds)}個'",
+            "desc": "現在Botが参加しているサーバーの総数を返します。"
+        },
+        {
+            "title": "導入サーバー名一覧を表示",
+            "code": "print('\\n'.join([f'{i+1}. {g.name} (ID:{g.id})' for i, g in enumerate(bot.guilds)]))",
+            "desc": "参加中の全サーバー名とIDを一覧表示します。"
+        },
+        {
+            "title": "Botユーザー情報を確認",
+            "code": "f'{bot.user} (ID: {bot.user.id})'",
+            "desc": "Botのユーザー名とIDを返します。"
+        },
+        {
+            "title": "キャッシュ済みユーザー数を確認",
+            "code": "f'キャッシュ済みユーザー数: {len(bot.users)}人'",
+            "desc": "Botがキャッシュしている全ユーザー数を返します。"
+        },
+        {
+            "title": "現在のカスタムステータスを確認",
+            "code": "current_custom_status or 'デフォルト（サーバー数カウント）'",
+            "desc": "現在設定されているカスタムステータスの文字列を確認します。"
+        },
+        {
+            "title": "スパムキャッシュの状態を確認",
+            "code": "getattr(bot, 'spam_cache', {})",
+            "desc": "AutoModのスパム検知キャッシュの現在状態を確認します。"
+        },
+        {
+            "title": "登録済みスラッシュコマンド数を確認",
+            "code": "f'グローバルコマンド数: {len(bot.tree.get_commands())}個'",
+            "desc": "グローバルに登録されているスラッシュコマンドの数を返します。"
+        },
+    ],
+    "サーバー情報確認": [
+        {
+            "title": "現在のサーバー情報を確認",
+            "code": "f'{guild.name} / メンバー: {guild.member_count}人 / ロール: {len(guild.roles)}個 / ch: {len(guild.channels)}個'",
+            "desc": "コマンドを実行したサーバーの基本情報を返します。"
+        },
+        {
+            "title": "サーバーのオーナーを確認",
+            "code": "f'オーナー: {guild.owner} (ID: {guild.owner_id})'",
+            "desc": "サーバーのオーナー名とIDを返します。"
+        },
+        {
+            "title": "サーバーのロール一覧を表示",
+            "code": "print('\\n'.join([f'{r.position}: {r.name} (ID:{r.id})' for r in sorted(guild.roles, key=lambda r: -r.position)]))",
+            "desc": "サーバーの全ロールを権限位置順に一覧表示します。"
+        },
+        {
+            "title": "テキストチャンネル一覧を表示",
+            "code": "print('\\n'.join([f'#{c.name} (ID:{c.id})' for c in guild.text_channels]))",
+            "desc": "サーバーの全テキストチャンネルを一覧表示します。"
+        },
+        {
+            "title": "BotメンバーとHumanメンバーの内訳",
+            "code": "bots = sum(1 for m in guild.members if m.bot); print(f'Human: {guild.member_count - bots}人 / Bot: {bots}体')",
+            "desc": "サーバーメンバーの人間とBot数の内訳を表示します。"
+        },
+        {
+            "title": "承認済みサーバー一覧を確認",
+            "code": "data = load_data(); approved = [sid for sid, cfg in data.items() if isinstance(cfg, dict) and cfg.get('approval_status') == 'approved']; print(f'承認済み: {len(approved)}サーバー\\n' + '\\n'.join(approved))",
+            "desc": "Bot利用が承認済みのサーバーID一覧を表示します。"
+        },
+        {
+            "title": "サーバーのブースト状況を確認",
+            "code": "f'{guild.name} ブーストLv.{guild.premium_tier} / ブースト数: {guild.premium_subscription_count}回'",
+            "desc": "サーバーのNitroブーストレベルと回数を返します。"
+        },
+        {
+            "title": "antinuke設定状況を確認",
+            "code": "data = load_data(); cfg = get_guild_config(data, str(guild.id)); an = cfg.get('antinuke', {}); f\"antinuke: {'有効' if an.get('enabled') else '無効'} / 閾値: {an.get('threshold_seconds',10)}秒で{an.get('threshold_count',3)}回\"",
+            "desc": "現在のサーバーのantinuke設定をまとめて返します。"
+        },
+    ],
+    "データ操作・JSON確認": [
+        {
+            "title": "JSONデータ全体を確認",
+            "code": "import json; data = load_data(); print(json.dumps(data, ensure_ascii=False, indent=2)[:1500])",
+            "desc": "保存されているJSONデータ全体を整形して表示します（先頭1500文字）。"
+        },
+        {
+            "title": "現在のサーバー設定を確認",
+            "code": "import json; data = load_data(); cfg = get_guild_config(data, str(guild.id)); print(json.dumps(cfg, ensure_ascii=False, indent=2))",
+            "desc": "コマンド実行サーバーの設定JSONをそのまま表示します。"
+        },
+        {
+            "title": "コマンド許可ユーザーを確認",
+            "code": "data = load_data(); cfg = get_guild_config(data, str(guild.id)); allowed = cfg.get('allowed_users', []); f'許可ユーザー数: {len(allowed)}人\\n' + ', '.join([str(uid) for uid in allowed]) or 'なし'",
+            "desc": "現在のサーバーのコマンド許可ユーザーIDを一覧表示します。"
+        },
+        {
+            "title": "カスタムトリガー一覧を確認",
+            "code": "data = load_data(); cfg = get_guild_config(data, str(guild.id)); triggers = cfg.get('custom_triggers', []); print('\\n'.join([f\"{t['trigger']} ({t.get('match_type','contains')}) -> {t['response']}\" for t in triggers])) if triggers else print('なし')",
+            "desc": "現在のサーバーに登録されたカスタムトリガーを全件表示します。"
+        },
+        {
+            "title": "カスタムコマンド一覧を確認",
+            "code": "data = load_data(); cfg = get_guild_config(data, str(guild.id)); cmds = cfg.get('custom_commands', {}); print('\\n'.join([f'/customcmd {k} -> {v}' for k, v in cmds.items()])) if cmds else print('なし')",
+            "desc": "現在のサーバーに登録されたカスタムコマンドを全件表示します。"
+        },
+        {
+            "title": "全サーバーの警告数を確認",
+            "code": "data = load_data(); [(sid, len(get_guild_config(data, sid).get('warnings', {}))) for sid in data if sid not in ('user_apps','global_config') and isinstance(data[sid], dict)]",
+            "desc": "全サーバーの警告レコード数を一覧で返します。"
+        },
+        {
+            "title": "グローバル信頼ユーザー一覧を確認",
+            "code": "data = load_data(); trusted = data.get('global_config', {}).get('trusted_users', []); f'信頼ユーザー数: {len(trusted)}人\\n' + ', '.join([str(uid) for uid in trusted]) or 'なし'",
+            "desc": "グローバル信頼ユーザーのID一覧を表示します。"
+        },
+        {
+            "title": "NGワード一覧を確認",
+            "code": "data = load_data(); cfg = get_guild_config(data, str(guild.id)); ng = cfg.get('ng_words', []); ', '.join(ng) if ng else 'NGワード未登録'",
+            "desc": "現在のサーバーに登録されているNGワードを表示します。"
+        },
+    ]
+}
+
+
+@bot.tree.command(name="eval_help", description="【オーナー限定】/evalで使えるコード例を一覧表示します")
+@discord.app_commands.choices(カテゴリ=[
+    discord.app_commands.Choice(name="Bot管理・デバッグ用", value="Bot管理・デバッグ"),
+    discord.app_commands.Choice(name="サーバー情報確認用", value="サーバー情報確認"),
+    discord.app_commands.Choice(name="データ操作・JSON確認用", value="データ操作・JSON確認"),
+])
+async def eval_help(interaction: discord.Interaction, カテゴリ: discord.app_commands.Choice[str]):
+    if not await is_owner_check(interaction):
+        return
+
+    category_key = カテゴリ.value
+    examples = EVAL_EXAMPLES.get(category_key, [])
+
+    color_map = {
+        "Bot管理・デバッグ":    discord.Color.blurple(),
+        "サーバー情報確認":     discord.Color.teal(),
+        "データ操作・JSON確認": discord.Color.gold(),
+    }
+
+    embed = discord.Embed(
+        title=f"/eval コード例一覧 ― {カテゴリ.name}",
+        description=(
+            "コピーして `/eval コード:` に貼り付けるだけで実行できます。\n"
+            "複数行コードは \\`\\`\\` で囲んでも実行できます。\n"
+            "※ `guild` / `bot` / `channel` 変数はそのまま使用可能です。"
+        ),
+        color=color_map.get(category_key, discord.Color.blue())
+    )
+
+    for ex in examples:
+        embed.add_field(
+            name=f"🔹 {ex['title']}",
+            value=(
+                f"{ex['desc']}\n"
+                f"```py\n{ex['code']}\n```"
+            ),
+            inline=False
+        )
+
+    embed.set_footer(text=f"カテゴリ: {カテゴリ.name} | 全{len(examples)}件 | /eval_help で他カテゴリも確認できます")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# ====================================================================
 # Botの起動
 # ====================================================================
 
