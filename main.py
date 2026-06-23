@@ -5173,6 +5173,8 @@ async def eval_command(interaction: discord.Interaction, コード: str):
     local_vars = {
         "bot": bot,
         "interaction": interaction,
+        "channel": interaction.channel,
+        "guild": interaction.guild,
         "discord": discord,
         "load_data": load_data,
         "save_data": save_data,
@@ -5247,9 +5249,9 @@ async def eval_command(interaction: discord.Interaction, コード: str):
         value=f"```py\n{code_preview}\n```",
         inline=False
     )
-    embed.set_footer(text=f"実行時間: {elapsed:.2f}ms")
+    embed.set_footer(text=f"実行時間: {elapsed:.2f}ms | 実行者: {interaction.user}")
 
-    await interaction.followup.send(embed=embed, ephemeral=True)
+    await interaction.followup.send(embed=embed, ephemeral=False)
 
 
 # ====================================================================
