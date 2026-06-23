@@ -4457,6 +4457,126 @@ def get_registered_sounds(all_data: dict, guild_id_str: str) -> dict:
     return cfg["registered_sounds"]
 
 
+class VoicePlayApprovalView(discord.ui.View):
+    """
+    /voice_play 実行時にオーナーのDMへ送る「再生許可申請」ビューです。
+    オーナーが許可すると実際の再生が開始されます。
+    """
+    def __init__(
+        self,
+        interaction: discord.Interaction,
+        voice_client: discord.VoiceClient,
+        volume_source: discord.PCMVolumeTransformer,
+        source_label: str,
+        audio_path: str,
+        is_temp_file: bool,
+        音量: int,
+    ):
+        super().__init__(timeout=300)
+        self.interaction = interaction
+        self.voice_client = voice_client
+        self.volume_source = volume_source
+        self.source_label = source_label
+        self.audio_path = audio_path
+        self.is_temp_file = is_temp_file
+        self.音量 = 音量
+        self._handled = False
+
+    @discord.ui.button(label="許可する", style=discord.ButtonStyle.success)
+    async def approve(self, interaction: discord.Interaction, button: discord.ui.Button):
+        client = interaction.client
+        owner_id = await resolve_owner_id(client)
+        if interaction.user.id != owner_id:
+            await interaction.response.send_message("このボタンはBOT所有者専用です。", ephemeral=True)
+            return
+        if self._handled:
+            await interaction.response.send_message("この申請はすでに処理済みです。", ephemeral=True)
+            return
+        self._handled = True
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(
+            content=f"**{self.source_label}** の再生を許可しました。",
+            embed=None,
+            view=self
+        )
+
+        # 接続が切れていた場合は再接続
+        if not self.voice_client.is_connected():
+            try:
+                member = self.interaction.guild.get_member(self.interaction.user.id)
+                if not member or not member.voice or not member.voice.channel:
+                    await self.interaction.followup.send("再生を許可しましたが、あなたがボイスチャンネルにいないため再生できませんでした。", ephemeral=True)
+                    return
+                self.voice_client = await member.voice.channel.connect()
+            except Exception as e:
+                await self.interaction.followup.send(f"再接続に失敗しました: {e}", ephemeral=True)
+                return
+
+        if self.voice_client.is_playing() or self.voice_client.is_paused():
+            self.voice_client.stop()
+
+        # 再生開始
+        import shutil
+        ffmpeg_path = shutil.which("ffmpeg") or "ffmpeg"
+        try:
+            ffmpeg_source = discord.FFmpegPCMAudio(self.audio_path, executable=ffmpeg_path)
+            volume_source = discord.PCMVolumeTransformer(ffmpeg_source, volume=self.音量 / 100)
+        except Exception as e:
+            await self.interaction.followup.send(f"再生開始に失敗しました: {e}", ephemeral=True)
+            return
+
+        control_view = VoiceControlView(
+            voice_client=self.voice_client,
+            source=volume_source,
+            source_label=self.source_label,
+            requester=self.interaction.user,
+            audio_path=self.audio_path,
+            is_temp_file=self.is_temp_file,
+        )
+
+        def _after_play(error):
+            if error:
+                print(f"[ボイス再生エラー] {error}")
+            if control_view.loop:
+                asyncio.run_coroutine_threadsafe(control_view._replay(), self.voice_client._state.loop)
+            else:
+                if self.is_temp_file and os.path.exists(self.audio_path):
+                    try:
+                        os.remove(self.audio_path)
+                    except Exception:
+                        pass
+
+        self.voice_client.play(volume_source, after=_after_play)
+        await self.interaction.followup.send(embed=control_view.build_status_embed(), view=control_view)
+
+    @discord.ui.button(label="拒否する", style=discord.ButtonStyle.danger)
+    async def reject(self, interaction: discord.Interaction, button: discord.ui.Button):
+        client = interaction.client
+        owner_id = await resolve_owner_id(client)
+        if interaction.user.id != owner_id:
+            await interaction.response.send_message("このボタンはBOT所有者専用です。", ephemeral=True)
+            return
+        if self._handled:
+            await interaction.response.send_message("この申請はすでに処理済みです。", ephemeral=True)
+            return
+        self._handled = True
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(
+            content=f"**{self.source_label}** の再生を拒否しました。",
+            embed=None,
+            view=self
+        )
+        # 一時ファイルを削除
+        if self.is_temp_file and os.path.exists(self.audio_path):
+            try:
+                os.remove(self.audio_path)
+            except Exception:
+                pass
+        await self.interaction.followup.send("再生申請がBOT所有者によって拒否されました。", ephemeral=True)
+
+
 class VoiceNextSelect(discord.ui.Select):
     """曲切り替え用：登録済み音源から次の曲を選ぶセレクトメニューです。"""
     def __init__(self, guild: discord.Guild, parent_view: "VoiceControlView"):
@@ -4829,30 +4949,57 @@ async def voice_play(
             os.remove(audio_path)
         return
 
-    view = VoiceControlView(
+    # --- 再生許可申請をオーナーに送る ---
+    owner_id = await resolve_owner_id(interaction.client)
+    try:
+        owner = interaction.client.get_user(owner_id) or await interaction.client.fetch_user(owner_id)
+    except Exception:
+        owner = None
+
+    if not owner:
+        await interaction.followup.send("BOT所有者の情報を取得できませんでした。時間をおいて再試行してください。", ephemeral=True)
+        if is_temp_file and os.path.exists(audio_path):
+            os.remove(audio_path)
+        return
+
+    request_embed = discord.Embed(
+        title="ボイス再生の許可申請",
+        description="以下のサーバーで音声ファイルの再生リクエストが届きました。",
+        color=discord.Color.orange()
+    )
+    request_embed.add_field(name="サーバー", value=interaction.guild.name, inline=True)
+    request_embed.add_field(name="申請者", value=f"{interaction.user} ({interaction.user.mention})", inline=True)
+    request_embed.add_field(name="ファイル名", value=source_label, inline=False)
+    request_embed.add_field(name="チャンネル", value=voice_client.channel.name, inline=True)
+    request_embed.timestamp = discord.utils.utcnow()
+
+    approval_view = VoicePlayApprovalView(
+        interaction=interaction,
         voice_client=voice_client,
-        source=volume_source,
+        volume_source=volume_source,
         source_label=source_label,
-        requester=interaction.user,
         audio_path=audio_path,
         is_temp_file=is_temp_file,
+        音量=音量,
     )
 
-    def _after_play(error):
-        if error:
-            print(f"[ボイス再生エラー] {error}")
-        if view.loop:
-            asyncio.run_coroutine_threadsafe(view._replay(), voice_client._state.loop)
-        else:
-            if is_temp_file and os.path.exists(audio_path):
-                try:
-                    os.remove(audio_path)
-                except Exception:
-                    pass
+    try:
+        await owner.send(embed=request_embed, view=approval_view)
+    except discord.Forbidden:
+        await interaction.followup.send("BOT所有者へのDM送信に失敗しました（DM拒否設定の可能性があります）。", ephemeral=True)
+        if is_temp_file and os.path.exists(audio_path):
+            os.remove(audio_path)
+        return
+    except Exception as e:
+        await interaction.followup.send(f"申請送信中にエラーが発生しました: {e}", ephemeral=True)
+        if is_temp_file and os.path.exists(audio_path):
+            os.remove(audio_path)
+        return
 
-    voice_client.play(volume_source, after=_after_play)
-
-    await interaction.followup.send(embed=view.build_status_embed(), view=view)
+    await interaction.followup.send(
+        f"BOT所有者に再生許可申請を送信しました。\nファイル: `{source_label}`\n所有者が許可するとボイスチャンネルで再生が始まります（申請は5分間有効です）。",
+        ephemeral=True
+    )
 
 
 @bot.tree.command(name="voice_sound_add", description="サーバーで使い回せる音源を名前付きで登録します（誰でも使用可能）")
