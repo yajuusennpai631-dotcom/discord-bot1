@@ -3192,7 +3192,8 @@ async def help_command(interaction: discord.Interaction):
                 "`/owner_status` : Botの視聴中ステータス文字をリアルタイムで変更します\n"
                 "`/owner_guilds` : 導入中のサーバー一覧を確認し、任意のサーバーから脱退できます\n"
                 "`/owner_guild_detail` : サーバーの詳細情報（ch数・ロール数・Bot設定状況）と招待リンクを取得します\n"
-                "`/owner_broadcast` : 指定サーバーにEmbedでお知らせを一斉送信します"
+                "`/owner_broadcast` : 指定サーバーにEmbedでお知らせを一斉送信します\n"
+                "`/eval` : Pythonコードを実行して結果を返します（デバッグ・管理用）"
             ),
             inline=False
         )
@@ -5131,6 +5132,124 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
             if len(human_members_recheck) == 0:
                 await voice_client.disconnect()
                 print(f"[ボイス自動切断] {member.guild.name} で誰もいなくなったため切断しました。")
+
+
+# ====================================================================
+# セクション 11: eval コマンド（オーナー限定・コード実行）
+# ====================================================================
+
+@bot.tree.command(name="eval", description="【オーナー限定】Pythonコードを実行して結果を返します")
+async def eval_command(interaction: discord.Interaction, コード: str):
+    """
+    オーナー限定のPythonコード実行コマンドです。
+    Botの内部状態（guilds, get_guild, load_data など）にアクセスできます。
+    複数行コードは ``` で囲んでも実行できます。
+    """
+    if not await is_owner_check(interaction):
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    # コードブロック記法（```python ... ``` や ``` ... ```）を除去
+    code = コード.strip()
+    if code.startswith("```"):
+        lines = code.split("\n")
+        # 最初の行（```python など）と最後の行（```）を除去
+        lines = lines[1:] if lines[0].startswith("```") else lines
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        code = "\n".join(lines)
+
+    # 実行結果を受け取るための変数
+    import io
+    import traceback
+    import time
+
+    stdout_capture = io.StringIO()
+    result_value = None
+    error_text = None
+
+    # コード実行に使えるローカル変数（Botの内部にアクセスできるようにする）
+    local_vars = {
+        "bot": bot,
+        "interaction": interaction,
+        "discord": discord,
+        "load_data": load_data,
+        "save_data": save_data,
+        "get_guild_config": get_guild_config,
+        "asyncio": asyncio,
+    }
+
+    start_time = time.perf_counter()
+    try:
+        # 最後の式の値を返すために、exec前にコンパイルして最後の行をevalで取得
+        import ast as _ast
+        try:
+            tree = _ast.parse(code, mode="exec")
+        except SyntaxError as e:
+            raise e
+
+        # 最後のノードがExprの場合はevalで値を取得
+        if tree.body and isinstance(tree.body[-1], _ast.Expr):
+            last_expr = tree.body.pop()
+            exec_code = compile(tree, "<eval>", "exec")
+            eval_code = compile(_ast.Expression(body=last_expr.value), "<eval>", "eval")
+
+            import contextlib
+            with contextlib.redirect_stdout(stdout_capture):
+                exec(exec_code, local_vars)
+                result_value = eval(eval_code, local_vars)
+
+            # コルーチンの場合はawait
+            if asyncio.iscoroutine(result_value):
+                result_value = await result_value
+        else:
+            import contextlib
+            with contextlib.redirect_stdout(stdout_capture):
+                exec(compile(tree, "<eval>", "exec"), local_vars)
+
+    except Exception:
+        error_text = traceback.format_exc()
+
+    elapsed = (time.perf_counter() - start_time) * 1000  # ms
+
+    # Embed作成
+    stdout_text = stdout_capture.getvalue()
+
+    if error_text:
+        embed = discord.Embed(title="eval - エラー", color=discord.Color.red())
+        embed.add_field(
+            name="エラー内容",
+            value=f"```py\n{error_text[:1000]}\n```",
+            inline=False
+        )
+    else:
+        embed = discord.Embed(title="eval - 実行完了", color=discord.Color.green())
+        if stdout_text:
+            embed.add_field(
+                name="出力 (print)",
+                value=f"```\n{stdout_text[:900]}\n```",
+                inline=False
+            )
+        if result_value is not None:
+            embed.add_field(
+                name="戻り値",
+                value=f"```py\n{repr(result_value)[:900]}\n```",
+                inline=False
+            )
+        if not stdout_text and result_value is None:
+            embed.add_field(name="結果", value="（出力なし）", inline=False)
+
+    # 実行したコードも表示
+    code_preview = code if len(code) <= 500 else code[:497] + "..."
+    embed.add_field(
+        name="実行コード",
+        value=f"```py\n{code_preview}\n```",
+        inline=False
+    )
+    embed.set_footer(text=f"実行時間: {elapsed:.2f}ms")
+
+    await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 # ====================================================================
