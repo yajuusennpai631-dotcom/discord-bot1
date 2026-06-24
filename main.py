@@ -136,6 +136,11 @@ def get_guild_config(all_data: dict, guild_id_str: str) -> dict:
         ("stats_member_ch_id", None),
         ("stats_online_ch_id", None),
         ("stats_bot_ch_id", None),
+        ("alt_check_enabled", False),
+        ("alt_check_days", 30),
+        ("alt_check_action", "notify"),
+        ("iplogger_check_enabled", False),
+        ("giveaways", {}),
     ]:
         if key not in cfg:
             cfg[key] = default
@@ -2658,6 +2663,7 @@ async def on_ready():
                 print("[警告] Opusライブラリが見つかりませんでした。音声機能が使えない可能性があります。")
 
     bot.add_view(VerifyButtonView())
+    bot.add_view(GiveawayJoinView())  # プレゼント参加ボタンの永続化
     all_data = load_data()
 
     for guild_id_str, config in all_data.items():
@@ -2718,6 +2724,30 @@ async def on_ready():
         if guild and any(stats_ch_ids):
             _stats_tasks[guild_id_int] = asyncio.create_task(_stats_loop(guild))
             print(f"  > 統計ループ: 再起動しました")
+
+        # 進行中プレゼントのタスクを再起動
+        giveaways = config.get("giveaways", {})
+        now_utc = discord.utils.utcnow()
+        for msg_id_str, gw in list(giveaways.items()):
+            try:
+                end_dt = datetime.datetime.fromisoformat(gw["end_at"])
+                if end_dt.tzinfo is None:
+                    end_dt = end_dt.replace(tzinfo=datetime.timezone.utc)
+                ch_id = gw.get("channel_id")
+                ch = guild.get_channel(ch_id) if guild and ch_id else None
+                if ch and end_dt > now_utc:
+                    msg_id = int(msg_id_str)
+                    task = asyncio.create_task(_run_giveaway(ch, msg_id, guild_id_int, end_dt))
+                    _giveaway_tasks[msg_id] = task
+                    print(f"  > プレゼントタスク: msg_id={msg_id_str} を再起動しました")
+                elif end_dt <= now_utc:
+                    # 期限切れのプレゼントを即時処理
+                    ch2 = guild.get_channel(gw.get("channel_id")) if guild else None
+                    if ch2:
+                        msg_id = int(msg_id_str)
+                        asyncio.create_task(_run_giveaway(ch2, msg_id, guild_id_int, now_utc))
+            except Exception as e:
+                print(f"  > [警告] プレゼントタスク復元に失敗: {e}")
     print("---------------------------------------")
     print(f"ログインユーザー: {bot.user.name} (ID: {bot.user.id})")
     print("スラッシュコマンドを更新したい場合は、サーバー上で '!sync' と発言してください。")
@@ -2766,9 +2796,95 @@ def _is_automod_target(author: discord.Member, guild_config: dict, all_data: dic
     return True
 
 
+async def _check_iplogger(message: discord.Message) -> bool:
+    """
+    メッセージ内のURLをスキャンし、既知のIPロガー系ドメインまたは
+    短縮URLの展開先がIPロガーであれば削除・通知します。
+    True を返すと呼び出し元でメッセージ処理を中断します。
+    """
+    # 既知のIPロガー・フィッシング系ドメイン一覧
+    IPLOGGER_DOMAINS = {
+        "grabify.link", "iplogger.org", "iplogger.com", "iplogger.ru",
+        "2no.co", "yip.su", "ps3cfw.com", "stopify.co", "lovebird.guru",
+        "blasze.com", "blasze.tk", "iplis.ru", "02ip.ru", "ezstat.ru",
+        "linezing.com", "trackyou.live", "ipgrab.io", "loggly.io",
+        "track.ly", "link.tl", "bc.vc", "shorturl.at",
+        "jackass.wtf", "screenshot.exposed",
+    }
+    # URL短縮サービス（展開チェック対象）
+    URL_SHORTENERS = {
+        "bit.ly", "tinyurl.com", "t.co", "ow.ly", "is.gd",
+        "buff.ly", "adf.ly", "goo.gl", "cutt.ly", "rebrand.ly",
+        "tiny.cc", "rb.gy", "short.io",
+    }
+
+    import re
+    urls = re.findall(r"https?://[^\s<>\"']+", message.content)
+    if not urls:
+        return False
+
+    detected_url = None
+    detected_reason = None
+
+    for url in urls:
+        try:
+            from urllib.parse import urlparse
+            parsed = urlparse(url)
+            domain = parsed.netloc.lower().lstrip("www.")
+        except Exception:
+            continue
+
+        # 直接一致チェック
+        if any(domain == d or domain.endswith("." + d) for d in IPLOGGER_DOMAINS):
+            detected_url = url
+            detected_reason = f"既知のIPロガードメイン: `{domain}`"
+            break
+
+        # 短縮URL展開チェック
+        if any(domain == d or domain.endswith("." + d) for d in URL_SHORTENERS):
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.head(url, allow_redirects=True, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                        final_url = str(resp.url)
+                        final_domain = urlparse(final_url).netloc.lower().lstrip("www.")
+                        if any(final_domain == d or final_domain.endswith("." + d) for d in IPLOGGER_DOMAINS):
+                            detected_url = url
+                            detected_reason = f"短縮URL展開先がIPロガー: `{final_domain}`"
+                            break
+            except Exception:
+                pass
+
+    if not detected_url:
+        return False
+
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    warn_embed = discord.Embed(
+        title="🚨 IPロガーリンクを検知・削除しました",
+        color=discord.Color.red()
+    )
+    warn_embed.add_field(name="送信者", value=message.author.mention, inline=True)
+    warn_embed.add_field(name="検知理由", value=detected_reason, inline=False)
+    warn_embed.set_footer(text="このリンクは個人情報（IPアドレス）を収集する危険なURLです")
+
+    try:
+        await message.channel.send(
+            f"⚠️ {message.author.mention} 危険なIPロガーリンクを検知したため削除しました。",
+            delete_after=10
+        )
+    except Exception:
+        pass
+
+    await _send_mod_log(message.guild, warn_embed)
+    return True
+
+
 async def _run_automod_checks(message: discord.Message, guild_config: dict) -> bool:
     """
-    招待リンク削除・NGワード削除を実行します。
+    招待リンク削除・NGワード削除・IPロガー検知を実行します。
     削除した場合は True を返します（呼び出し元でreturnするため）。
     スパム検知はメッセージ送信時のみ対象のため含めていません。
     """
@@ -2800,6 +2916,11 @@ async def _run_automod_checks(message: discord.Message, guild_config: dict) -> b
                 )
             except Exception:
                 pass
+            return True
+
+    # IPロガー検知
+    if guild_config.get("iplogger_check_enabled", False):
+        if await _check_iplogger(message):
             return True
 
     return False
@@ -3050,6 +3171,45 @@ async def on_member_join(member: discord.Member):
                 await member.add_roles(role, reason="ウェルカム自動ロール付与")
             except Exception:
                 pass
+
+    # alt_check: 新規アカウント検知
+    alt_enabled = cfg.get("alt_check_enabled", False)
+    if alt_enabled:
+        threshold_days = cfg.get("alt_check_days", 30)
+        account_age = (discord.utils.utcnow() - member.created_at).days
+        if account_age < threshold_days:
+            action = cfg.get("alt_check_action", "notify")
+            alt_embed = discord.Embed(
+                title="⚠️ 新規アカウント検知 (alt_check)",
+                color=discord.Color.orange()
+            )
+            alt_embed.set_thumbnail(url=member.display_avatar.url)
+            alt_embed.add_field(name="ユーザー", value=f"{member.mention} (`{member.id}`)", inline=False)
+            alt_embed.add_field(name="アカウント作成日", value=member.created_at.strftime("%Y/%m/%d"), inline=True)
+            alt_embed.add_field(name="アカウント日齢", value=f"{account_age}日", inline=True)
+            alt_embed.add_field(name="閾値", value=f"{threshold_days}日未満", inline=True)
+            alt_embed.add_field(name="実行アクション", value={"notify": "通知のみ", "kick": "キック", "ban": "BAN"}.get(action, action), inline=True)
+            alt_embed.timestamp = discord.utils.utcnow()
+
+            await _send_mod_log(member.guild, alt_embed)
+
+            if action == "kick":
+                try:
+                    await member.send(
+                        f"**{member.guild.name}** への参加が拒否されました。\n"
+                        f"アカウントが作成されてから{threshold_days}日以上経過していないと参加できません（現在{account_age}日）。"
+                    )
+                except Exception:
+                    pass
+                try:
+                    await member.kick(reason=f"alt_check: アカウント日齢 {account_age}日（閾値: {threshold_days}日）")
+                except Exception:
+                    pass
+            elif action == "ban":
+                try:
+                    await member.ban(reason=f"alt_check: アカウント日齢 {account_age}日（閾値: {threshold_days}日）")
+                except Exception:
+                    pass
 
 
 @bot.event
@@ -6011,6 +6171,703 @@ async def eval_help(interaction: discord.Interaction, カテゴリ: discord.app_
 
     embed.set_footer(text=f"カテゴリ: {カテゴリ.name} | 全{len(examples)}件 | /eval_help で他カテゴリも確認できます")
     await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# ====================================================================
+# セクション 13: 追加機能コマンド群
+# /calc / /giveaway / /alt_check / /iplogger_check / /embed_builder
+# ====================================================================
+
+# --------------------------------------------------------------------
+# /calc — 数式計算
+# --------------------------------------------------------------------
+
+@bot.tree.command(name="calc", description="数式を計算して結果を返します")
+async def calc(interaction: discord.Interaction, 数式: str):
+    """
+    四則演算・累乗・括弧・関数（sin/cos/sqrt等）に対応。
+    import や exec などの危険な操作は禁止されています。
+    """
+    import math
+    import ast as _ast
+    import operator as _op
+
+    # 許可する演算子・関数のみのサンドボックス
+    ALLOWED_OPS = {
+        _ast.Add:    _op.add,
+        _ast.Sub:    _op.sub,
+        _ast.Mult:   _op.mul,
+        _ast.Div:    _op.truediv,
+        _ast.Pow:    _op.pow,
+        _ast.USub:   _op.neg,
+        _ast.UAdd:   _op.pos,
+        _ast.Mod:    _op.mod,
+        _ast.FloorDiv: _op.floordiv,
+    }
+    ALLOWED_FUNCS = {
+        "sin": math.sin, "cos": math.cos, "tan": math.tan,
+        "asin": math.asin, "acos": math.acos, "atan": math.atan,
+        "sqrt": math.sqrt, "log": math.log, "log10": math.log10,
+        "log2": math.log2, "exp": math.exp, "abs": abs,
+        "ceil": math.ceil, "floor": math.floor, "round": round,
+        "factorial": math.factorial, "degrees": math.degrees,
+        "radians": math.radians,
+    }
+    ALLOWED_CONSTS = {
+        "pi": math.pi, "e": math.e, "tau": math.tau, "inf": math.inf,
+    }
+
+    def _safe_eval(node):
+        if isinstance(node, _ast.Constant):
+            if isinstance(node.value, (int, float)):
+                return node.value
+            raise ValueError("文字列や他の型は使用できません")
+        elif isinstance(node, _ast.BinOp):
+            op_type = type(node.op)
+            if op_type not in ALLOWED_OPS:
+                raise ValueError(f"使用できない演算子です: {op_type.__name__}")
+            left  = _safe_eval(node.left)
+            right = _safe_eval(node.right)
+            if op_type == _ast.Div and right == 0:
+                raise ZeroDivisionError("0で割ることはできません")
+            return ALLOWED_OPS[op_type](left, right)
+        elif isinstance(node, _ast.UnaryOp):
+            op_type = type(node.op)
+            if op_type not in ALLOWED_OPS:
+                raise ValueError(f"使用できない演算子です: {op_type.__name__}")
+            return ALLOWED_OPS[op_type](_safe_eval(node.operand))
+        elif isinstance(node, _ast.Call):
+            if not isinstance(node.func, _ast.Name):
+                raise ValueError("関数呼び出しの形式が不正です")
+            func_name = node.func.id
+            if func_name not in ALLOWED_FUNCS:
+                raise ValueError(f"使用できない関数です: `{func_name}`")
+            args = [_safe_eval(a) for a in node.args]
+            return ALLOWED_FUNCS[func_name](*args)
+        elif isinstance(node, _ast.Name):
+            if node.id in ALLOWED_CONSTS:
+                return ALLOWED_CONSTS[node.id]
+            raise ValueError(f"使用できない変数です: `{node.id}`")
+        else:
+            raise ValueError(f"サポートされていない式の形式です: {type(node).__name__}")
+
+    expr = 数式.strip()
+    # 全角数字・記号を半角に変換
+    expr = expr.translate(str.maketrans(
+        "０１２３４５６７８９＋－×÷＊＾（）　",
+        "0123456789+-*/*^ () "
+    ))
+    expr = expr.replace("^", "**").replace("×", "*").replace("÷", "/")
+
+    try:
+        tree = _ast.parse(expr, mode="eval")
+        result = _safe_eval(tree.body)
+    except ZeroDivisionError as e:
+        await interaction.response.send_message(f"❌ エラー: {e}", ephemeral=True)
+        return
+    except (ValueError, TypeError) as e:
+        await interaction.response.send_message(f"❌ 計算エラー: {e}", ephemeral=True)
+        return
+    except SyntaxError:
+        await interaction.response.send_message("❌ 数式の形式が正しくありません。", ephemeral=True)
+        return
+    except Exception as e:
+        await interaction.response.send_message(f"❌ 予期しないエラー: {e}", ephemeral=True)
+        return
+
+    # 結果の整形（整数なら小数点なし）
+    if isinstance(result, float) and result.is_integer():
+        result_str = str(int(result))
+    elif isinstance(result, float):
+        result_str = f"{result:.10g}"
+    else:
+        result_str = str(result)
+
+    embed = discord.Embed(color=discord.Color.blurple())
+    embed.add_field(name="計算式", value=f"```\n{数式}\n```", inline=False)
+    embed.add_field(name="結果",   value=f"```\n{result_str}\n```", inline=False)
+    embed.set_footer(text="使用可能: + - * / ** % // | sin cos sqrt log pi e ...")
+    await interaction.response.send_message(embed=embed)
+
+
+# --------------------------------------------------------------------
+# /giveaway — 抽選プレゼント機能
+# --------------------------------------------------------------------
+
+# 実行中プレゼント管理 {message_id: asyncio.Task}
+_giveaway_tasks: dict[int, asyncio.Task] = {}
+
+
+class GiveawayJoinView(discord.ui.View):
+    """プレゼント参加ボタンビュー。カスタムIDで永続化対応。"""
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="🎉 参加する",
+        style=discord.ButtonStyle.success,
+        custom_id="giveaway_join"
+    )
+    async def join(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.guild:
+            return
+
+        all_data = load_data()
+        cfg = get_guild_config(all_data, str(interaction.guild.id))
+        giveaways = cfg.get("giveaways", {})
+        msg_id_str = str(interaction.message.id)
+
+        if msg_id_str not in giveaways:
+            await interaction.response.send_message("このプレゼント企画は終了または削除されました。", ephemeral=True)
+            return
+
+        gw = giveaways[msg_id_str]
+        participants = gw.get("participants", [])
+        uid = interaction.user.id
+
+        if uid in participants:
+            # 参加取消
+            participants.remove(uid)
+            gw["participants"] = participants
+            save_data(all_data)
+            await interaction.response.send_message("プレゼント企画への参加を取り消しました。", ephemeral=True)
+        else:
+            participants.append(uid)
+            gw["participants"] = participants
+            save_data(all_data)
+            await interaction.response.send_message("🎉 プレゼント企画に参加しました！もう一度押すと取り消せます。", ephemeral=True)
+
+        # Embed の参加者数を更新
+        try:
+            embed = interaction.message.embeds[0]
+            for i, field in enumerate(embed.fields):
+                if "参加者" in field.name:
+                    embed.set_field_at(i, name="参加者数", value=f"{len(participants)}人", inline=True)
+                    break
+            await interaction.message.edit(embed=embed)
+        except Exception:
+            pass
+
+
+def _build_giveaway_embed(prize: str, host: discord.Member, end_dt: datetime.datetime, winners: int, participants: int) -> discord.Embed:
+    embed = discord.Embed(
+        title=f"🎉 プレゼント企画: {prize}",
+        color=discord.Color.gold()
+    )
+    embed.add_field(name="景品", value=prize, inline=True)
+    embed.add_field(name="当選人数", value=f"{winners}人", inline=True)
+    embed.add_field(name="参加者数", value=f"{participants}人", inline=True)
+    embed.add_field(name="主催者", value=host.mention, inline=True)
+    embed.add_field(name="終了日時", value=discord.utils.format_dt(end_dt, style="F"), inline=True)
+    embed.set_footer(text="🎉 ボタンを押して参加！もう一度押すと取り消せます")
+    embed.timestamp = end_dt
+    return embed
+
+
+async def _run_giveaway(channel: discord.TextChannel, message_id: int, guild_id: int, end_dt: datetime.datetime):
+    """指定時刻まで待機し、抽選を実行します。"""
+    now = discord.utils.utcnow()
+    wait_seconds = (end_dt - now).total_seconds()
+    if wait_seconds > 0:
+        await asyncio.sleep(wait_seconds)
+
+    # 抽選実行
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(guild_id))
+    giveaways = cfg.get("giveaways", {})
+    msg_id_str = str(message_id)
+
+    if msg_id_str not in giveaways:
+        return
+
+    gw = giveaways[msg_id_str]
+    participants = gw.get("participants", [])
+    winner_count = gw.get("winners", 1)
+    prize = gw.get("prize", "景品")
+
+    import random
+    if not participants:
+        result_embed = discord.Embed(
+            title="🎉 プレゼント企画 終了",
+            description=f"**{prize}**\n\n参加者がいなかったため、当選者なしで終了しました。",
+            color=discord.Color.greyple()
+        )
+    else:
+        actual_winners = min(winner_count, len(participants))
+        chosen = random.sample(participants, actual_winners)
+        mentions = " ".join(f"<@{uid}>" for uid in chosen)
+        result_embed = discord.Embed(
+            title="🎉 プレゼント企画 終了！",
+            description=f"**景品: {prize}**\n\n🏆 当選者: {mentions}\nおめでとうございます！",
+            color=discord.Color.gold()
+        )
+        result_embed.add_field(name="参加者数", value=f"{len(participants)}人", inline=True)
+        result_embed.add_field(name="当選人数", value=f"{actual_winners}人", inline=True)
+
+    result_embed.timestamp = discord.utils.utcnow()
+
+    # 元メッセージを更新してボタンを無効化
+    try:
+        msg = await channel.fetch_message(message_id)
+        disabled_view = discord.ui.View()
+        disabled_btn = discord.ui.Button(
+            label="🎉 終了（参加受付終了）",
+            style=discord.ButtonStyle.secondary,
+            disabled=True
+        )
+        disabled_view.add_item(disabled_btn)
+        await msg.edit(view=disabled_view)
+    except Exception:
+        pass
+
+    try:
+        await channel.send(embed=result_embed)
+    except Exception:
+        pass
+
+    # データから削除
+    del giveaways[msg_id_str]
+    save_data(all_data)
+    _giveaway_tasks.pop(message_id, None)
+
+
+@bot.tree.command(name="giveaway", description="【管理者専用】プレゼント企画を開始します")
+@discord.app_commands.choices(操作=[
+    discord.app_commands.Choice(name="開始する", value="start"),
+    discord.app_commands.Choice(name="終了する（即時抽選）", value="end"),
+    discord.app_commands.Choice(name="一覧を表示", value="list"),
+])
+async def giveaway(
+    interaction: discord.Interaction,
+    操作: discord.app_commands.Choice[str],
+    景品: str = None,
+    時間_分: int = None,
+    当選人数: int = 1,
+):
+    if not await is_admin_or_allowed(interaction):
+        return
+    if not interaction.guild:
+        return
+
+    if 操作.value == "list":
+        all_data = load_data()
+        cfg = get_guild_config(all_data, str(interaction.guild.id))
+        giveaways = cfg.get("giveaways", {})
+        if not giveaways:
+            await interaction.response.send_message("現在進行中のプレゼント企画はありません。", ephemeral=True)
+            return
+        embed = discord.Embed(title="進行中のプレゼント企画", color=discord.Color.gold())
+        for msg_id, gw in giveaways.items():
+            end_dt = datetime.datetime.fromisoformat(gw["end_at"])
+            embed.add_field(
+                name=f"🎉 {gw['prize']}",
+                value=(
+                    f"メッセージID: `{msg_id}`\n"
+                    f"参加者: {len(gw.get('participants', []))}人 / "
+                    f"当選: {gw['winners']}人\n"
+                    f"終了: {discord.utils.format_dt(end_dt, style='R')}"
+                ),
+                inline=False
+            )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+
+    if 操作.value == "end":
+        all_data = load_data()
+        cfg = get_guild_config(all_data, str(interaction.guild.id))
+        giveaways = cfg.get("giveaways", {})
+        if not giveaways:
+            await interaction.response.send_message("進行中のプレゼント企画がありません。", ephemeral=True)
+            return
+        # 最新のプレゼントを即時終了
+        latest_id = int(list(giveaways.keys())[-1])
+        task = _giveaway_tasks.pop(latest_id, None)
+        if task and not task.done():
+            task.cancel()
+        gw = giveaways[str(latest_id)]
+        ch = interaction.guild.get_channel(gw.get("channel_id", interaction.channel.id))
+        if ch:
+            gw["end_at"] = discord.utils.utcnow().isoformat()
+            save_data(all_data)
+            asyncio.create_task(_run_giveaway(ch, latest_id, interaction.guild.id, discord.utils.utcnow()))
+        await interaction.response.send_message("プレゼント企画を即時終了して抽選を実行します。", ephemeral=True)
+        return
+
+    # 操作 == "start"
+    if not 景品 or not 時間_分:
+        await interaction.response.send_message("「開始する」の場合は「景品」と「時間_分」を指定してください。", ephemeral=True)
+        return
+    if 時間_分 < 1 or 時間_分 > 43200:
+        await interaction.response.send_message("時間は1分〜43200分（30日）で指定してください。", ephemeral=True)
+        return
+    if 当選人数 < 1 or 当選人数 > 20:
+        await interaction.response.send_message("当選人数は1〜20人で指定してください。", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    end_dt = discord.utils.utcnow() + datetime.timedelta(minutes=時間_分)
+    embed = _build_giveaway_embed(景品, interaction.user, end_dt, 当選人数, 0)
+    view = GiveawayJoinView()
+
+    msg = await interaction.channel.send(embed=embed, view=view)
+
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(interaction.guild.id))
+    cfg.setdefault("giveaways", {})[str(msg.id)] = {
+        "prize": 景品,
+        "winners": 当選人数,
+        "end_at": end_dt.isoformat(),
+        "channel_id": interaction.channel.id,
+        "host_id": interaction.user.id,
+        "participants": [],
+    }
+    save_data(all_data)
+
+    task = asyncio.create_task(_run_giveaway(interaction.channel, msg.id, interaction.guild.id, end_dt))
+    _giveaway_tasks[msg.id] = task
+
+    await interaction.followup.send(
+        f"🎉 プレゼント企画を開始しました！\n景品: **{景品}** / {時間_分}分後に抽選 / 当選{当選人数}人",
+        ephemeral=True
+    )
+
+
+# --------------------------------------------------------------------
+# /alt_check — 新規アカウント検知設定
+# --------------------------------------------------------------------
+
+@bot.tree.command(name="alt_check", description="【管理者専用】新規アカウント（垢BAN逃れ）の自動検知を設定します")
+@discord.app_commands.choices(操作=[
+    discord.app_commands.Choice(name="有効にする", value="on"),
+    discord.app_commands.Choice(name="無効にする", value="off"),
+    discord.app_commands.Choice(name="現在の設定を確認", value="status"),
+])
+@discord.app_commands.choices(アクション=[
+    discord.app_commands.Choice(name="通知のみ（ログチャンネルに報告）", value="notify"),
+    discord.app_commands.Choice(name="キック（参加拒否）", value="kick"),
+    discord.app_commands.Choice(name="BAN", value="ban"),
+])
+async def alt_check(
+    interaction: discord.Interaction,
+    操作: discord.app_commands.Choice[str],
+    アクション: discord.app_commands.Choice[str] = None,
+    閾値_日数: app_commands.Range[int, 1, 365] = None,
+):
+    if not await is_guild_admin(interaction):
+        return
+    if not interaction.guild:
+        return
+
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(interaction.guild.id))
+
+    if 操作.value == "status":
+        embed = discord.Embed(title="alt_check 設定状況", color=discord.Color.blue())
+        embed.add_field(name="状態", value="有効" if cfg.get("alt_check_enabled") else "無効", inline=True)
+        embed.add_field(name="閾値", value=f"{cfg.get('alt_check_days', 30)}日未満", inline=True)
+        action_label = {"notify": "通知のみ", "kick": "キック", "ban": "BAN"}.get(cfg.get("alt_check_action", "notify"), "不明")
+        embed.add_field(name="アクション", value=action_label, inline=True)
+        embed.set_footer(text="参加メンバーのアカウント作成日が閾値より新しい場合に反応します")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+
+    if 操作.value == "off":
+        cfg["alt_check_enabled"] = False
+        save_data(all_data)
+        await interaction.response.send_message("alt_check を無効にしました。", ephemeral=True)
+        return
+
+    # on
+    cfg["alt_check_enabled"] = True
+    if アクション:
+        cfg["alt_check_action"] = アクション.value
+    if 閾値_日数:
+        cfg["alt_check_days"] = 閾値_日数
+    save_data(all_data)
+
+    action_label = {"notify": "通知のみ", "kick": "キック", "ban": "BAN"}.get(cfg["alt_check_action"], "通知のみ")
+    await interaction.response.send_message(
+        f"alt_check を有効にしました。\n"
+        f"・閾値: アカウント作成から **{cfg['alt_check_days']}日未満** で反応\n"
+        f"・アクション: **{action_label}**\n"
+        "ログチャンネルを設定していない場合は通知が届きません（`/modlog_set` で設定してください）。",
+        ephemeral=True
+    )
+
+
+# --------------------------------------------------------------------
+# /iplogger_check — IPロガー自動検知設定
+# --------------------------------------------------------------------
+
+@bot.tree.command(name="iplogger_check", description="【管理者専用】IPロガー・フィッシングリンクの自動検知・削除を設定します")
+@discord.app_commands.choices(状態=[
+    discord.app_commands.Choice(name="有効にする", value="on"),
+    discord.app_commands.Choice(name="無効にする", value="off"),
+])
+async def iplogger_check(interaction: discord.Interaction, 状態: discord.app_commands.Choice[str]):
+    if not await is_guild_admin(interaction):
+        return
+    if not interaction.guild:
+        return
+
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(interaction.guild.id))
+    cfg["iplogger_check_enabled"] = (状態.value == "on")
+    save_data(all_data)
+
+    if 状態.value == "on":
+        await interaction.response.send_message(
+            "IPロガー検知を **有効** にしました。\n"
+            "grabify.link / iplogger.org などの既知ドメインと、\n"
+            "bit.ly 等の短縮URLの展開先も自動チェックします。\n"
+            "検知した場合はメッセージを即削除し、モデレーションログに記録します。",
+            ephemeral=True
+        )
+    else:
+        await interaction.response.send_message("IPロガー検知を **無効** にしました。", ephemeral=True)
+
+
+# --------------------------------------------------------------------
+# /embed_builder — GUIでEmbedを作成して送信
+# --------------------------------------------------------------------
+
+class EmbedBuilderModal(discord.ui.Modal, title="Embed内容を入力"):
+    """Embedのタイトル・説明・フッターを入力するモーダル。"""
+    embed_title = discord.ui.TextInput(
+        label="タイトル",
+        placeholder="例: お知らせ",
+        max_length=256,
+        required=False
+    )
+    embed_description = discord.ui.TextInput(
+        label="本文",
+        style=discord.TextStyle.paragraph,
+        placeholder="Embedの本文を入力してください...",
+        max_length=4000,
+        required=False
+    )
+    embed_footer = discord.ui.TextInput(
+        label="フッター",
+        placeholder="例: ※詳細はお問い合わせください",
+        max_length=2048,
+        required=False
+    )
+    embed_image_url = discord.ui.TextInput(
+        label="画像URL（省略可）",
+        placeholder="https://example.com/image.png",
+        required=False
+    )
+    embed_thumbnail_url = discord.ui.TextInput(
+        label="サムネイルURL（省略可）",
+        placeholder="https://example.com/thumb.png",
+        required=False
+    )
+
+    def __init__(self, parent_view: "EmbedBuilderView"):
+        super().__init__()
+        self.parent_view = parent_view
+
+    async def on_submit(self, interaction: discord.Interaction):
+        pv = self.parent_view
+        pv.embed_data["title"]         = self.embed_title.value or None
+        pv.embed_data["description"]   = self.embed_description.value or None
+        pv.embed_data["footer"]        = self.embed_footer.value or None
+        pv.embed_data["image_url"]     = self.embed_image_url.value or None
+        pv.embed_data["thumbnail_url"] = self.embed_thumbnail_url.value or None
+        await interaction.response.edit_message(embed=pv.build_preview(), view=pv)
+
+
+EMBED_COLOR_OPTIONS = {
+    "ブルー":   discord.Color.blue(),
+    "グリーン": discord.Color.green(),
+    "レッド":   discord.Color.red(),
+    "ゴールド": discord.Color.gold(),
+    "パープル": discord.Color.purple(),
+    "オレンジ": discord.Color.orange(),
+    "グレー":   discord.Color.greyple(),
+    "ティール": discord.Color.teal(),
+    "白":       discord.Color.from_rgb(255, 255, 255),
+    "黒":       discord.Color.from_rgb(30, 30, 30),
+}
+
+
+class EmbedColorSelect(discord.ui.Select):
+    def __init__(self, parent_view: "EmbedBuilderView"):
+        self.parent_view = parent_view
+        options = [discord.SelectOption(label=name, value=name) for name in EMBED_COLOR_OPTIONS]
+        super().__init__(placeholder="枠線の色を選択...", options=options, row=1)
+
+    async def callback(self, interaction: discord.Interaction):
+        self.parent_view.embed_data["color"] = self.values[0]
+        await interaction.response.edit_message(embed=self.parent_view.build_preview(), view=self.parent_view)
+
+
+class EmbedBuilderView(discord.ui.View):
+    """Embed作成GUIビュー。"""
+
+    def __init__(self, author: discord.abc.User, target_channel: discord.TextChannel):
+        super().__init__(timeout=600)
+        self.author = author
+        self.target_channel = target_channel
+        self.embed_data: dict = {
+            "title": None,
+            "description": None,
+            "footer": None,
+            "color": "ブルー",
+            "image_url": None,
+            "thumbnail_url": None,
+            "fields": [],   # [{"name": str, "value": str, "inline": bool}]
+        }
+        self.add_item(EmbedColorSelect(self))
+
+    def build_preview(self) -> discord.Embed:
+        color = EMBED_COLOR_OPTIONS.get(self.embed_data.get("color", "ブルー"), discord.Color.blue())
+        embed = discord.Embed(
+            title=self.embed_data.get("title") or "（タイトル未入力）",
+            description=self.embed_data.get("description") or "（本文未入力）",
+            color=color
+        )
+        for f in self.embed_data.get("fields", []):
+            embed.add_field(name=f["name"], value=f["value"], inline=f.get("inline", False))
+        if self.embed_data.get("footer"):
+            embed.set_footer(text=self.embed_data["footer"])
+        if self.embed_data.get("image_url"):
+            embed.set_image(url=self.embed_data["image_url"])
+        if self.embed_data.get("thumbnail_url"):
+            embed.set_thumbnail(url=self.embed_data["thumbnail_url"])
+        embed.timestamp = discord.utils.utcnow()
+        return embed
+
+    @discord.ui.button(label="📝 内容を編集", style=discord.ButtonStyle.primary, row=0)
+    async def edit_content(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.author.id:
+            await interaction.response.send_message("このパネルはあなた専用です。", ephemeral=True)
+            return
+        modal = EmbedBuilderModal(self)
+        # 現在の値をプリフィル
+        if self.embed_data.get("title"):
+            modal.embed_title.default = self.embed_data["title"]
+        if self.embed_data.get("description"):
+            modal.embed_description.default = self.embed_data["description"]
+        if self.embed_data.get("footer"):
+            modal.embed_footer.default = self.embed_data["footer"]
+        if self.embed_data.get("image_url"):
+            modal.embed_image_url.default = self.embed_data["image_url"]
+        if self.embed_data.get("thumbnail_url"):
+            modal.embed_thumbnail_url.default = self.embed_data["thumbnail_url"]
+        await interaction.response.send_modal(modal)
+
+    @discord.ui.button(label="➕ フィールド追加", style=discord.ButtonStyle.secondary, row=0)
+    async def add_field(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.author.id:
+            await interaction.response.send_message("このパネルはあなた専用です。", ephemeral=True)
+            return
+        if len(self.embed_data["fields"]) >= 25:
+            await interaction.response.send_message("フィールドは最大25個までです。", ephemeral=True)
+            return
+        await interaction.response.send_modal(EmbedFieldModal(self))
+
+    @discord.ui.button(label="🗑️ フィールド削除", style=discord.ButtonStyle.secondary, row=0)
+    async def remove_field(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.author.id:
+            await interaction.response.send_message("このパネルはあなた専用です。", ephemeral=True)
+            return
+        if not self.embed_data["fields"]:
+            await interaction.response.send_message("削除できるフィールドがありません。", ephemeral=True)
+            return
+        # 末尾のフィールドを削除
+        removed = self.embed_data["fields"].pop()
+        await interaction.response.edit_message(embed=self.build_preview(), view=self)
+        await interaction.followup.send(f"フィールド「{removed['name']}」を削除しました。", ephemeral=True)
+
+    @discord.ui.button(label="✅ このチャンネルに送信", style=discord.ButtonStyle.success, row=2)
+    async def send_embed(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.author.id:
+            await interaction.response.send_message("このパネルはあなた専用です。", ephemeral=True)
+            return
+        embed = self.build_preview()
+        try:
+            await self.target_channel.send(embed=embed)
+        except discord.Forbidden:
+            await interaction.response.send_message("送信権限がありません。", ephemeral=True)
+            return
+        except Exception as e:
+            await interaction.response.send_message(f"送信エラー: {e}", ephemeral=True)
+            return
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(
+            content=f"✅ {self.target_channel.mention} にEmbedを送信しました。",
+            embed=None,
+            view=self
+        )
+
+    @discord.ui.button(label="❌ キャンセル", style=discord.ButtonStyle.danger, row=2)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.author.id:
+            await interaction.response.send_message("このパネルはあなた専用です。", ephemeral=True)
+            return
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(content="Embed作成をキャンセルしました。", embed=None, view=self)
+
+
+class EmbedFieldModal(discord.ui.Modal, title="フィールドを追加"):
+    field_name = discord.ui.TextInput(
+        label="フィールド名",
+        placeholder="例: 注意事項",
+        max_length=256,
+        required=True
+    )
+    field_value = discord.ui.TextInput(
+        label="フィールドの内容",
+        style=discord.TextStyle.paragraph,
+        placeholder="フィールドの内容を入力...",
+        max_length=1024,
+        required=True
+    )
+    field_inline = discord.ui.TextInput(
+        label="横並び表示（yes / no）",
+        placeholder="yes または no",
+        default="no",
+        max_length=3,
+        required=False
+    )
+
+    def __init__(self, parent_view: "EmbedBuilderView"):
+        super().__init__()
+        self.parent_view = parent_view
+
+    async def on_submit(self, interaction: discord.Interaction):
+        inline = self.field_inline.value.strip().lower() in ("yes", "y", "true", "1")
+        self.parent_view.embed_data["fields"].append({
+            "name": self.field_name.value,
+            "value": self.field_value.value,
+            "inline": inline,
+        })
+        await interaction.response.edit_message(embed=self.parent_view.build_preview(), view=self.parent_view)
+
+
+@bot.tree.command(name="embed_builder", description="【管理者専用】GUIでEmbedメッセージを作成してチャンネルに送信します")
+async def embed_builder(
+    interaction: discord.Interaction,
+    送信先チャンネル: discord.TextChannel = None,
+):
+    if not await is_admin_or_allowed(interaction):
+        return
+    if not interaction.guild:
+        return
+
+    target_ch = 送信先チャンネル or interaction.channel
+    view = EmbedBuilderView(author=interaction.user, target_channel=target_ch)
+    await interaction.response.send_message(
+        f"Embedビルダーを起動しました。送信先: {target_ch.mention}\n"
+        "「📝 内容を編集」でタイトル・本文・画像URLを入力し、色を選んで「✅ 送信」を押してください。",
+        embed=view.build_preview(),
+        view=view,
+        ephemeral=True
+    )
 
 
 # ====================================================================
