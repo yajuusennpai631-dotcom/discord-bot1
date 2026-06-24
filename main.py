@@ -128,7 +128,14 @@ def get_guild_config(all_data: dict, guild_id_str: str) -> dict:
         ("ng_words", []),
         ("mod_log_channel_id", None),
         ("custom_triggers", []),
-        ("custom_commands", {})
+        ("custom_commands", {}),
+        ("welcome_channel_id", None),
+        ("welcome_message", None),
+        ("welcome_role_id", None),
+        ("stats_category_id", None),
+        ("stats_member_ch_id", None),
+        ("stats_online_ch_id", None),
+        ("stats_bot_ch_id", None),
     ]:
         if key not in cfg:
             cfg[key] = default
@@ -2701,6 +2708,16 @@ async def on_ready():
             if roles:
                 bot.add_view(DynamicRoleView(roles))
                 print(f"  > ロールパネル: {len(roles)}個の取得ボタンを再活性化しました")
+
+        # 統計チャンネルの自動更新ループを再起動
+        stats_ch_ids = [
+            config.get("stats_member_ch_id"),
+            config.get("stats_online_ch_id"),
+            config.get("stats_bot_ch_id"),
+        ]
+        if guild and any(stats_ch_ids):
+            _stats_tasks[guild_id_int] = asyncio.create_task(_stats_loop(guild))
+            print(f"  > 統計ループ: 再起動しました")
     print("---------------------------------------")
     print(f"ログインユーザー: {bot.user.name} (ID: {bot.user.id})")
     print("スラッシュコマンドを更新したい場合は、サーバー上で '!sync' と発言してください。")
@@ -2872,7 +2889,23 @@ async def on_message(message: discord.Message):
             if message.author.guild_permissions.administrator:
                 to_channel = message.guild.get_channel(to_id)
                 if to_channel:
-                    await to_channel.send(message.content)
+                    # 転送メッセージにも招待リンクチェックを適用
+                    content_lower = message.content.lower()
+                    if guild_config.get("automod_invite_enabled", False) and any(
+                        kw in content_lower for kw in (
+                            "discord.gg/", "discord.com/invite/", "discord.me/", "dsc.gg/"
+                        )
+                    ):
+                        try:
+                            await message.delete()
+                            await message.channel.send(
+                                f"⚠️ {message.author.mention} 転送元チャンネルでも招待リンクの送信は許可されていません。",
+                                delete_after=5
+                            )
+                        except Exception:
+                            pass
+                    else:
+                        await to_channel.send(message.content)
 
         # 4. 自動返信ロールメンション処理
         trigger_ch_id = guild_config.get("mention_trigger_channel")
@@ -2983,6 +3016,40 @@ async def on_member_join(member: discord.Member):
     embed.set_thumbnail(url=member.display_avatar.url)
     embed.add_field(name="アカウント作成日時", value=member.created_at.strftime("%Y/%m/%d %H:%M:%S UTC"), inline=False)
     await _send_mod_log(member.guild, embed)
+
+    # ウェルカムメッセージ送信
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(member.guild.id))
+    welcome_ch_id = cfg.get("welcome_channel_id")
+    welcome_msg = cfg.get("welcome_message")
+    welcome_role_id = cfg.get("welcome_role_id")
+
+    if welcome_ch_id and welcome_msg:
+        ch = member.guild.get_channel(welcome_ch_id)
+        if ch:
+            try:
+                # {user} {server} {count} プレースホルダー対応
+                formatted = welcome_msg.replace("{user}", member.mention)
+                formatted = formatted.replace("{username}", str(member))
+                formatted = formatted.replace("{server}", member.guild.name)
+                formatted = formatted.replace("{count}", str(member.guild.member_count))
+                welcome_embed = discord.Embed(
+                    description=formatted,
+                    color=discord.Color.green()
+                )
+                welcome_embed.set_thumbnail(url=member.display_avatar.url)
+                welcome_embed.set_footer(text=f"{member.guild.name} へようこそ！")
+                await ch.send(embed=welcome_embed)
+            except Exception as e:
+                print(f"[ウェルカム送信エラー] {e}")
+
+    if welcome_role_id:
+        role = member.guild.get_role(welcome_role_id)
+        if role:
+            try:
+                await member.add_roles(role, reason="ウェルカム自動ロール付与")
+            except Exception:
+                pass
 
 
 @bot.event
@@ -4200,6 +4267,521 @@ async def owner_trust_list(interaction: discord.Interaction):
         color=discord.Color.blue()
     )
     await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# ====================================================================
+# セクション 8-EX: 追加機能コマンド群
+# /slowmode / /poll / /welcome_setup / /server_stats / /dm_user
+# ====================================================================
+
+# --------------------------------------------------------------------
+# /slowmode
+# --------------------------------------------------------------------
+
+@bot.tree.command(name="slowmode", description="【モデレーター専用】チャンネルのスロウモードを設定・解除します")
+async def slowmode(
+    interaction: discord.Interaction,
+    秒数: app_commands.Range[int, 0, 21600],
+    チャンネル: discord.TextChannel = None,
+):
+    """
+    秒数に 0 を指定すると解除。省略時は現在のチャンネルに適用。
+    最大 21600秒（6時間）まで設定可能。
+    """
+    if not await is_moderator(interaction):
+        return
+    if not interaction.guild:
+        return
+
+    target_ch = チャンネル or interaction.channel
+    try:
+        await target_ch.edit(slowmode_delay=秒数, reason=f"スロウモード設定 by {interaction.user}")
+    except discord.Forbidden:
+        await interaction.response.send_message("権限が不足しているため設定できません。", ephemeral=True)
+        return
+    except Exception as e:
+        await interaction.response.send_message(f"エラーが発生しました: {e}", ephemeral=True)
+        return
+
+    if 秒数 == 0:
+        msg = f"{target_ch.mention} のスロウモードを**解除**しました。"
+    elif 秒数 < 60:
+        msg = f"{target_ch.mention} のスロウモードを **{秒数}秒** に設定しました。"
+    elif 秒数 < 3600:
+        msg = f"{target_ch.mention} のスロウモードを **{秒数 // 60}分{秒数 % 60}秒** に設定しました。"
+    else:
+        h = 秒数 // 3600
+        m = (秒数 % 3600) // 60
+        msg = f"{target_ch.mention} のスロウモードを **{h}時間{m}分** に設定しました。"
+
+    await interaction.response.send_message(msg, ephemeral=True)
+
+
+# --------------------------------------------------------------------
+# /poll — リアクション投票パネル
+# --------------------------------------------------------------------
+
+@bot.tree.command(name="poll", description="【管理者専用】絵文字ボタン付きの投票パネルを作成します")
+async def poll(
+    interaction: discord.Interaction,
+    質問: str,
+    選択肢1: str,
+    選択肢2: str,
+    選択肢3: str = None,
+    選択肢4: str = None,
+    選択肢5: str = None,
+):
+    if not await is_admin_or_allowed(interaction):
+        return
+    if not interaction.guild:
+        return
+
+    choices_raw = [選択肢1, 選択肢2, 選択肢3, 選択肢4, 選択肢5]
+    choices = [c for c in choices_raw if c]
+
+    EMOJIS = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"]
+
+    embed = discord.Embed(
+        title=f"📊 {質問}",
+        color=discord.Color.blurple()
+    )
+    for i, choice in enumerate(choices):
+        embed.add_field(name=f"{EMOJIS[i]} {choice}", value="\u200b", inline=False)
+    embed.set_footer(text=f"投票者: {interaction.user} | ボタンを押して投票してください")
+
+    view = PollView(choices, EMOJIS[:len(choices)])
+    await interaction.response.send_message(embed=embed, view=view)
+
+
+class PollView(discord.ui.View):
+    """投票パネル用ビュー。各選択肢のボタン押下で票数を集計します。"""
+
+    def __init__(self, choices: list[str], emojis: list[str]):
+        super().__init__(timeout=None)
+        self.choices = choices
+        self.emojis = emojis
+        # {user_id: choice_index} — 1人1票
+        self.votes: dict[int, int] = {}
+        for i, (choice, emoji) in enumerate(zip(choices, emojis)):
+            btn = discord.ui.Button(
+                label=choice[:40],
+                emoji=emoji,
+                style=discord.ButtonStyle.primary,
+                custom_id=f"poll_choice_{i}",
+                row=i // 3,
+            )
+            btn.callback = self._make_callback(i)
+            self.add_item(btn)
+
+        # 結果表示ボタン
+        result_btn = discord.ui.Button(
+            label="現在の結果を見る",
+            style=discord.ButtonStyle.secondary,
+            emoji="📊",
+            custom_id="poll_result",
+            row=2,
+        )
+        result_btn.callback = self._show_result
+        self.add_item(result_btn)
+
+    def _make_callback(self, index: int):
+        async def callback(interaction: discord.Interaction):
+            uid = interaction.user.id
+            prev = self.votes.get(uid)
+            if prev == index:
+                # 同じ選択肢を再押し→取消
+                del self.votes[uid]
+                await interaction.response.send_message(
+                    f"{self.emojis[index]} **{self.choices[index]}** への投票を取り消しました。",
+                    ephemeral=True
+                )
+            else:
+                self.votes[uid] = index
+                await interaction.response.send_message(
+                    f"{self.emojis[index]} **{self.choices[index]}** に投票しました！\n"
+                    "もう一度押すと取り消せます。",
+                    ephemeral=True
+                )
+        return callback
+
+    async def _show_result(self, interaction: discord.Interaction):
+        total = len(self.votes)
+        lines = []
+        for i, (choice, emoji) in enumerate(zip(self.choices, self.emojis)):
+            count = sum(1 for v in self.votes.values() if v == i)
+            pct = int(count / total * 100) if total > 0 else 0
+            bar = "█" * (pct // 10) + "░" * (10 - pct // 10)
+            lines.append(f"{emoji} **{choice}**\n`{bar}` {count}票 ({pct}%)")
+        embed = discord.Embed(
+            title="📊 現在の投票結果",
+            description="\n\n".join(lines) if lines else "まだ投票はありません。",
+            color=discord.Color.green()
+        )
+        embed.set_footer(text=f"総投票数: {total}票")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# --------------------------------------------------------------------
+# /welcome_setup — ウェルカムメッセージ設定
+# --------------------------------------------------------------------
+
+@bot.tree.command(name="welcome_setup", description="【管理者専用】メンバー参加時のウェルカムメッセージを設定します")
+@discord.app_commands.choices(操作=[
+    discord.app_commands.Choice(name="設定する", value="set"),
+    discord.app_commands.Choice(name="解除する", value="reset"),
+    discord.app_commands.Choice(name="現在の設定を確認", value="status"),
+])
+async def welcome_setup(
+    interaction: discord.Interaction,
+    操作: discord.app_commands.Choice[str],
+    チャンネル: discord.TextChannel = None,
+    メッセージ: str = None,
+    自動付与ロール: discord.Role = None,
+):
+    """
+    メッセージ内で使えるプレースホルダー:
+      {user}     → メンションになります
+      {username} → ユーザー名
+      {server}   → サーバー名
+      {count}    → 現在のメンバー数
+    """
+    if not await is_guild_admin(interaction):
+        return
+    if not interaction.guild:
+        return
+
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(interaction.guild.id))
+
+    if 操作.value == "reset":
+        cfg["welcome_channel_id"] = None
+        cfg["welcome_message"] = None
+        cfg["welcome_role_id"] = None
+        save_data(all_data)
+        await interaction.response.send_message("ウェルカムメッセージの設定を解除しました。", ephemeral=True)
+        return
+
+    if 操作.value == "status":
+        ch_id = cfg.get("welcome_channel_id")
+        msg = cfg.get("welcome_message")
+        role_id = cfg.get("welcome_role_id")
+        ch = interaction.guild.get_channel(ch_id) if ch_id else None
+        role = interaction.guild.get_role(role_id) if role_id else None
+        embed = discord.Embed(title="ウェルカムメッセージ設定状況", color=discord.Color.teal())
+        embed.add_field(name="送信チャンネル", value=ch.mention if ch else "未設定", inline=True)
+        embed.add_field(name="自動付与ロール", value=role.mention if role else "なし", inline=True)
+        embed.add_field(
+            name="メッセージ内容",
+            value=f"```\n{msg}\n```" if msg else "未設定",
+            inline=False
+        )
+        embed.set_footer(text="プレースホルダー: {user} {username} {server} {count}")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+
+    # 操作 == "set"
+    if not チャンネル or not メッセージ:
+        await interaction.response.send_message(
+            "設定する場合は「チャンネル」と「メッセージ」の両方を指定してください。",
+            ephemeral=True
+        )
+        return
+
+    cfg["welcome_channel_id"] = チャンネル.id
+    cfg["welcome_message"] = メッセージ
+    cfg["welcome_role_id"] = 自動付与ロール.id if 自動付与ロール else None
+    save_data(all_data)
+
+    preview = メッセージ.replace("{user}", interaction.user.mention)
+    preview = preview.replace("{username}", str(interaction.user))
+    preview = preview.replace("{server}", interaction.guild.name)
+    preview = preview.replace("{count}", str(interaction.guild.member_count))
+
+    embed = discord.Embed(
+        title="ウェルカムメッセージを設定しました",
+        color=discord.Color.green()
+    )
+    embed.add_field(name="送信チャンネル", value=チャンネル.mention, inline=True)
+    embed.add_field(name="自動付与ロール", value=自動付与ロール.mention if 自動付与ロール else "なし", inline=True)
+    embed.add_field(name="プレビュー", value=preview[:500], inline=False)
+    embed.set_footer(text="メンバーが参加するたびにこのメッセージが送信されます")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# --------------------------------------------------------------------
+# /server_stats — リアルタイム統計チャンネル
+# --------------------------------------------------------------------
+
+# 統計更新タスクの管理（guild_id -> task）
+_stats_tasks: dict[int, asyncio.Task] = {}
+
+
+async def _update_stats_channels(guild: discord.Guild):
+    """統計チャンネルの名前をメンバー数などに合わせて更新します。"""
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(guild.id))
+
+    member_ch_id = cfg.get("stats_member_ch_id")
+    online_ch_id = cfg.get("stats_online_ch_id")
+    bot_ch_id = cfg.get("stats_bot_ch_id")
+
+    total = guild.member_count
+    bots = sum(1 for m in guild.members if m.bot)
+    humans = total - bots
+    online = sum(
+        1 for m in guild.members
+        if not m.bot and m.status != discord.Status.offline
+    )
+
+    updates = [
+        (member_ch_id, f"👥 メンバー: {humans}人"),
+        (online_ch_id, f"🟢 オンライン: {online}人"),
+        (bot_ch_id,    f"🤖 Bot: {bots}体"),
+    ]
+    for ch_id, new_name in updates:
+        if not ch_id:
+            continue
+        ch = guild.get_channel(ch_id)
+        if ch and ch.name != new_name:
+            try:
+                await ch.edit(name=new_name, reason="サーバー統計更新")
+            except Exception:
+                pass
+
+
+async def _stats_loop(guild: discord.Guild):
+    """5分ごとに統計チャンネルを更新するループタスクです。"""
+    while True:
+        try:
+            await _update_stats_channels(guild)
+        except Exception as e:
+            print(f"[stats_loop エラー] {guild.name}: {e}")
+        await asyncio.sleep(300)  # 5分ごとに更新
+
+
+@bot.tree.command(name="server_stats", description="【管理者専用】サーバー統計をリアルタイムでチャンネル名に表示します")
+@discord.app_commands.choices(操作=[
+    discord.app_commands.Choice(name="設定する（カテゴリを指定）", value="set"),
+    discord.app_commands.Choice(name="解除する", value="reset"),
+    discord.app_commands.Choice(name="今すぐ更新", value="update"),
+    discord.app_commands.Choice(name="現在の設定を確認", value="status"),
+])
+async def server_stats(
+    interaction: discord.Interaction,
+    操作: discord.app_commands.Choice[str],
+    カテゴリ: discord.CategoryChannel = None,
+):
+    """
+    「設定する」を実行するとカテゴリ内に
+      👥 メンバー: XX人
+      🟢 オンライン: XX人
+      🤖 Bot: XX体
+    の3つのボイスチャンネルを自動作成し、5分ごとに名前を更新します。
+    """
+    if not await is_guild_admin(interaction):
+        return
+    if not interaction.guild:
+        return
+
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(interaction.guild.id))
+    guild = interaction.guild
+
+    if 操作.value == "status":
+        member_ch = guild.get_channel(cfg.get("stats_member_ch_id"))
+        online_ch = guild.get_channel(cfg.get("stats_online_ch_id"))
+        bot_ch    = guild.get_channel(cfg.get("stats_bot_ch_id"))
+        cat       = guild.get_channel(cfg.get("stats_category_id"))
+        embed = discord.Embed(title="サーバー統計チャンネル設定状況", color=discord.Color.blue())
+        embed.add_field(name="カテゴリ", value=cat.name if cat else "未設定", inline=False)
+        embed.add_field(name="メンバー数ch", value=member_ch.mention if member_ch else "未設定", inline=True)
+        embed.add_field(name="オンラインch", value=online_ch.mention if online_ch else "未設定", inline=True)
+        embed.add_field(name="Botch",        value=bot_ch.mention    if bot_ch    else "未設定", inline=True)
+        task_running = guild.id in _stats_tasks and not _stats_tasks[guild.id].done()
+        embed.add_field(name="自動更新", value="稼働中（5分ごと）" if task_running else "停止中", inline=False)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+
+    if 操作.value == "update":
+        ch_ids = [cfg.get("stats_member_ch_id"), cfg.get("stats_online_ch_id"), cfg.get("stats_bot_ch_id")]
+        if not any(ch_ids):
+            await interaction.response.send_message("統計チャンネルが設定されていません。先に「設定する」を実行してください。", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        await _update_stats_channels(guild)
+        await interaction.followup.send("統計チャンネルを今すぐ更新しました。", ephemeral=True)
+        return
+
+    if 操作.value == "reset":
+        for ch_key in ("stats_member_ch_id", "stats_online_ch_id", "stats_bot_ch_id"):
+            ch_id = cfg.get(ch_key)
+            if ch_id:
+                ch = guild.get_channel(ch_id)
+                if ch:
+                    try:
+                        await ch.delete(reason="統計チャンネル解除")
+                    except Exception:
+                        pass
+        cfg["stats_category_id"] = None
+        cfg["stats_member_ch_id"] = None
+        cfg["stats_online_ch_id"] = None
+        cfg["stats_bot_ch_id"] = None
+        save_data(all_data)
+        task = _stats_tasks.pop(guild.id, None)
+        if task and not task.done():
+            task.cancel()
+        await interaction.response.send_message("統計チャンネルの設定を解除し、チャンネルを削除しました。", ephemeral=True)
+        return
+
+    # 操作 == "set"
+    if not カテゴリ:
+        await interaction.response.send_message(
+            "設定する場合は「カテゴリ」を指定してください。\n"
+            "指定したカテゴリ内に統計ボイスチャンネルが自動作成されます。",
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    total = guild.member_count
+    bots  = sum(1 for m in guild.members if m.bot)
+    humans = total - bots
+    online = sum(1 for m in guild.members if not m.bot and m.status != discord.Status.offline)
+
+    # 既存チャンネルがあれば削除してから再作成
+    for ch_key in ("stats_member_ch_id", "stats_online_ch_id", "stats_bot_ch_id"):
+        old_ch_id = cfg.get(ch_key)
+        if old_ch_id:
+            old_ch = guild.get_channel(old_ch_id)
+            if old_ch:
+                try:
+                    await old_ch.delete(reason="統計チャンネル再作成")
+                except Exception:
+                    pass
+
+    # 閲覧のみ・接続不可のパーミッション
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(
+            view_channel=True,
+            connect=False
+        )
+    }
+
+    try:
+        member_ch = await guild.create_voice_channel(
+            name=f"👥 メンバー: {humans}人",
+            category=カテゴリ,
+            overwrites=overwrites,
+            reason="サーバー統計チャンネル作成"
+        )
+        online_ch = await guild.create_voice_channel(
+            name=f"🟢 オンライン: {online}人",
+            category=カテゴリ,
+            overwrites=overwrites,
+            reason="サーバー統計チャンネル作成"
+        )
+        bot_ch = await guild.create_voice_channel(
+            name=f"🤖 Bot: {bots}体",
+            category=カテゴリ,
+            overwrites=overwrites,
+            reason="サーバー統計チャンネル作成"
+        )
+    except discord.Forbidden:
+        await interaction.followup.send("チャンネル作成権限が不足しています。", ephemeral=True)
+        return
+    except Exception as e:
+        await interaction.followup.send(f"チャンネル作成中にエラーが発生しました: {e}", ephemeral=True)
+        return
+
+    cfg["stats_category_id"]  = カテゴリ.id
+    cfg["stats_member_ch_id"] = member_ch.id
+    cfg["stats_online_ch_id"] = online_ch.id
+    cfg["stats_bot_ch_id"]    = bot_ch.id
+    save_data(all_data)
+
+    # 既存タスクをキャンセルして新しいループを開始
+    old_task = _stats_tasks.pop(guild.id, None)
+    if old_task and not old_task.done():
+        old_task.cancel()
+    _stats_tasks[guild.id] = asyncio.create_task(_stats_loop(guild))
+
+    embed = discord.Embed(
+        title="サーバー統計チャンネルを設定しました",
+        color=discord.Color.green()
+    )
+    embed.add_field(name="カテゴリ",       value=カテゴリ.name,         inline=False)
+    embed.add_field(name="メンバー数",     value=member_ch.mention,    inline=True)
+    embed.add_field(name="オンライン人数", value=online_ch.mention,     inline=True)
+    embed.add_field(name="Bot数",          value=bot_ch.mention,        inline=True)
+    embed.set_footer(text="5分ごとに自動更新されます。Bot再起動後は /server_stats 設定する を再実行してください。")
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+# --------------------------------------------------------------------
+# /dm_user — 特定ユーザーへのDM送信
+# --------------------------------------------------------------------
+
+@bot.tree.command(name="dm_user", description="【オーナー・許可ユーザー専用】指定したユーザーにBotからDMを送信します")
+async def dm_user(
+    interaction: discord.Interaction,
+    ユーザー: discord.User,
+    メッセージ: str,
+    匿名送信: bool = False,
+):
+    """
+    匿名送信=True にすると送信者情報をDMに含めません（サーバー名のみ記載）。
+    """
+    if not await is_admin_or_allowed(interaction):
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    embed = discord.Embed(
+        description=メッセージ,
+        color=discord.Color.blurple()
+    )
+    if interaction.guild:
+        embed.set_author(name=interaction.guild.name, icon_url=interaction.guild.icon.url if interaction.guild.icon else None)
+    if not 匿名送信:
+        embed.set_footer(text=f"送信者: {interaction.user} | {interaction.guild.name if interaction.guild else 'Direct'}")
+    else:
+        embed.set_footer(text=f"このメッセージは {interaction.guild.name if interaction.guild else 'Bot'} から送信されました")
+
+    try:
+        await ユーザー.send(embed=embed)
+    except discord.Forbidden:
+        await interaction.followup.send(
+            f"{ユーザー.mention} へのDM送信に失敗しました。\n"
+            "DM受信を拒否している可能性があります。",
+            ephemeral=True
+        )
+        return
+    except Exception as e:
+        await interaction.followup.send(f"送信中にエラーが発生しました: {e}", ephemeral=True)
+        return
+
+    result_embed = discord.Embed(
+        title="DM送信完了",
+        color=discord.Color.green()
+    )
+    result_embed.add_field(name="送信先", value=f"{ユーザー} (`{ユーザー.id}`)", inline=False)
+    result_embed.add_field(name="内容", value=メッセージ[:500], inline=False)
+    result_embed.add_field(name="匿名送信", value="はい" if 匿名送信 else "いいえ", inline=True)
+    await interaction.followup.send(embed=result_embed, ephemeral=True)
+
+    # モデレーションログにも記録
+    if interaction.guild:
+        log_embed = discord.Embed(
+            title="[ログ] Bot経由DM送信",
+            color=discord.Color.purple()
+        )
+        log_embed.add_field(name="送信者", value=interaction.user.mention, inline=True)
+        log_embed.add_field(name="送信先", value=f"{ユーザー.mention} (`{ユーザー.id}`)", inline=True)
+        log_embed.add_field(name="内容", value=メッセージ[:500], inline=False)
+        log_embed.add_field(name="匿名送信", value="はい" if 匿名送信 else "いいえ", inline=True)
+        log_embed.timestamp = discord.utils.utcnow()
+        await _send_mod_log(interaction.guild, log_embed)
 
 
 # ====================================================================
