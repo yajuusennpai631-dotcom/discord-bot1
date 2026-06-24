@@ -2750,7 +2750,15 @@ async def on_ready():
                 print(f"  > [警告] プレゼントタスク復元に失敗: {e}")
     print("---------------------------------------")
     print(f"ログインユーザー: {bot.user.name} (ID: {bot.user.id})")
-    print("スラッシュコマンドを更新したい場合は、サーバー上で '!sync' と発言してください。")
+
+    # 起動時にスラッシュコマンドを自動同期（コマンド候補欄に表示されない問題の対策）
+    try:
+        synced = await bot.tree.sync()
+        print(f"[システム] スラッシュコマンドを自動同期しました: {len(synced)}個（反映まで最大1時間）")
+    except Exception as e:
+        print(f"[警告] スラッシュコマンドの自動同期に失敗しました: {e}")
+
+    print("スラッシュコマンドを即時反映したい場合は、サーバー上で '!sync' と発言してください。")
 
 
 @bot.event
