@@ -3405,7 +3405,7 @@ async def help_command(interaction: discord.Interaction):
         )
     if is_admin or is_owner:
         embed.add_field(
-            name="サーバー管理者専用コマンド",
+            name="サーバー管理者専用コマンド (1/2)",
             value=(
                 "`/server_status` : 現在の各種機能の設定状況を確認します\n"
                 "`/server_list_users` : コマンド使用許可リストの確認・編集を行います\n"
@@ -3418,7 +3418,13 @@ async def help_command(interaction: discord.Interaction):
                 "`/server_mention_setup` / `/server_mention_reset` : 自動返信ロールメンションの設定と解除を行います\n"
                 "`/server_stats` : メンバー数などをチャンネル名に反映する統計機能を設定します\n"
                 "`/server_backup` : サーバーのロール・チャンネル・権限をJSONバックアップします\n"
-                "`/server_restore` : バックアップJSONからサーバー構成を復元します\n"
+                "`/server_restore` : バックアップJSONからサーバー構成を復元します"
+            ),
+            inline=False
+        )
+        embed.add_field(
+            name="サーバー管理者専用コマンド (2/2)",
+            value=(
                 "`/welcome_setup` : 新規参加者へのウェルカムメッセージ・ロールを設定します\n"
                 "`/modlog_set` : モデレーションログの通知先チャンネルを設定します\n"
                 "`/automod_toggle` : 自動モデレーション機能（スパム・招待リンク・NGワード）を切り替えます\n"
