@@ -18,7 +18,6 @@ import time
 import discord
 from discord.ext import commands
 import aiohttp
-import io
 from discord import app_commands
 
 # .env ファイルからの環境変数読み込み (ローカル開発用)
