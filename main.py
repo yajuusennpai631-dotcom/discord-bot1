@@ -18,6 +18,7 @@ import time
 import discord
 from discord.ext import commands
 import aiohttp
+import io
 from discord import app_commands
 
 # .env ファイルからの環境変数読み込み (ローカル開発用)
@@ -3353,6 +3354,12 @@ async def help_command(interaction: discord.Interaction):
             "`/search` : 各種検索サイトやWikipediaのリンク・概要を生成します\n"
             "`/my_scan` : サーバー情報、または指定ユーザーの基本情報を確認します\n"
             "`/apology` : セレクトメニューから謝罪文を組み立てて送信します\n"
+            "`/calc` : 数式を計算して結果を返します\n"
+            "`/poll` : 投票パネルを作成します\n"
+            "`/giveaway` : プレゼント企画を作成・管理します\n"
+            "`/warnings` : 指定ユーザーの警告履歴を確認します\n"
+            "`/server_stats` : サーバーの統計情報を表示します\n"
+            "`/iplogger_check` : URLがIPロガーでないかチェックします\n"
             "`/customcmd <名前>` : サーバーに登録されたカスタムコマンドを実行します"
         ),
         inline=False
@@ -3384,7 +3391,15 @@ async def help_command(interaction: discord.Interaction):
                 "`/my_scan_channels` : サーバーのチャンネル構造とカスタム権限をスキャンします\n"
                 "`/my_audit_perms` : @everyone の不適切な権限をスキャンします\n"
                 "`/my_check_url` : URLの安全性をVirusTotalでチェックします\n"
-                "`/say` : Botに指定したメッセージを代わりに発言させます"
+                "`/say` : Botに指定したメッセージを代わりに発言させます\n"
+                "`/dm_user` : 指定ユーザーにDMを送信します\n"
+                "`/embed_builder` : GUIでEmbedメッセージを作成してチャンネルに送信します\n"
+                "`/warn` : ユーザーに警告を付与します\n"
+                "`/kick` : ユーザーをサーバーからキックします\n"
+                "`/ban` : ユーザーをサーバーからBANします\n"
+                "`/mute` : ユーザーをタイムアウト（ミュート）します\n"
+                "`/purge` : 指定件数のメッセージを一括削除します\n"
+                "`/slowmode` : チャンネルの低速モードを設定します"
             ),
             inline=False
         )
@@ -3395,13 +3410,20 @@ async def help_command(interaction: discord.Interaction):
                 "`/server_status` : 現在の各種機能の設定状況を確認します\n"
                 "`/server_list_users` : コマンド使用許可リストの確認・編集を行います\n"
                 "`/server_create_channel` : 新しいテキストチャンネルを作成します\n"
+                "`/server_copy` : チャンネルをコピーして複製します\n"
                 "`/server_role_panel` : 指定ロールを取得できるボタン付きパネルを設置します\n"
-                "`/server_forward_setup` / `reset` : メッセージ自動転送の設定を行います\n"
-                "`/server_announce_setup` / `send` : 配信お知らせ機能の設定と送信を行います\n"
-                "`/server_verify_setup` / `btn` : メンバー認証用パネルを設置します\n"
-                "`/server_mention_setup` / `reset` : 自動返信ロールメンションの設定と解除を行います\n"
+                "`/server_forward_setup` / `/server_forward_reset` : メッセージ自動転送の設定・解除を行います\n"
+                "`/server_announce_setup` / `/server_announce_send` : 配信お知らせ機能の設定と送信を行います\n"
+                "`/server_verify_setup` / `/server_verify_btn` : メンバー認証用パネルを設置します\n"
+                "`/server_mention_setup` / `/server_mention_reset` : 自動返信ロールメンションの設定と解除を行います\n"
+                "`/server_stats` : メンバー数などをチャンネル名に反映する統計機能を設定します\n"
                 "`/server_backup` : サーバーのロール・チャンネル・権限をJSONバックアップします\n"
                 "`/server_restore` : バックアップJSONからサーバー構成を復元します\n"
+                "`/welcome_setup` : 新規参加者へのウェルカムメッセージ・ロールを設定します\n"
+                "`/modlog_set` : モデレーションログの通知先チャンネルを設定します\n"
+                "`/automod_toggle` : 自動モデレーション機能（スパム・招待リンク・NGワード）を切り替えます\n"
+                "`/automod_ngword_add` / `/automod_ngword_remove` : NGワードの追加・削除を行います\n"
+                "`/alt_check` : 新規アカウント（サブ垢）の自動検出設定を行います\n"
                 "`/antinuke` : 不審な連続操作の自動検出を有効・無効にします\n"
                 "`/antinuke_level` : 検出時の対応（ロール剥奪 or BAN）を設定します\n"
                 "`/antinuke_threshold` : 検出条件の操作回数・時間幅を設定します\n"
@@ -3419,7 +3441,9 @@ async def help_command(interaction: discord.Interaction):
                 "`/owner_guilds` : 導入中のサーバー一覧を確認し、任意のサーバーから脱退できます\n"
                 "`/owner_guild_detail` : サーバーの詳細情報（ch数・ロール数・Bot設定状況）と招待リンクを取得します\n"
                 "`/owner_broadcast` : 指定サーバーにEmbedでお知らせを一斉送信します\n"
-                "`/eval` : Pythonコードを実行して結果を返します（デバッグ・管理用）"
+                "`/owner_trust_add` / `/owner_trust_remove` / `/owner_trust_list` : 信頼ユーザーの追加・削除・一覧管理を行います\n"
+                "`/eval` : Pythonコードを実行して結果を返します（デバッグ・管理用）\n"
+                "`/eval_help` : /eval で使えるコード例を一覧表示します"
             ),
             inline=False
         )
