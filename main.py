@@ -141,6 +141,18 @@ def get_guild_config(all_data: dict, guild_id_str: str) -> dict:
         ("alt_check_action", "notify"),
         ("iplogger_check_enabled", False),
         ("giveaways", {}),
+        # --- 経済システム（メッセージ報酬・ロールショップ・自販機） ---
+        ("economy_enabled", False),
+        ("economy_currency_name", "コイン"),
+        ("economy_reward_min", 1),
+        ("economy_reward_max", 5),
+        ("economy_cooldown_seconds", 60),
+        ("economy_balances", {}),       # {user_id_str: int}
+        ("economy_last_earned", {}),    # {user_id_str: unix_timestamp}
+        ("role_shop", []),              # [{"id": int, "role_id": int, "name": str, "price": int}]
+        ("owned_shop_roles", {}),       # {user_id_str: [role_shop_item_id, ...]}
+        ("vending_items", []),          # [{"id": int, "name": str, "price": int, "stock": int, "content": str}]
+        ("economy_next_id", 1),         # role_shop / vending_items 共通のID発行用カウンタ
     ]:
         if key not in cfg:
             cfg[key] = default
@@ -3064,7 +3076,64 @@ async def on_message(message: discord.Message):
         # 5. カスタムトリガー自動返信処理
         await _run_custom_triggers(message, guild_config)
 
+        # 6. 経済システム: メッセージ送信報酬（クールダウン付き）
+        if guild_config.get("economy_enabled", False):
+            _grant_message_reward(all_data, guild_config, message)
+
     await bot.process_commands(message)
+
+
+def _grant_message_reward(all_data: dict, guild_config: dict, message: discord.Message):
+    """
+    メッセージ送信に対して少額の通貨を自動付与します。
+    スパム対策として、ユーザーごとにクールダウン（既定60秒）を設け、
+    クールダウン中の連投には一切報酬を与えません（カウントの蓄積もしません）。
+    """
+    import random
+
+    user_id_str = str(message.author.id)
+    now_ts = time.time()
+
+    cooldown = guild_config.get("economy_cooldown_seconds", 60)
+    last_earned_map = guild_config.setdefault("economy_last_earned", {})
+    last_ts = last_earned_map.get(user_id_str, 0)
+
+    if now_ts - last_ts < cooldown:
+        # クールダウン中。報酬なし（不正な高速連投での稼ぎを防止）。
+        return
+
+    reward_min = guild_config.get("economy_reward_min", 1)
+    reward_max = guild_config.get("economy_reward_max", 5)
+    if reward_max < reward_min:
+        reward_max = reward_min
+    reward = random.randint(reward_min, reward_max)
+
+    balances = guild_config.setdefault("economy_balances", {})
+    balances[user_id_str] = balances.get(user_id_str, 0) + reward
+    last_earned_map[user_id_str] = now_ts
+
+    save_data(all_data)
+
+
+def get_balance(guild_config: dict, user_id: int) -> int:
+    """指定ユーザーの所持金（通貨）を取得します。"""
+    return guild_config.get("economy_balances", {}).get(str(user_id), 0)
+
+
+def add_balance(guild_config: dict, user_id: int, amount: int):
+    """指定ユーザーの所持金に amount を加算（負数で減算）します。"""
+    balances = guild_config.setdefault("economy_balances", {})
+    user_id_str = str(user_id)
+    balances[user_id_str] = balances.get(user_id_str, 0) + amount
+    if balances[user_id_str] < 0:
+        balances[user_id_str] = 0
+
+
+def issue_economy_id(guild_config: dict) -> int:
+    """role_shop / vending_items 用の連番IDを発行します。"""
+    new_id = guild_config.get("economy_next_id", 1)
+    guild_config["economy_next_id"] = new_id + 1
+    return new_id
 
 
 async def _send_mod_log(guild: discord.Guild, embed: discord.Embed):
@@ -6905,6 +6974,486 @@ async def embed_builder(
         view=view,
         ephemeral=True
     )
+
+
+# ====================================================================
+# セクション 14: 経済システム（通貨・ロールショップ・自販機）
+# ====================================================================
+#
+# 概要:
+#   ・メッセージ送信ごとにクールダウン付きで少額の通貨を自動付与（on_message側で処理）
+#   ・通貨はサーバーごとに独立して管理（guild_config["economy_balances"]）
+#   ・ロールショップ: 通貨を消費してロールを購入できる
+#   ・自販機: 通貨を消費して「アイテム（テキスト内容）」を購入できる。在庫管理あり
+#
+# 注意:
+#   ・通貨の稼ぎ方は「メッセージ送信」のみで、クールダウン（既定60秒）を必ず挟みます。
+#     これにより連投・自動送信スクリプトによる無制限な稼ぎを防止します。
+#   ・管理者は /economy_give で手動付与・没収ができますが、乱用防止のため
+#     実行ログ（コマンド実行者）が Embed のフッターに残るようにしています。
+# --------------------------------------------------------------------
+
+def _format_currency(guild_config: dict, amount: int) -> str:
+    """通貨名付きの金額表示文字列を作成します。"""
+    name = guild_config.get("economy_currency_name", "コイン")
+    return f"{amount:,} {name}"
+
+
+# --------------------------------------------------------------------
+# /economy_setup — 経済システムの有効化・各種パラメータ設定
+# --------------------------------------------------------------------
+
+@bot.tree.command(name="economy_setup", description="【管理者専用】通貨システム（メッセージ報酬）を設定します")
+@discord.app_commands.describe(
+    有効化="経済システムを有効化するか",
+    通貨名="表示する通貨の名前（例: コイン、ポイント）",
+    最小報酬="1メッセージあたりの最小付与額",
+    最大報酬="1メッセージあたりの最大付与額",
+    クールダウン秒="次の報酬が発生するまでの待機時間（秒）。連投対策のため必須です。"
+)
+async def economy_setup(
+    interaction: discord.Interaction,
+    有効化: bool = None,
+    通貨名: str = None,
+    最小報酬: int = None,
+    最大報酬: int = None,
+    クールダウン秒: int = None,
+):
+    if not await is_admin_or_allowed(interaction):
+        return
+    if not interaction.guild:
+        return
+
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(interaction.guild.id))
+
+    if 有効化 is not None:
+        cfg["economy_enabled"] = 有効化
+    if 通貨名:
+        cfg["economy_currency_name"] = 通貨名[:20]
+    if 最小報酬 is not None:
+        if 最小報酬 < 0:
+            await interaction.response.send_message("最小報酬は0以上で指定してください。", ephemeral=True)
+            return
+        cfg["economy_reward_min"] = 最小報酬
+    if 最大報酬 is not None:
+        if 最大報酬 < 0:
+            await interaction.response.send_message("最大報酬は0以上で指定してください。", ephemeral=True)
+            return
+        cfg["economy_reward_max"] = 最大報酬
+    if クールダウン秒 is not None:
+        if クールダウン秒 < 10:
+            await interaction.response.send_message(
+                "クールダウンは10秒以上で指定してください（連投による無制限な稼ぎを防ぐための最低制限です）。",
+                ephemeral=True
+            )
+            return
+        cfg["economy_cooldown_seconds"] = クールダウン秒
+
+    save_data(all_data)
+
+    embed = discord.Embed(title="経済システム設定", color=discord.Color.green())
+    embed.add_field(name="有効化", value="✅ 有効" if cfg.get("economy_enabled") else "❌ 無効", inline=True)
+    embed.add_field(name="通貨名", value=cfg.get("economy_currency_name", "コイン"), inline=True)
+    embed.add_field(
+        name="報酬額（1メッセージ）",
+        value=f"{cfg.get('economy_reward_min', 1)} 〜 {cfg.get('economy_reward_max', 5)}",
+        inline=True
+    )
+    embed.add_field(name="クールダウン", value=f"{cfg.get('economy_cooldown_seconds', 60)}秒", inline=True)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# --------------------------------------------------------------------
+# /balance — 所持金確認
+# --------------------------------------------------------------------
+
+@bot.tree.command(name="balance", description="自分または指定したユーザーの所持金を確認します")
+async def balance(interaction: discord.Interaction, ユーザー: discord.Member = None):
+    if not interaction.guild:
+        await interaction.response.send_message("このコマンドはサーバー内で実行してください。", ephemeral=True)
+        return
+
+    target = ユーザー or interaction.user
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(interaction.guild.id))
+    amount = get_balance(cfg, target.id)
+
+    embed = discord.Embed(
+        title="💰 所持金",
+        description=f"{target.mention} の所持金: **{_format_currency(cfg, amount)}**",
+        color=discord.Color.gold()
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=(ユーザー is None))
+
+
+# --------------------------------------------------------------------
+# /economy_give — 管理者による手動付与・没収
+# --------------------------------------------------------------------
+
+@bot.tree.command(name="economy_give", description="【管理者専用】指定ユーザーの所持金を増減させます")
+@discord.app_commands.describe(
+    ユーザー="対象ユーザー",
+    金額="増減させる金額（負の数を指定すると没収）"
+)
+async def economy_give(interaction: discord.Interaction, ユーザー: discord.Member, 金額: int):
+    if not await is_admin_or_allowed(interaction):
+        return
+    if not interaction.guild:
+        return
+
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(interaction.guild.id))
+    add_balance(cfg, ユーザー.id, 金額)
+    save_data(all_data)
+
+    new_balance = get_balance(cfg, ユーザー.id)
+    embed = discord.Embed(
+        title="💰 所持金を変更しました",
+        description=(
+            f"対象: {ユーザー.mention}\n"
+            f"変更額: {'+' if 金額 >= 0 else ''}{金額}\n"
+            f"現在の所持金: **{_format_currency(cfg, new_balance)}**"
+        ),
+        color=discord.Color.blue()
+    )
+# --------------------------------------------------------------------
+# ロールショップ
+# --------------------------------------------------------------------
+
+class RoleShopBuyButton(discord.ui.Button):
+    """ロールショップの各商品に対応する購入ボタン。"""
+
+    def __init__(self, item: dict):
+        self.item_id = item["id"]
+        self.role_id = item["role_id"]
+        self.price = item["price"]
+        label = f"{item['name']} ({item['price']:,})"
+        super().__init__(
+            label=label[:80],
+            style=discord.ButtonStyle.success,
+            custom_id=f"roleshop_buy_{item['id']}"
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if not interaction.guild:
+            return
+
+        all_data = load_data()
+        cfg = get_guild_config(all_data, str(interaction.guild.id))
+
+        shop_items = cfg.get("role_shop", [])
+        item = next((i for i in shop_items if i["id"] == self.item_id), None)
+        if item is None:
+            await interaction.response.send_message("この商品は既に削除されています。", ephemeral=True)
+            return
+
+        role = interaction.guild.get_role(item["role_id"])
+        if role is None:
+            await interaction.response.send_message(
+                "対応するロールがサーバー上に見つかりません。管理者に確認してください。", ephemeral=True
+            )
+            return
+
+        owned = cfg.setdefault("owned_shop_roles", {})
+        user_owned = owned.setdefault(str(interaction.user.id), [])
+        if item["id"] in user_owned:
+            await interaction.response.send_message("このロールは既に購入済みです。", ephemeral=True)
+            return
+
+        user_balance = get_balance(cfg, interaction.user.id)
+        if user_balance < item["price"]:
+            await interaction.response.send_message(
+                f"所持金が不足しています。必要: {_format_currency(cfg, item['price'])} / "
+                f"所持: {_format_currency(cfg, user_balance)}",
+                ephemeral=True
+            )
+            return
+
+        try:
+            await interaction.user.add_roles(role, reason="ロールショップ購入")
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                "ロールを付与する権限がBotにありません（ロール順位を確認してください）。", ephemeral=True
+            )
+            return
+
+        add_balance(cfg, interaction.user.id, -item["price"])
+        user_owned.append(item["id"])
+        save_data(all_data)
+
+        await interaction.response.send_message(
+            f"✅ **{role.name}** を購入しました！ 残り所持金: {_format_currency(cfg, get_balance(cfg, interaction.user.id))}",
+            ephemeral=True
+        )
+
+
+class RoleShopView(discord.ui.View):
+    """ロールショップの商品一覧パネル（購入ボタン付き）。"""
+
+    def __init__(self, shop_items: list):
+        super().__init__(timeout=None)
+        # Discordの制約上、1ビューに置けるボタンは最大25個
+        for item in shop_items[:25]:
+            self.add_item(RoleShopBuyButton(item))
+
+
+def _build_role_shop_embed(guild_config: dict, guild: discord.Guild) -> discord.Embed:
+    shop_items = guild_config.get("role_shop", [])
+    embed = discord.Embed(
+        title="🛒 ロールショップ",
+        description="ボタンを押すとロールを購入できます。" if shop_items else "現在、販売中のロールはありません。",
+        color=discord.Color.purple()
+    )
+    for item in shop_items:
+        role = guild.get_role(item["role_id"])
+        role_text = role.mention if role else "（ロール削除済み）"
+        embed.add_field(
+            name=f"{item['name']}（ID: {item['id']}）",
+            value=f"{role_text}\n価格: {item['price']:,}",
+            inline=True
+        )
+    return embed
+
+
+@bot.tree.command(name="roleshop_add", description="【管理者専用】ロールショップに商品を追加します")
+@discord.app_commands.describe(ロール="販売するロール", 価格="購入に必要な通貨額", 表示名="ショップに表示する商品名")
+async def roleshop_add(interaction: discord.Interaction, ロール: discord.Role, 価格: int, 表示名: str = None):
+    if not await is_admin_or_allowed(interaction):
+        return
+    if not interaction.guild:
+        return
+    if 価格 < 1:
+        await interaction.response.send_message("価格は1以上で指定してください。", ephemeral=True)
+        return
+    if ロール >= interaction.guild.me.top_role:
+        await interaction.response.send_message(
+            "指定されたロールはBotの最高ロールより上位にあるため付与できません。ロールの順位を確認してください。",
+            ephemeral=True
+        )
+        return
+
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(interaction.guild.id))
+    new_id = issue_economy_id(cfg)
+    cfg.setdefault("role_shop", []).append({
+        "id": new_id,
+        "role_id": ロール.id,
+        "name": 表示名 or ロール.name,
+        "price": 価格,
+    })
+    save_data(all_data)
+
+    await interaction.response.send_message(
+        f"✅ ロールショップに **{表示名 or ロール.name}**（{ロール.mention} / 価格: {価格:,}）を追加しました。"
+        f"（商品ID: {new_id}）",
+        ephemeral=True
+    )
+
+
+@bot.tree.command(name="roleshop_remove", description="【管理者専用】ロールショップから商品を削除します")
+@discord.app_commands.describe(商品id="削除する商品のID（/roleshop で確認できます）")
+async def roleshop_remove(interaction: discord.Interaction, 商品id: int):
+    if not await is_admin_or_allowed(interaction):
+        return
+    if not interaction.guild:
+        return
+
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(interaction.guild.id))
+    shop_items = cfg.get("role_shop", [])
+    before_len = len(shop_items)
+    cfg["role_shop"] = [i for i in shop_items if i["id"] != 商品id]
+    save_data(all_data)
+
+    if len(cfg["role_shop"]) == before_len:
+        await interaction.response.send_message("指定されたIDの商品が見つかりませんでした。", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"✅ 商品ID {商品id} をロールショップから削除しました。", ephemeral=True)
+
+
+@bot.tree.command(name="roleshop", description="ロールショップを表示し、ロールを購入できます")
+async def roleshop(interaction: discord.Interaction):
+    if not interaction.guild:
+        await interaction.response.send_message("このコマンドはサーバー内で実行してください。", ephemeral=True)
+        return
+
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(interaction.guild.id))
+    shop_items = cfg.get("role_shop", [])
+
+# --------------------------------------------------------------------
+# 自販機
+# --------------------------------------------------------------------
+
+class VendingBuyButton(discord.ui.Button):
+    """自販機の各アイテムに対応する購入ボタン。"""
+
+    def __init__(self, item: dict):
+        self.item_id = item["id"]
+        stock = item.get("stock", 0)
+        disabled = stock <= 0
+        label = f"{item['name']} ({item['price']:,}) 残{stock}"
+        super().__init__(
+            label=label[:80],
+            style=discord.ButtonStyle.primary if not disabled else discord.ButtonStyle.secondary,
+            custom_id=f"vending_buy_{item['id']}",
+            disabled=disabled,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if not interaction.guild:
+            return
+
+        all_data = load_data()
+        cfg = get_guild_config(all_data, str(interaction.guild.id))
+
+        items = cfg.get("vending_items", [])
+        item = next((i for i in items if i["id"] == self.item_id), None)
+        if item is None:
+            await interaction.response.send_message("この商品は既に削除されています。", ephemeral=True)
+            return
+
+        if item.get("stock", 0) <= 0:
+            await interaction.response.send_message("この商品は売り切れです。", ephemeral=True)
+            return
+
+        user_balance = get_balance(cfg, interaction.user.id)
+        if user_balance < item["price"]:
+            await interaction.response.send_message(
+                f"所持金が不足しています。必要: {_format_currency(cfg, item['price'])} / "
+                f"所持: {_format_currency(cfg, user_balance)}",
+                ephemeral=True
+            )
+            return
+
+        # 在庫減算・所持金減算
+        item["stock"] -= 1
+        add_balance(cfg, interaction.user.id, -item["price"])
+        save_data(all_data)
+
+        # 購入内容はDMで送付（失敗時はephemeralメッセージにフォールバック）
+        content_text = item.get("content", "（内容が設定されていません）")
+        try:
+            await interaction.user.send(
+                f"🧃 自販機で **{item['name']}** を購入しました。\n\n内容:\n{content_text}"
+            )
+            await interaction.response.send_message(
+                f"✅ **{item['name']}** を購入しました。内容をDMに送信しました。", ephemeral=True
+            )
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                f"✅ **{item['name']}** を購入しました。\n"
+                f"（DMが送れなかったため、こちらに表示します）\n内容:\n{content_text}",
+                ephemeral=True
+            )
+
+        # パネルの在庫表示を更新
+        try:
+            new_view = VendingMachineView(cfg.get("vending_items", []))
+            new_embed = _build_vending_embed(cfg)
+            await interaction.message.edit(embed=new_embed, view=new_view)
+        except Exception:
+            pass
+
+
+class VendingMachineView(discord.ui.View):
+    """自販機の商品一覧パネル（購入ボタン付き）。"""
+
+    def __init__(self, items: list):
+        super().__init__(timeout=None)
+        for item in items[:25]:
+            self.add_item(VendingBuyButton(item))
+
+
+def _build_vending_embed(guild_config: dict) -> discord.Embed:
+    items = guild_config.get("vending_items", [])
+    embed = discord.Embed(
+        title="🧃 自販機",
+        description="ボタンを押すと商品を購入できます。内容はDMで送付されます。" if items else "現在、販売中の商品はありません。",
+        color=discord.Color.teal()
+    )
+    for item in items:
+        stock = item.get("stock", 0)
+        embed.add_field(
+            name=f"{item['name']}（ID: {item['id']}）",
+            value=f"価格: {item['price']:,}\n在庫: {stock if stock > 0 else '売り切れ'}",
+            inline=True
+        )
+    return embed
+
+
+@bot.tree.command(name="vendingmachine_add", description="【管理者専用】自販機に商品を追加します")
+@discord.app_commands.describe(
+    商品名="自販機に表示する商品名",
+    価格="購入に必要な通貨額",
+    在庫数="販売する個数",
+    内容="購入時にDMで送る内容（テキスト。シリアルコード等の配布に利用できます）"
+)
+async def vendingmachine_add(interaction: discord.Interaction, 商品名: str, 価格: int, 在庫数: int, 内容: str):
+    if not await is_admin_or_allowed(interaction):
+        return
+    if not interaction.guild:
+        return
+    if 価格 < 1:
+        await interaction.response.send_message("価格は1以上で指定してください。", ephemeral=True)
+        return
+    if 在庫数 < 0:
+        await interaction.response.send_message("在庫数は0以上で指定してください。", ephemeral=True)
+        return
+
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(interaction.guild.id))
+    new_id = issue_economy_id(cfg)
+    cfg.setdefault("vending_items", []).append({
+        "id": new_id,
+        "name": 商品名[:80],
+        "price": 価格,
+        "stock": 在庫数,
+        "content": 内容[:1500],
+    })
+    save_data(all_data)
+
+    await interaction.response.send_message(
+        f"✅ 自販機に **{商品名}**（価格: {価格:,} / 在庫: {在庫数}）を追加しました。（商品ID: {new_id}）",
+        ephemeral=True
+    )
+
+
+@bot.tree.command(name="vendingmachine_remove", description="【管理者専用】自販機から商品を削除します")
+@discord.app_commands.describe(商品id="削除する商品のID（/vendingmachine で確認できます）")
+async def vendingmachine_remove(interaction: discord.Interaction, 商品id: int):
+    if not await is_admin_or_allowed(interaction):
+        return
+    if not interaction.guild:
+        return
+
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(interaction.guild.id))
+    items = cfg.get("vending_items", [])
+    before_len = len(items)
+    cfg["vending_items"] = [i for i in items if i["id"] != 商品id]
+    save_data(all_data)
+
+    if len(cfg["vending_items"]) == before_len:
+        await interaction.response.send_message("指定されたIDの商品が見つかりませんでした。", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"✅ 商品ID {商品id} を自販機から削除しました。", ephemeral=True)
+
+
+@bot.tree.command(name="vendingmachine", description="自販機を表示し、商品を購入できます")
+async def vendingmachine(interaction: discord.Interaction):
+    if not interaction.guild:
+        await interaction.response.send_message("このコマンドはサーバー内で実行してください。", ephemeral=True)
+        return
+
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(interaction.guild.id))
+    items = cfg.get("vending_items", [])
+
+    embed = _build_vending_embed(cfg)
+    view = VendingMachineView(items) if items else None
+    await interaction.response.send_message(embed=embed, view=view)
 
 
 # ====================================================================
