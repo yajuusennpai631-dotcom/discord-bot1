@@ -155,6 +155,13 @@ def get_guild_config(all_data: dict, guild_id_str: str) -> dict:
         ("economy_next_id", 1),         # role_shop / vending_items 共通のID発行用カウンタ
         ("vending_panel_channel_id", None),  # 設置型自販機パネルのチャンネルID
         ("vending_panel_message_id", None),  # 設置型自販機パネルのメッセージID
+        ("role_shop_panel_channel_id", None),  # 設置型ロールショップパネルのチャンネルID
+        ("role_shop_panel_message_id", None),  # 設置型ロールショップパネルのメッセージID
+        # --- /work コマンド（2時間ごとのコイン稼ぎ） ---
+        ("economy_work_reward_min", 10),
+        ("economy_work_reward_max", 50),
+        ("economy_work_cooldown_seconds", 7200),  # 既定2時間
+        ("economy_last_work", {}),      # {user_id_str: unix_timestamp}
     ]:
         if key not in cfg:
             cfg[key] = default
@@ -2698,18 +2705,22 @@ async def on_ready():
     else:
         print("[警告] オーナー情報の取得に失敗しました。")
 
-    # ロールショップボタンの永続化View再登録（再起動後もボタンが反応するようにする）
+    # 設置型ロールショップパネルの永続化View再登録（再起動後もボタンが反応するようにする）
     for guild_id_str, config in all_data.items():
         if guild_id_str in ("user_apps", "global_config"):
             continue
         if not isinstance(config, dict):
             continue
-        shop_items = config.get("role_shop", [])
-        if shop_items:
-            try:
-                bot.add_view(RoleShopView(shop_items))
-            except Exception as e:
-                print(f"[警告] ロールショップViewの再登録に失敗しました（guild={guild_id_str}）: {e}")
+        panel_message_id = config.get("role_shop_panel_message_id")
+        panel_channel_id = config.get("role_shop_panel_channel_id")
+        if not panel_message_id or not panel_channel_id:
+            continue
+        try:
+            shop_items = config.get("role_shop", [])
+            view = RoleShopView(shop_items) if shop_items else discord.ui.View(timeout=None)
+            bot.add_view(view, message_id=panel_message_id)
+        except Exception as e:
+            print(f"[警告] ロールショップパネルの再登録に失敗しました（guild={guild_id_str}）: {e}")
 
     # 設置型自販機パネルの永続化View再登録（再起動後もボタンが反応するようにする）
     for guild_id_str, config in all_data.items():
@@ -7035,13 +7046,16 @@ def _format_currency(guild_config: dict, amount: int) -> str:
 # /economy_setup — 経済システムの有効化・各種パラメータ設定
 # --------------------------------------------------------------------
 
-@bot.tree.command(name="economy_setup", description="【管理者専用】通貨システム（メッセージ報酬）を設定します")
+@bot.tree.command(name="economy_setup", description="【管理者専用】通貨システム（メッセージ報酬・workコマンド）を設定します")
 @discord.app_commands.describe(
     有効化="経済システムを有効化するか",
     通貨名="表示する通貨の名前（例: コイン、ポイント）",
     最小報酬="1メッセージあたりの最小付与額",
     最大報酬="1メッセージあたりの最大付与額",
-    クールダウン秒="次の報酬が発生するまでの待機時間（秒）。連投対策のため必須です。"
+    クールダウン秒="次のメッセージ報酬が発生するまでの待機時間（秒）。連投対策のため必須です。",
+    work最小報酬="/workコマンド1回あたりの最小付与額",
+    work最大報酬="/workコマンド1回あたりの最大付与額",
+    workクールダウン秒="/workコマンドを再実行できるまでの待機時間（秒）。既定は7200秒（2時間）です。"
 )
 async def economy_setup(
     interaction: discord.Interaction,
@@ -7050,6 +7064,9 @@ async def economy_setup(
     最小報酬: int = None,
     最大報酬: int = None,
     クールダウン秒: int = None,
+    work最小報酬: int = None,
+    work最大報酬: int = None,
+    workクールダウン秒: int = None,
 ):
     if not await is_admin_or_allowed(interaction):
         return
@@ -7081,6 +7098,23 @@ async def economy_setup(
             )
             return
         cfg["economy_cooldown_seconds"] = クールダウン秒
+    if work最小報酬 is not None:
+        if work最小報酬 < 0:
+            await interaction.response.send_message("work最小報酬は0以上で指定してください。", ephemeral=True)
+            return
+        cfg["economy_work_reward_min"] = work最小報酬
+    if work最大報酬 is not None:
+        if work最大報酬 < 0:
+            await interaction.response.send_message("work最大報酬は0以上で指定してください。", ephemeral=True)
+            return
+        cfg["economy_work_reward_max"] = work最大報酬
+    if workクールダウン秒 is not None:
+        if workクールダウン秒 < 60:
+            await interaction.response.send_message(
+                "workクールダウンは60秒以上で指定してください。", ephemeral=True
+            )
+            return
+        cfg["economy_work_cooldown_seconds"] = workクールダウン秒
 
     save_data(all_data)
 
@@ -7092,7 +7126,14 @@ async def economy_setup(
         value=f"{cfg.get('economy_reward_min', 1)} 〜 {cfg.get('economy_reward_max', 5)}",
         inline=True
     )
-    embed.add_field(name="クールダウン", value=f"{cfg.get('economy_cooldown_seconds', 60)}秒", inline=True)
+    embed.add_field(name="クールダウン（メッセージ）", value=f"{cfg.get('economy_cooldown_seconds', 60)}秒", inline=True)
+    embed.add_field(
+        name="報酬額（/work）",
+        value=f"{cfg.get('economy_work_reward_min', 10)} 〜 {cfg.get('economy_work_reward_max', 50)}",
+        inline=True
+    )
+    work_cd = cfg.get('economy_work_cooldown_seconds', 7200)
+    embed.add_field(name="クールダウン（/work）", value=f"{work_cd}秒（{work_cd // 3600}時間）", inline=True)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
@@ -7117,6 +7158,67 @@ async def balance(interaction: discord.Interaction, ユーザー: discord.Member
         color=discord.Color.gold()
     )
     await interaction.response.send_message(embed=embed, ephemeral=(ユーザー is None))
+
+
+# --------------------------------------------------------------------
+# /work — 2時間ごとにコインを稼げる労働コマンド
+# --------------------------------------------------------------------
+
+@bot.tree.command(name="work", description="働いてコインを稼ぎます（2時間ごとに1回）")
+async def work(interaction: discord.Interaction):
+    if not interaction.guild:
+        await interaction.response.send_message("このコマンドはサーバー内で実行してください。", ephemeral=True)
+        return
+
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(interaction.guild.id))
+
+    if not cfg.get("economy_enabled", False):
+        await interaction.response.send_message(
+            "このサーバーでは経済システムが有効になっていません。管理者に /economy_setup での有効化を依頼してください。",
+            ephemeral=True
+        )
+        return
+
+    import random
+
+    user_id_str = str(interaction.user.id)
+    now_ts = time.time()
+
+    cooldown = cfg.get("economy_work_cooldown_seconds", 7200)
+    last_work_map = cfg.setdefault("economy_last_work", {})
+    last_ts = last_work_map.get(user_id_str, 0)
+    remaining = cooldown - (now_ts - last_ts)
+
+    if remaining > 0:
+        hours, rem = divmod(int(remaining), 3600)
+        minutes, seconds = divmod(rem, 60)
+        await interaction.response.send_message(
+            f"まだ働けません。次に働けるまで: {hours}時間{minutes}分{seconds}秒",
+            ephemeral=True
+        )
+        return
+
+    reward_min = cfg.get("economy_work_reward_min", 10)
+    reward_max = cfg.get("economy_work_reward_max", 50)
+    if reward_max < reward_min:
+        reward_max = reward_min
+    reward = random.randint(reward_min, reward_max)
+
+    add_balance(cfg, interaction.user.id, reward)
+    last_work_map[user_id_str] = now_ts
+    save_data(all_data)
+
+    embed = discord.Embed(
+        title="[WORK] 労働完了",
+        description=(
+            f"働いて **{_format_currency(cfg, reward)}** を獲得しました！\n"
+            f"現在の所持金: **{_format_currency(cfg, get_balance(cfg, interaction.user.id))}**"
+        ),
+        color=discord.Color.green()
+    )
+    embed.set_footer(text="次に働けるのは2時間後です（サーバー設定により変動する場合があります）")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 # --------------------------------------------------------------------
@@ -7149,6 +7251,9 @@ async def economy_give(interaction: discord.Interaction, ユーザー: discord.M
         ),
         color=discord.Color.blue()
     )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
 # --------------------------------------------------------------------
 # ロールショップ
 # --------------------------------------------------------------------
@@ -7248,6 +7353,36 @@ def _build_role_shop_embed(guild_config: dict, guild: discord.Guild) -> discord.
     return embed
 
 
+async def _refresh_role_shop_panel(guild: discord.Guild, guild_config: dict):
+    """
+    設置済みのロールショップパネル（role_shop_panel_channel_id / role_shop_panel_message_id）が
+    存在する場合、最新の商品情報でメッセージを編集して更新します。
+    パネルが見つからない場合（手動削除等）は静かに諦めます（エラーにしません）。
+    """
+    channel_id = guild_config.get("role_shop_panel_channel_id")
+    message_id = guild_config.get("role_shop_panel_message_id")
+    if not channel_id or not message_id:
+        return
+
+    channel = guild.get_channel(channel_id)
+    if channel is None:
+        return
+
+    try:
+        message = await channel.fetch_message(message_id)
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        return
+
+    shop_items = guild_config.get("role_shop", [])
+    new_embed = _build_role_shop_embed(guild_config, guild)
+    new_view = RoleShopView(shop_items) if shop_items else None
+
+    try:
+        await message.edit(embed=new_embed, view=new_view)
+    except discord.HTTPException:
+        pass
+
+
 @bot.tree.command(name="roleshop_add", description="【管理者専用】ロールショップに商品を追加します")
 @discord.app_commands.describe(ロール="販売するロール", 価格="購入に必要な通貨額", 表示名="ショップに表示する商品名")
 async def roleshop_add(interaction: discord.Interaction, ロール: discord.Role, 価格: int, 表示名: str = None):
@@ -7276,9 +7411,12 @@ async def roleshop_add(interaction: discord.Interaction, ロール: discord.Role
     })
     save_data(all_data)
 
+    await _refresh_role_shop_panel(interaction.guild, cfg)
+
     await interaction.response.send_message(
         f"[OK] ロールショップに **{表示名 or ロール.name}**（{ロール.mention} / 価格: {価格:,}）を追加しました。"
-        f"（商品ID: {new_id}）",
+        f"（商品ID: {new_id}）\n"
+        f"設置済みパネルがある場合は自動的に更新されました。",
         ephemeral=True
     )
 
@@ -7301,22 +7439,49 @@ async def roleshop_remove(interaction: discord.Interaction, 商品id: int):
     if len(cfg["role_shop"]) == before_len:
         await interaction.response.send_message("指定されたIDの商品が見つかりませんでした。", ephemeral=True)
     else:
-        await interaction.response.send_message(f"[OK] 商品ID {商品id} をロールショップから削除しました。", ephemeral=True)
+        await _refresh_role_shop_panel(interaction.guild, cfg)
+        await interaction.response.send_message(
+            f"[OK] 商品ID {商品id} をロールショップから削除しました。設置済みパネルがある場合は自動的に更新されました。",
+            ephemeral=True
+        )
 
 
-@bot.tree.command(name="roleshop", description="ロールショップを表示し、ロールを購入できます")
+@bot.tree.command(name="roleshop", description="【管理者専用】このチャンネルにロールショップパネルを設置します")
 async def roleshop(interaction: discord.Interaction):
+    if not await is_admin_or_allowed(interaction):
+        return
     if not interaction.guild:
-        await interaction.response.send_message("このコマンドはサーバー内で実行してください。", ephemeral=True)
         return
 
     all_data = load_data()
     cfg = get_guild_config(all_data, str(interaction.guild.id))
-    shop_items = cfg.get("role_shop", [])
 
+    # 既存の設置済みパネルがあれば、ボタンを無効化したメッセージとして残す
+    old_channel_id = cfg.get("role_shop_panel_channel_id")
+    old_message_id = cfg.get("role_shop_panel_message_id")
+    if old_channel_id and old_message_id:
+        old_channel = interaction.guild.get_channel(old_channel_id)
+        if old_channel:
+            try:
+                old_message = await old_channel.fetch_message(old_message_id)
+                await old_message.edit(
+                    content="[!] このロールショップパネルは新しいパネルに置き換えられたため無効です。",
+                    embed=None,
+                    view=None
+                )
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
+
+    shop_items = cfg.get("role_shop", [])
     embed = _build_role_shop_embed(cfg, interaction.guild)
     view = RoleShopView(shop_items) if shop_items else None
-    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+    await interaction.response.send_message(embed=embed, view=view)
+    panel_message = await interaction.original_response()
+
+    cfg["role_shop_panel_channel_id"] = interaction.channel.id
+    cfg["role_shop_panel_message_id"] = panel_message.id
+    save_data(all_data)
 
 # --------------------------------------------------------------------
 # 自販機
