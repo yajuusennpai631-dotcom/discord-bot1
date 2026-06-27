@@ -2839,6 +2839,14 @@ async def on_guild_join(guild: discord.Guild):
     await update_bot_status(bot)
     all_data = load_data()
     cfg = get_guild_config(all_data, str(guild.id))
+
+    # すでに承認済みのサーバーはステータスを保持し、申請パネルも再送しない
+    if cfg.get("approval_status") == "approved":
+        print(f"[サーバー参加] {guild.name} はすでに承認済みのためステータスを保持します。")
+        save_data(all_data)
+        return
+
+    # 新規サーバーまたは未承認サーバーのみ pending に設定して申請パネルを送る
     cfg["approval_status"] = "pending"
     save_data(all_data)
     await send_approval_panel(guild)
@@ -3717,6 +3725,8 @@ async def sync_command_error(ctx, error):
 # ====================================================================
 
 @bot.tree.command(name="help", description="利用可能なコマンド一覧をカテゴリ別に表示します")
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=False)
 async def help_command(interaction: discord.Interaction):
     owner_id = await resolve_owner_id(interaction.client)
     is_owner = (interaction.user.id == owner_id)
@@ -3861,11 +3871,15 @@ async def help_command(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="hello", description="Botが挨拶を返します")
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=False)
 async def hello(interaction: discord.Interaction):
     await interaction.response.send_message(f"こんにちは、{interaction.user.mention}さん。")
 
 
 @bot.tree.command(name="search", description="各種検索サイトやWikipediaの検索リンクを生成します")
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=False)
 @discord.app_commands.choices(engine=[
     discord.app_commands.Choice(name="Google (ウェブ検索)", value="google"),
     discord.app_commands.Choice(name="YouTube (動画検索)", value="youtube"),
@@ -3943,6 +3957,8 @@ async def my_scan(interaction: discord.Interaction, target_user: discord.User = 
 
 
 @bot.tree.command(name="apology", description="セレクトメニューから謝罪文を組み立てて送信します")
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=False)
 async def apology(interaction: discord.Interaction):
     view = ApologyBuilderView(author=interaction.user)
     await interaction.response.send_message(
@@ -3953,6 +3969,8 @@ async def apology(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="my_memo", description="あなた専用の個人メモを追加・一覧表示・削除・全消去します")
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=False)
 @discord.app_commands.choices(action=[
     discord.app_commands.Choice(name="メモを追加する", value="add"),
     discord.app_commands.Choice(name="一覧を表示する", value="list"),
@@ -3989,6 +4007,8 @@ async def my_memo(interaction: discord.Interaction, action: discord.app_commands
 
 
 @bot.tree.command(name="my_clip", description="あなた専用のクリップ（テキストやリンク）を保存・管理します")
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=False)
 @discord.app_commands.choices(action=[
     discord.app_commands.Choice(name="クリップを追加する", value="add"),
     discord.app_commands.Choice(name="一覧を表示する", value="list"),
@@ -4017,6 +4037,8 @@ async def my_clip(interaction: discord.Interaction, action: discord.app_commands
 
 
 @bot.tree.command(name="say", description="Botに指定したメッセージを代わりに発言させます")
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=False)
 async def say(interaction: discord.Interaction, message: str):
     # DM・グループDMの場合はBotオーナーのみ許可、サーバー内は通常の権限チェック
     owner_id = await resolve_owner_id(interaction.client)
@@ -4101,6 +4123,8 @@ async def my_audit_perms(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="my_check_url", description="URLの安全性をVirusTotalでチェックします")
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=False)
 async def my_check_url(interaction: discord.Interaction, url: str):
     if not await is_admin_or_allowed(interaction): return
     await interaction.response.defer(ephemeral=True)
@@ -5581,6 +5605,8 @@ async def customcmd_name_autocomplete(interaction: discord.Interaction, current:
 
 
 @bot.tree.command(name="customcmd", description="登録されたカスタムコマンドを実行します")
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=False)
 @discord.app_commands.autocomplete(名前=customcmd_name_autocomplete)
 async def customcmd(interaction: discord.Interaction, 名前: str):
     if not interaction.guild:
@@ -6317,6 +6343,8 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
 # ====================================================================
 
 @bot.tree.command(name="eval", description="【オーナー限定】Pythonコードを実行して結果を返します")
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=False)
 async def eval_command(interaction: discord.Interaction, コード: str):
     """
     オーナー限定のPythonコード実行コマンドです。
@@ -6567,6 +6595,8 @@ EVAL_EXAMPLES = {
 
 
 @bot.tree.command(name="eval_help", description="【オーナー限定】/evalで使えるコード例を一覧表示します")
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=False)
 @discord.app_commands.choices(カテゴリ=[
     discord.app_commands.Choice(name="Bot管理・デバッグ用", value="Bot管理・デバッグ"),
     discord.app_commands.Choice(name="サーバー情報確認用", value="サーバー情報確認"),
@@ -6619,6 +6649,8 @@ async def eval_help(interaction: discord.Interaction, カテゴリ: discord.app_
 # --------------------------------------------------------------------
 
 @bot.tree.command(name="calc", description="数式を計算して結果を返します")
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=False)
 async def calc(interaction: discord.Interaction, 数式: str):
     """
     四則演算・累乗・括弧・関数（sin/cos/sqrt等）に対応。
