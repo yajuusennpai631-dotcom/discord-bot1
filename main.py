@@ -37,6 +37,13 @@ OCR_SPACE_API_KEY = os.getenv("OCR_SPACE_API_KEY")
 ROBLOX_API_KEY = os.getenv("ROBLOX_API_KEY")
 ROBLOX_UNIVERSE_ID = os.getenv("ROBLOX_UNIVERSE_ID")
 
+# --- Discord OAuth2 関連設定（サーバーブラックリスト認証用）---
+DISCORD_CLIENT_ID = os.getenv("DISCORD_CLIENT_ID", "")
+DISCORD_CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET", "")
+OAUTH_REDIRECT_URI = os.getenv("OAUTH_REDIRECT_URI", "")
+OAUTH_SECRET_KEY = os.getenv("OAUTH_SECRET_KEY", "default_secret_change_me")
+OAUTH_PORT = int(os.getenv("PORT", "8080"))  # Railway は PORT 環境変数で起動ポートを渡す
+
 if not TOKEN:
     print("エラー: 環境変数 'DISCORD_TOKEN' が見つかりません。")
     sys.exit(1)
@@ -165,6 +172,11 @@ def get_guild_config(all_data: dict, guild_id_str: str) -> dict:
         ("economy_work_reward_max", 50),
         ("economy_work_cooldown_seconds", 7200),  # 既定2時間
         ("economy_last_work", {}),      # {user_id_str: unix_timestamp}
+        # --- サーバーブラックリスト（特定サーバー参加者自動BAN） ---
+        ("server_blacklist_enabled", False),    # 機能ON/OFF
+        ("server_blacklist_ids", []),           # BANの対象となるDiscordサーバーID一覧（int）
+        ("server_blacklist_action", "ban"),     # 'ban' または 'kick'
+        ("server_blacklist_log_channel_id", None),  # 処理結果を通知するチャンネルID
     ]:
         if key not in cfg:
             cfg[key] = default
@@ -3333,6 +3345,60 @@ async def on_member_join(member: discord.Member):
                     await member.ban(reason=f"alt_check: アカウント日齢 {account_age}日（閾値: {threshold_days}日）")
                 except Exception:
                     pass
+
+    # =========================================================
+    # サーバーブラックリスト: 特定サーバー参加者を自動BAN/KICK
+    # =========================================================
+    if cfg.get("server_blacklist_enabled", False) and OAUTH_REDIRECT_URI:
+        blacklist_ids = cfg.get("server_blacklist_ids", [])
+        if blacklist_ids:
+            # HMAC署名付きのstateトークンを生成（guild_id:user_id）
+            import hmac
+            import hashlib
+            state_payload = f"{member.guild.id}:{member.id}"
+            signature = hmac.new(
+                OAUTH_SECRET_KEY.encode(),
+                state_payload.encode(),
+                hashlib.sha256
+            ).hexdigest()
+            state = base64.urlsafe_b64encode(
+                f"{state_payload}:{signature}".encode()
+            ).decode()
+
+            # OAuth2 認証URL を生成
+            params = urllib.parse.urlencode({
+                "client_id": DISCORD_CLIENT_ID,
+                "redirect_uri": OAUTH_REDIRECT_URI,
+                "response_type": "code",
+                "scope": "guilds",
+                "state": state,
+            })
+            oauth_url = f"https://discord.com/oauth2/authorize?{params}"
+
+            # ユーザーにDMで認証URLを送信
+            try:
+                dm_embed = discord.Embed(
+                    title=f"[!] {member.guild.name} への参加確認",
+                    description=(
+                        "このサーバーへの参加には**認証**が必要です。\n\n"
+                        "下のリンクをクリックしてDiscord認証を完了してください。\n"
+                        "**認証を行わない場合、参加確認ができないため処理が行われません。**"
+                    ),
+                    color=discord.Color.orange()
+                )
+                dm_embed.add_field(
+                    name="認証リンク",
+                    value=f"[こちらをクリックして認証する]({oauth_url})",
+                    inline=False
+                )
+                dm_embed.set_footer(text="このリンクはあなた専用です。他の人と共有しないでください。")
+                await member.send(embed=dm_embed)
+                print(f"[サーバーBL] {member} に認証URLをDM送信しました（サーバー: {member.guild.name}）")
+            except discord.Forbidden:
+                # DMが無効の場合はログのみ
+                print(f"[サーバーBL] {member} へのDM送信に失敗しました（DM無効）")
+            except Exception as e:
+                print(f"[サーバーBL] DM送信エラー: {e}")
 
 
 @bot.event
@@ -7901,7 +7967,356 @@ async def vendingmachine(interaction: discord.Interaction):
 
 
 # ====================================================================
+# セクション X: サーバーブラックリスト コマンドグループ
+# ====================================================================
+
+server_blacklist_group = app_commands.Group(
+    name="server_blacklist",
+    description="特定サーバー参加者の自動BAN/KICK機能を管理します（モデレーター専用）"
+)
+
+
+@server_blacklist_group.command(name="toggle", description="サーバーブラックリスト機能のON/OFFを切り替えます")
+async def sbl_toggle(interaction: discord.Interaction):
+    if not await is_moderator(interaction):
+        return
+    if not interaction.guild:
+        return
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(interaction.guild.id))
+
+    # OAuth2設定が不完全な場合は警告
+    if not OAUTH_REDIRECT_URI or not DISCORD_CLIENT_ID or not DISCORD_CLIENT_SECRET:
+        await interaction.response.send_message(
+            "[NG] 環境変数 `DISCORD_CLIENT_ID` / `DISCORD_CLIENT_SECRET` / `OAUTH_REDIRECT_URI` が設定されていないため、この機能を有効にできません。\n"
+            "Railwayの環境変数ページでこれらを設定してください。",
+            ephemeral=True
+        )
+        return
+
+    new_state = not cfg.get("server_blacklist_enabled", False)
+    cfg["server_blacklist_enabled"] = new_state
+    save_data(all_data)
+
+    state_text = "[ON] 有効" if new_state else "[OFF] 無効"
+    await interaction.response.send_message(
+        f"サーバーブラックリスト機能を **{state_text}** にしました。",
+        ephemeral=True
+    )
+
+
+@server_blacklist_group.command(name="add", description="ブラックリストにDiscordサーバーIDを追加します")
+@app_commands.describe(server_id="BANの対象とするDiscordサーバーID")
+async def sbl_add(interaction: discord.Interaction, server_id: str):
+    if not await is_moderator(interaction):
+        return
+    if not interaction.guild:
+        return
+
+    try:
+        sid = int(server_id)
+    except ValueError:
+        await interaction.response.send_message("[NG] サーバーIDは数値で入力してください。", ephemeral=True)
+        return
+
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(interaction.guild.id))
+    bl = cfg.setdefault("server_blacklist_ids", [])
+
+    if sid in bl:
+        await interaction.response.send_message(f"[NG] サーバーID `{sid}` はすでに登録されています。", ephemeral=True)
+        return
+
+    bl.append(sid)
+    save_data(all_data)
+    await interaction.response.send_message(
+        f"[OK] サーバーID `{sid}` をブラックリストに追加しました。\n"
+        f"このサーバーに参加しているユーザーが自サーバーに入ると認証URLが送信されます。",
+        ephemeral=True
+    )
+
+
+@server_blacklist_group.command(name="remove", description="ブラックリストからDiscordサーバーIDを削除します")
+@app_commands.describe(server_id="削除するDiscordサーバーID")
+async def sbl_remove(interaction: discord.Interaction, server_id: str):
+    if not await is_moderator(interaction):
+        return
+    if not interaction.guild:
+        return
+
+    try:
+        sid = int(server_id)
+    except ValueError:
+        await interaction.response.send_message("[NG] サーバーIDは数値で入力してください。", ephemeral=True)
+        return
+
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(interaction.guild.id))
+    bl = cfg.get("server_blacklist_ids", [])
+
+    if sid not in bl:
+        await interaction.response.send_message(f"[NG] サーバーID `{sid}` はリストに存在しません。", ephemeral=True)
+        return
+
+    bl.remove(sid)
+    save_data(all_data)
+    await interaction.response.send_message(f"[OK] サーバーID `{sid}` をブラックリストから削除しました。", ephemeral=True)
+
+
+@server_blacklist_group.command(name="list", description="ブラックリストに登録されているサーバーID一覧を表示します")
+async def sbl_list(interaction: discord.Interaction):
+    if not await is_moderator(interaction):
+        return
+    if not interaction.guild:
+        return
+
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(interaction.guild.id))
+    bl = cfg.get("server_blacklist_ids", [])
+    enabled = cfg.get("server_blacklist_enabled", False)
+    action = cfg.get("server_blacklist_action", "ban")
+
+    embed = discord.Embed(
+        title="サーバーブラックリスト 設定状況",
+        color=discord.Color.red() if enabled else discord.Color.greyple()
+    )
+    embed.add_field(name="機能状態", value="[ON] 有効" if enabled else "[OFF] 無効", inline=True)
+    embed.add_field(name="処置", value="BAN" if action == "ban" else "キック", inline=True)
+    embed.add_field(name="OAuth2設定", value="[OK]" if OAUTH_REDIRECT_URI else "[NG] 未設定", inline=True)
+
+    if bl:
+        lines = [f"`{sid}`" for sid in bl]
+        embed.add_field(name=f"登録サーバーID ({len(bl)}件)", value="\n".join(lines[:20]), inline=False)
+    else:
+        embed.add_field(name="登録サーバーID", value="なし", inline=False)
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@server_blacklist_group.command(name="action", description="ブラックリスト対象者への処置を設定します")
+@app_commands.describe(action="ban: BAN / kick: キック")
+@app_commands.choices(action=[
+    app_commands.Choice(name="BAN（永久追放）", value="ban"),
+    app_commands.Choice(name="キック（退出のみ）", value="kick"),
+])
+async def sbl_action(interaction: discord.Interaction, action: str):
+    if not await is_moderator(interaction):
+        return
+    if not interaction.guild:
+        return
+
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(interaction.guild.id))
+    cfg["server_blacklist_action"] = action
+    save_data(all_data)
+
+    label = "BAN（永久追放）" if action == "ban" else "キック（退出のみ）"
+    await interaction.response.send_message(f"[OK] ブラックリスト対象者への処置を **{label}** に設定しました。", ephemeral=True)
+
+
+bot.tree.add_command(server_blacklist_group)
+
+
+# ====================================================================
+# OAuth2 コールバック Webサーバー（aiohttp）
+# ====================================================================
+
+async def _oauth2_callback_handler(request):
+    """
+    Discord OAuth2 コールバックエンドポイント。
+    ユーザーが認証を完了したときにここへリダイレクトされる。
+    stateを検証し、ユーザーの参加サーバー一覧を取得してBL照合を行う。
+    """
+    import hmac
+    import hashlib
+
+    code = request.rel_url.query.get("code")
+    state = request.rel_url.query.get("state")
+
+    if not code or not state:
+        return aiohttp.web.Response(
+            text="<html><body><h2>[NG] 無効なリクエストです。</h2></body></html>",
+            content_type="text/html"
+        )
+
+    # --- state の検証（HMAC署名確認） ---
+    try:
+        decoded = base64.urlsafe_b64decode(state.encode()).decode()
+        parts = decoded.split(":")
+        if len(parts) != 3:
+            raise ValueError("state フォーマット不正")
+        guild_id_str, user_id_str, sig = parts
+        guild_id = int(guild_id_str)
+        user_id = int(user_id_str)
+        expected_sig = hmac.new(
+            OAUTH_SECRET_KEY.encode(),
+            f"{guild_id_str}:{user_id_str}".encode(),
+            hashlib.sha256
+        ).hexdigest()
+        if not hmac.compare_digest(sig, expected_sig):
+            raise ValueError("署名不一致")
+    except Exception as e:
+        print(f"[OAuth2] state検証エラー: {e}")
+        return aiohttp.web.Response(
+            text="<html><body><h2>[NG] 認証トークンが無効です。もう一度やり直してください。</h2></body></html>",
+            content_type="text/html"
+        )
+
+    # --- Discord API に code を送りアクセストークンを取得 ---
+    async with aiohttp.ClientSession() as session:
+        token_res = await session.post(
+            "https://discord.com/api/v10/oauth2/token",
+            data={
+                "client_id": DISCORD_CLIENT_ID,
+                "client_secret": DISCORD_CLIENT_SECRET,
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": OAUTH_REDIRECT_URI,
+            },
+            headers={"Content-Type": "application/x-www-form-urlencoded"}
+        )
+        token_data = await token_res.json()
+
+    access_token = token_data.get("access_token")
+    if not access_token:
+        print(f"[OAuth2] トークン取得失敗: {token_data}")
+        return aiohttp.web.Response(
+            text="<html><body><h2>[NG] 認証に失敗しました。もう一度お試しください。</h2></body></html>",
+            content_type="text/html"
+        )
+
+    # --- アクセストークンでユーザーの参加サーバー一覧を取得 ---
+    async with aiohttp.ClientSession() as session:
+        guilds_res = await session.get(
+            "https://discord.com/api/v10/users/@me/guilds",
+            headers={"Authorization": f"Bearer {access_token}"}
+        )
+        user_guilds = await guilds_res.json()
+
+    if not isinstance(user_guilds, list):
+        return aiohttp.web.Response(
+            text="<html><body><h2>[NG] サーバー情報の取得に失敗しました。</h2></body></html>",
+            content_type="text/html"
+        )
+
+    user_guild_ids = {int(g["id"]) for g in user_guilds}
+
+    # --- ブラックリストとの照合 ---
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(guild_id))
+
+    if not cfg.get("server_blacklist_enabled", False):
+        # 機能が無効になっていれば認証OKとして終了
+        return aiohttp.web.Response(
+            text="<html><body><h2>[OK] 認証が完了しました。サーバーをお楽しみください！</h2></body></html>",
+            content_type="text/html"
+        )
+
+    blacklist_ids = set(cfg.get("server_blacklist_ids", []))
+    matched = user_guild_ids & blacklist_ids
+
+    target_guild = bot.get_guild(guild_id)
+    action = cfg.get("server_blacklist_action", "ban")
+    action_label = "BAN" if action == "ban" else "キック"
+
+    if matched:
+        # ブラックリスト対象サーバーに参加しているため処置を実行
+        matched_id_text = ", ".join(str(sid) for sid in matched)
+        print(f"[サーバーBL] ユーザー {user_id} がBL対象サーバー({matched_id_text})に在籍 -> {action_label} 実行")
+
+        if target_guild:
+            member = target_guild.get_member(user_id)
+            if member:
+                try:
+                    if action == "ban":
+                        await target_guild.ban(
+                            discord.Object(id=user_id),
+                            reason=f"サーバーBL: BL対象サーバー({matched_id_text})への参加を検出"
+                        )
+                    else:
+                        await member.kick(
+                            reason=f"サーバーBL: BL対象サーバー({matched_id_text})への参加を検出"
+                        )
+
+                    # ログチャンネルへ通知
+                    log_ch_id = cfg.get("server_blacklist_log_channel_id") or cfg.get("mod_log_channel_id")
+                    if log_ch_id:
+                        log_ch = target_guild.get_channel(log_ch_id)
+                        if log_ch:
+                            bl_embed = discord.Embed(
+                                title=f"[BL] サーバーブラックリスト - {action_label}実行",
+                                color=discord.Color.red()
+                            )
+                            bl_embed.add_field(
+                                name="対象ユーザー",
+                                value=f"<@{user_id}> (`{user_id}`)",
+                                inline=False
+                            )
+                            bl_embed.add_field(
+                                name="検出されたBL対象サーバーID",
+                                value=matched_id_text,
+                                inline=False
+                            )
+                            bl_embed.add_field(name="実行した処置", value=action_label, inline=True)
+                            bl_embed.timestamp = discord.utils.utcnow()
+                            try:
+                                await log_ch.send(embed=bl_embed)
+                            except Exception:
+                                pass
+
+                except Exception as e:
+                    print(f"[サーバーBL] {action_label}実行エラー: {e}")
+
+        return aiohttp.web.Response(
+            text=(
+                "<html><body>"
+                f"<h2>[BL] このサーバーには参加できません。</h2>"
+                f"<p>あなたは参加が制限されているサーバーに在籍しているため、{action_label}されました。</p>"
+                "</body></html>"
+            ),
+            content_type="text/html"
+        )
+    else:
+        # ブラックリスト対象サーバーに参加していない -> 認証OK
+        print(f"[サーバーBL] ユーザー {user_id} はBL対象サーバーに在籍なし -> 認証OK")
+        return aiohttp.web.Response(
+            text=(
+                "<html><body>"
+                "<h2>[OK] 認証が完了しました！</h2>"
+                "<p>サーバーに問題なく参加できます。このページを閉じてください。</p>"
+                "</body></html>"
+            ),
+            content_type="text/html"
+        )
+
+
+async def _start_web_server():
+    """aiohttp による OAuth2 コールバック受け取り用 Webサーバーを起動します。"""
+    app = aiohttp.web.Application()
+    app.router.add_get("/callback", _oauth2_callback_handler)
+    app.router.add_get("/", lambda req: aiohttp.web.Response(text="Bot is running."))
+    runner = aiohttp.web.AppRunner(app)
+    await runner.setup()
+    site = aiohttp.web.TCPSite(runner, "0.0.0.0", OAUTH_PORT)
+    await site.start()
+    print(f"[Webサーバー] OAuth2コールバックサーバーを起動しました（ポート: {OAUTH_PORT}）")
+
+
+# ====================================================================
 # Botの起動
 # ====================================================================
 
-bot.run(TOKEN)
+async def _main():
+    """BotとWebサーバーを同時に起動します。"""
+    # OAuth2設定が揃っている場合のみWebサーバーを起動
+    if DISCORD_CLIENT_ID and DISCORD_CLIENT_SECRET and OAUTH_REDIRECT_URI:
+        await _start_web_server()
+    else:
+        print("[警告] OAuth2の環境変数（DISCORD_CLIENT_ID / DISCORD_CLIENT_SECRET / OAUTH_REDIRECT_URI）が未設定のため、Webサーバーは起動しません。")
+        print("       サーバーブラックリスト機能を使用する場合は、これらの環境変数を設定してください。")
+
+    async with bot:
+        await bot.start(TOKEN)
+
+
+asyncio.run(_main())
