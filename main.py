@@ -3760,7 +3760,8 @@ async def help_command(interaction: discord.Interaction):
             "`/warnings` : 指定ユーザーの警告履歴を確認します\n"
             "`/server_stats` : サーバーの統計情報を表示します\n"
             "`/iplogger_check` : URLがIPロガーでないかチェックします\n"
-            "`/customcmd <名前>` : サーバーに登録されたカスタムコマンドを実行します"
+            "`/customcmd <名前>` : サーバーに登録されたカスタムコマンドを実行します\n"
+            "`/gift` : 自分のコインを他のユーザーに贈ります"
         ),
         inline=False
     )
@@ -7571,6 +7572,102 @@ async def economy_give(interaction: discord.Interaction, ユーザー: discord.M
         color=discord.Color.blue()
     )
     await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# --------------------------------------------------------------------
+# /gift — 他のユーザーへコインをギフト
+# --------------------------------------------------------------------
+
+@bot.tree.command(name="gift", description="自分のコインを他のユーザーに贈ります")
+@discord.app_commands.describe(
+    ユーザー="贈り先のユーザー",
+    金額="贈る金額（1以上）",
+    メッセージ="一言メッセージ（省略可）"
+)
+async def gift(
+    interaction: discord.Interaction,
+    ユーザー: discord.Member,
+    金額: app_commands.Range[int, 1, 999999999],
+    メッセージ: str = None,
+):
+    if not interaction.guild:
+        await interaction.response.send_message("このコマンドはサーバー内で実行してください。", ephemeral=True)
+        return
+
+    # 自分自身へのギフトは禁止
+    if ユーザー.id == interaction.user.id:
+        await interaction.response.send_message("自分自身にギフトはできません。", ephemeral=True)
+        return
+
+    # Bot へのギフトは禁止
+    if ユーザー.bot:
+        await interaction.response.send_message("Botにギフトはできません。", ephemeral=True)
+        return
+
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(interaction.guild.id))
+
+    if not cfg.get("economy_enabled", False):
+        await interaction.response.send_message(
+            "このサーバーでは経済システムが有効になっていません。",
+            ephemeral=True
+        )
+        return
+
+    sender_balance = get_balance(cfg, interaction.user.id)
+    if sender_balance < 金額:
+        await interaction.response.send_message(
+            f"所持金が不足しています。\n"
+            f"必要: {_format_currency(cfg, 金額)} / 所持: {_format_currency(cfg, sender_balance)}",
+            ephemeral=True
+        )
+        return
+
+    # 送信者から引いて受取人へ加算
+    add_balance(cfg, interaction.user.id, -金額)
+    add_balance(cfg, ユーザー.id, 金額)
+    save_data(all_data)
+
+    # ギフト受取通知を受取人にDMで送る（失敗しても握り潰す）
+    try:
+        dm_embed = discord.Embed(
+            title="[GIFT] コインを受け取りました！",
+            description=(
+                f"**{interaction.guild.name}** で {interaction.user.mention} から "
+                f"**{_format_currency(cfg, 金額)}** 受け取りました！"
+            ),
+            color=discord.Color.gold()
+        )
+        if メッセージ:
+            dm_embed.add_field(name="メッセージ", value=メッセージ, inline=False)
+        dm_embed.add_field(
+            name="現在の所持金",
+            value=_format_currency(cfg, get_balance(cfg, ユーザー.id)),
+            inline=True
+        )
+        dm_embed.set_footer(text=interaction.guild.name)
+        await ユーザー.send(embed=dm_embed)
+    except Exception:
+        pass
+
+    # 実行チャンネルに公開Embedで通知
+    result_embed = discord.Embed(
+        title="[GIFT] ギフト完了！",
+        description=(
+            f"{interaction.user.mention} → {ユーザー.mention}\n"
+            f"**{_format_currency(cfg, 金額)}** を贈りました！"
+        ),
+        color=discord.Color.gold()
+    )
+    if メッセージ:
+        result_embed.add_field(name="メッセージ", value=メッセージ, inline=False)
+    result_embed.add_field(
+        name="あなたの残り所持金",
+        value=_format_currency(cfg, get_balance(cfg, interaction.user.id)),
+        inline=True
+    )
+    result_embed.set_footer(text=f"送信者: {interaction.user}")
+    await interaction.response.send_message(embed=result_embed)
 
 
 # --------------------------------------------------------------------
