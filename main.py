@@ -3036,13 +3036,212 @@ async def _run_custom_triggers(message: discord.Message, guild_config: dict):
             return
 
 
+# ====================================================================
+# BOT へのDM ⇔ オーナー間メッセージリレー機能
+# ====================================================================
+#
+# ・一般ユーザーがBOTにDMを送ると、送信者名（とID）付きのembedでBOTオーナーへ転送される
+# ・オーナーは転送されたembedメッセージに「返信(Reply)」するか、
+#   `!reply <ユーザーID> <内容>` コマンドを使うことで、そのユーザーへBOTを通して返信できる
+#
+DM_RELAY_MAX_ENTRIES = 500  # 転送メッセージID -> 送信者ユーザーIDの対応表の最大保持件数
+
+
+def _remember_dm_relay(all_data: dict, forwarded_message_id: int, user_id: int):
+    """オーナーへ転送したメッセージIDと、元の送信者ユーザーIDの対応を記録します。"""
+    global_cfg = get_global_config(all_data)
+    relay_map = global_cfg.setdefault("dm_relay_map", {})
+    relay_map[str(forwarded_message_id)] = str(user_id)
+
+    # 対応表が肥大化しないよう、古いものから削除して件数を制限する
+    if len(relay_map) > DM_RELAY_MAX_ENTRIES:
+        for old_key in list(relay_map.keys())[: len(relay_map) - DM_RELAY_MAX_ENTRIES]:
+            del relay_map[old_key]
+
+
+async def _forward_dm_to_owner(message: discord.Message, owner_id: int):
+    """一般ユーザーからBOTへのDMを、送信者情報付きのembedでオーナーへ転送します。"""
+    try:
+        owner_user = bot.get_user(owner_id) or await bot.fetch_user(owner_id)
+    except Exception as e:
+        print(f"[DMリレー] オーナー情報の取得に失敗しました: {e}")
+        return
+
+    embed = discord.Embed(
+        title="📨 BOTにDMが届きました",
+        description=message.content if message.content else "(本文なし／添付ファイルのみ)",
+        color=discord.Color.blue(),
+        timestamp=message.created_at
+    )
+    embed.set_author(
+        name=f"{message.author} ({message.author.id})",
+        icon_url=message.author.display_avatar.url if message.author.display_avatar else discord.utils.MISSING
+    )
+    embed.set_footer(text="このメッセージに「返信」するか、!reply <ユーザーID> <内容> でこのユーザーへ返信できます")
+
+    # 添付ファイルの処理（画像はembedに表示、それ以外はそのままファイルとして転送）
+    files_to_send = []
+    image_url = None
+    extra_image_urls = []
+    try:
+        for a in message.attachments:
+            if a.content_type and a.content_type.startswith("image/") and image_url is None:
+                image_url = a.url
+            elif a.content_type and a.content_type.startswith("image/"):
+                extra_image_urls.append(a.url)
+            else:
+                files_to_send.append(await a.to_file())
+        if image_url:
+            embed.set_image(url=image_url)
+        if extra_image_urls:
+            embed.add_field(name="その他の添付画像", value="\n".join(extra_image_urls), inline=False)
+    except Exception as e:
+        print(f"[DMリレー] 添付ファイルの処理中にエラーが発生しました: {e}")
+
+    try:
+        sent_msg = await owner_user.send(embed=embed, files=files_to_send if files_to_send else None)
+    except discord.Forbidden:
+        print("[DMリレー] オーナーへの転送に失敗しました（オーナーがBOTからのDMを拒否しています）。")
+        return
+    except Exception as e:
+        print(f"[DMリレー] オーナーへの転送に失敗しました: {e}")
+        return
+
+    all_data = load_data()
+    _remember_dm_relay(all_data, sent_msg.id, message.author.id)
+    save_data(all_data)
+
+    try:
+        await message.add_reaction("📨")
+    except Exception:
+        pass
+
+
+async def _handle_owner_dm_reply(message: discord.Message) -> bool:
+    """
+    オーナーがBOTに送ったDMが、転送済みのユーザーメッセージへの「返信(Reply)」かどうかを判定し、
+    返信であれば対象ユーザーへ内容を送信します。
+    戻り値が True の場合、この関数内で処理が完結したことを示します（process_commandsを呼ぶ必要はありません）。
+    """
+    if not message.reference or not message.reference.message_id:
+        return False
+
+    all_data = load_data()
+    global_cfg = get_global_config(all_data)
+    relay_map = global_cfg.get("dm_relay_map", {})
+    target_user_id_str = relay_map.get(str(message.reference.message_id))
+
+    if not target_user_id_str:
+        return False
+
+    await _send_owner_reply_to_user(message, int(target_user_id_str))
+    return True
+
+
+async def _send_owner_reply_to_user(message: discord.Message, target_user_id: int):
+    """オーナーからの返信内容を、対象ユーザーへDMで送信します。"""
+    try:
+        target_user = bot.get_user(target_user_id) or await bot.fetch_user(target_user_id)
+    except Exception:
+        target_user = None
+
+    if target_user is None:
+        try:
+            await message.channel.send("[NG] 送信先のユーザーが見つかりませんでした。")
+        except Exception:
+            pass
+        return
+
+    content = message.content or None
+    try:
+        files = [await a.to_file() for a in message.attachments] if message.attachments else None
+    except Exception:
+        files = None
+
+    if not content and not files:
+        try:
+            await message.channel.send("[!] 送信する内容が空です。")
+        except Exception:
+            pass
+        return
+
+    try:
+        await target_user.send(content=content, files=files)
+        await message.add_reaction("✅")
+    except discord.Forbidden:
+        try:
+            await message.channel.send(f"[NG] {target_user} へのDM送信が拒否されました（DMをブロックしている可能性があります）。")
+        except Exception:
+            pass
+    except Exception as e:
+        try:
+            await message.channel.send(f"[NG] 送信中にエラーが発生しました: {e}")
+        except Exception:
+            pass
+
+
+async def _handle_dm_relay(message: discord.Message):
+    """BOT宛のDMを処理します（一般ユーザー→オーナー転送、オーナー→ユーザー返信）。"""
+    owner_id = await resolve_owner_id(bot)
+    if owner_id is None:
+        return
+
+    if message.author.id == owner_id:
+        # オーナーからのDM: 転送メッセージへの「返信」であれば対象ユーザーへ送信する
+        handled = await _handle_owner_dm_reply(message)
+        if not handled:
+            # 返信形式でなければ通常のコマンド（!reply <ID> <内容> や !sync 等）として処理する
+            await bot.process_commands(message)
+        return
+    else:
+        # 一般ユーザーからのDM: オーナーへ転送する
+        await _forward_dm_to_owner(message, owner_id)
+        return
+
+
+@bot.command(name="reply")
+async def reply_command(ctx: commands.Context, user_id: int, *, content: str = ""):
+    """
+    オーナー専用: BOTのDM内で `!reply <ユーザーID> <内容>` と送ることで、
+    指定したユーザーへBOTを通して返信します（転送embedへの「返信」操作の代替手段）。
+    """
+    if ctx.guild is not None:
+        return  # DM専用コマンド
+
+    owner_id = await resolve_owner_id(bot)
+    if owner_id is None or ctx.author.id != owner_id:
+        return
+
+    if not content and not ctx.message.attachments:
+        await ctx.send("[!] 使い方: `!reply <ユーザーID> <返信内容>`")
+        return
+
+    await _send_owner_reply_to_user(ctx.message, user_id)
+
+
+@reply_command.error
+async def reply_command_error(ctx: commands.Context, error):
+    if ctx.guild is not None:
+        return
+    if isinstance(error, (commands.MissingRequiredArgument, commands.BadArgument)):
+        await ctx.send("[!] 使い方: `!reply <ユーザーID> <返信内容>`")
+    else:
+        print(f"[!replyコマンドエラー] {error}")
+
+
 @bot.event
 async def on_message(message: discord.Message):
     """
     メッセージ受信時に呼び出されます。
     自動モデレーション（スパム・招待リンク・NGワード）、メッセージ転送、ロールメンションを処理します。
+    また、BOT宛のDM（オーナー⇔ユーザー間のメッセージリレー）も処理します。
     """
-    if message.author.bot or not message.guild:
+    if message.author.bot:
+        return
+
+    if not message.guild:
+        # ギルドに属さないメッセージ = DM -> オーナー⇔ユーザー間のリレー処理
+        await _handle_dm_relay(message)
         return
 
     guild_id_str = str(message.guild.id)
