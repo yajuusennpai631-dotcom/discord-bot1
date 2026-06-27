@@ -368,6 +368,8 @@ async def is_admin_or_allowed(interaction: discord.Interaction) -> bool:
         return True
 
     if not interaction.guild:
+        # DM・グループDMはBotオーナーのみ許可（上記でオーナーは通過済み）
+        await interaction.response.send_message("このコマンドを実行する権限がありません（管理者または許可ユーザー専用）。", ephemeral=True)
         return False
 
     if interaction.user.guild_permissions.administrator:
@@ -4016,9 +4018,26 @@ async def my_clip(interaction: discord.Interaction, action: discord.app_commands
 
 @bot.tree.command(name="say", description="Botに指定したメッセージを代わりに発言させます")
 async def say(interaction: discord.Interaction, message: str):
-    if not await is_admin_or_allowed(interaction): return
+    # DM・グループDMの場合はBotオーナーのみ許可、サーバー内は通常の権限チェック
+    owner_id = await resolve_owner_id(interaction.client)
+    if not interaction.guild:
+        # DM / グループDM
+        if interaction.user.id != owner_id:
+            await interaction.response.send_message("このコマンドを実行する権限がありません。", ephemeral=True)
+            return
+    else:
+        # サーバー内は従来の権限チェック
+        if not await is_admin_or_allowed(interaction):
+            return
+
     await interaction.response.send_message("メッセージを送信しました。", ephemeral=True)
-    await interaction.channel.send(message)
+
+    # DMチャンネルでは interaction.channel が None になる場合があるので followup で対処
+    if interaction.channel:
+        await interaction.channel.send(message)
+    else:
+        # DMチャンネルが取得できない場合はユーザーのDMへ直接送信
+        await interaction.user.send(message)
 
 
 @bot.tree.command(name="my_scan_channels", description="サーバーのチャンネル構造とカスタム権限をスキャンします")
