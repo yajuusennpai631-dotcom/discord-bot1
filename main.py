@@ -178,6 +178,7 @@ def get_guild_config(all_data: dict, guild_id_str: str) -> dict:
         ("server_blacklist_ids", []),           # BANの対象となるDiscordサーバーID一覧（int）
         ("server_blacklist_action", "ban"),     # 'ban' または 'kick'
         ("server_blacklist_log_channel_id", None),  # 処理結果を通知するチャンネルID
+        ("web_auth_verified_role_id", None),        # 認証完了時に付与するロールID
     ]:
         if key not in cfg:
             cfg[key] = default
@@ -8527,8 +8528,9 @@ async def sbl_action(interaction: discord.Interaction, action: str):
     await interaction.response.send_message(f"[OK] ブラックリスト対象者への処置を **{label}** に設定しました。", ephemeral=True)
 
 
-@server_blacklist_group.command(name="setup", description="このチャンネルにサーバーブラックリストのウェブ認証パネルを設置します")
-async def sbl_setup(interaction: discord.Interaction):
+@server_blacklist_group.command(name="setup", description="このチャンネルにウェブ認証パネルを設置します")
+@app_commands.describe(verified_role="認証完了時に付与するロール（省略可）")
+async def sbl_setup(interaction: discord.Interaction, verified_role: discord.Role = None):
     if not await is_moderator(interaction):
         return
     if not interaction.guild:
@@ -8545,6 +8547,10 @@ async def sbl_setup(interaction: discord.Interaction):
         )
         return
 
+    # 認証後付与ロールを保存（省略時は既存設定を維持）
+    if verified_role is not None:
+        cfg["web_auth_verified_role_id"] = verified_role.id
+
     embed = discord.Embed(
         title="サーバー入室認証",
         description=(
@@ -8554,17 +8560,32 @@ async def sbl_setup(interaction: discord.Interaction):
         ),
         color=discord.Color.blue()
     )
-    
+
     view = VerifyBlacklistButtonView()
-    
+
     await interaction.response.send_message("認証パネルを設置中...", ephemeral=True)
     panel_msg = await interaction.channel.send(embed=embed, view=view)
-    
+
     cfg["server_blacklist_verify_channel_id"] = interaction.channel.id
     cfg["server_blacklist_verify_message_id"] = panel_msg.id
     save_data(all_data)
-    
-    await interaction.edit_original_response(content="[OK] 認証パネルを設置しました！")
+
+    role_text = f"認証後付与ロール: {verified_role.mention}" if verified_role else "認証後付与ロール: 未設定"
+    await interaction.edit_original_response(content=f"[OK] 認証パネルを設置しました。{role_text}")
+
+
+@server_blacklist_group.command(name="role_clear", description="認証完了時に付与するロールの設定を解除します")
+async def sbl_role_clear(interaction: discord.Interaction):
+    if not await is_moderator(interaction):
+        return
+    if not interaction.guild:
+        return
+
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(interaction.guild.id))
+    cfg["web_auth_verified_role_id"] = None
+    save_data(all_data)
+    await interaction.response.send_message("[OK] 認証後付与ロールの設定を解除しました。", ephemeral=True)
 
 
 bot.tree.add_command(server_blacklist_group)
@@ -8573,6 +8594,37 @@ bot.tree.add_command(server_blacklist_group)
 # ====================================================================
 # OAuth2 コールバック Webサーバー（aiohttp）
 # ====================================================================
+
+async def _grant_verified_role(bot_client, guild_id: int, user_id: int, cfg: dict):
+    """
+    認証完了時に web_auth_verified_role_id で指定されたロールをメンバーへ付与します。
+    ロール未設定・メンバー不在・権限不足のいずれの場合もエラーにせず静かに終了します。
+    """
+    role_id = cfg.get("web_auth_verified_role_id")
+    if not role_id:
+        return
+
+    guild = bot_client.get_guild(guild_id)
+    if not guild:
+        return
+
+    member = guild.get_member(user_id)
+    if not member:
+        return
+
+    role = guild.get_role(role_id)
+    if not role:
+        print(f"[ウェブ認証] ロールID {role_id} がサーバーに存在しません。")
+        return
+
+    try:
+        await member.add_roles(role, reason="ウェブ認証完了によるロール付与")
+        print(f"[ウェブ認証] ユーザー {user_id} にロール「{role.name}」を付与しました。")
+    except discord.Forbidden:
+        print(f"[ウェブ認証] ロール付与権限がありません（ロール: {role.name}）。")
+    except Exception as e:
+        print(f"[ウェブ認証] ロール付与エラー: {e}")
+
 
 async def _oauth2_callback_handler(request):
     """
@@ -8659,7 +8711,8 @@ async def _oauth2_callback_handler(request):
     cfg = get_guild_config(all_data, str(guild_id))
 
     if not cfg.get("server_blacklist_enabled", False):
-        # 機能が無効になっていれば認証OKとして終了
+        # 機能が無効になっていれば認証OKとして終了（ロール付与のみ実行）
+        await _grant_verified_role(bot, guild_id, user_id, cfg)
         return aiohttp.web.Response(
             text="<html><body><h2>[OK] 認証が完了しました。サーバーをお楽しみください！</h2></body></html>",
             content_type="text/html"
@@ -8732,6 +8785,7 @@ async def _oauth2_callback_handler(request):
     else:
         # ブラックリスト対象サーバーに参加していない -> 認証OK
         print(f"[サーバーBL] ユーザー {user_id} はBL対象サーバーに在籍なし -> 認証OK")
+        await _grant_verified_role(bot, guild_id, user_id, cfg)
         return aiohttp.web.Response(
             text=(
                 "<html><body>"
