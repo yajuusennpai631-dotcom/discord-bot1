@@ -327,6 +327,9 @@ def get_global_config(all_data: dict) -> dict:
         cfg["global_msg_cooldown_seconds"] = 60
     if "global_msg_last_earned" not in cfg:
         cfg["global_msg_last_earned"] = {}  # {user_id_str: unix_timestamp}
+    # サーバーブラックリスト（全サーバー共通）
+    if "global_server_blacklist_ids" not in cfg:
+        cfg["global_server_blacklist_ids"] = []  # [server_id_int, ...]
     return cfg
 
 
@@ -3741,7 +3744,8 @@ async def on_member_join(member: discord.Member):
     # サーバーブラックリスト: 特定サーバー参加者を自動BAN/KICK
     # =========================================================
     if cfg.get("server_blacklist_enabled", False):
-        blacklist_ids = cfg.get("server_blacklist_ids", [])
+        global_bl_cfg = get_global_config(all_data)
+        blacklist_ids = global_bl_cfg.get("global_server_blacklist_ids", [])
         if blacklist_ids:
             # ユーザーにDMで認証チャンネルでの認証を促す
             verify_ch_id = cfg.get("server_blacklist_verify_channel_id")
@@ -8578,10 +8582,10 @@ async def sbl_toggle(interaction: discord.Interaction):
     )
 
 
-@server_blacklist_group.command(name="add", description="ブラックリストにDiscordサーバーIDを追加します")
+@server_blacklist_group.command(name="add", description="【オーナー専用・全サーバー共通】ブラックリストにDiscordサーバーIDを追加します")
 @app_commands.describe(server_id="BANの対象とするDiscordサーバーID")
 async def sbl_add(interaction: discord.Interaction, server_id: str):
-    if not await is_moderator(interaction):
+    if not await is_owner_check(interaction):
         return
     if not interaction.guild:
         return
@@ -8593,26 +8597,26 @@ async def sbl_add(interaction: discord.Interaction, server_id: str):
         return
 
     all_data = load_data()
-    cfg = get_guild_config(all_data, str(interaction.guild.id))
-    bl = cfg.setdefault("server_blacklist_ids", [])
+    global_cfg = get_global_config(all_data)
+    bl = global_cfg.setdefault("global_server_blacklist_ids", [])
 
     if sid in bl:
-        await interaction.response.send_message(f"[NG] サーバーID `{sid}` はすでに登録されています。", ephemeral=True)
+        await interaction.response.send_message(f"[NG] サーバーID `{sid}` はすでに全サーバー共通BLに登録されています。", ephemeral=True)
         return
 
     bl.append(sid)
     save_data(all_data)
     await interaction.response.send_message(
-        f"[OK] サーバーID `{sid}` をブラックリストに追加しました。\n"
-        f"このサーバーに参加しているユーザーが自サーバーに入ると認証URLが送信されます。",
+        f"[OK] サーバーID `{sid}` を**全サーバー共通**ブラックリストに追加しました。\n"
+        f"このサーバーに参加しているユーザーが、BL機能が有効なサーバーに入ると認証URLが送信されます。",
         ephemeral=True
     )
 
 
-@server_blacklist_group.command(name="remove", description="ブラックリストからDiscordサーバーIDを削除します")
+@server_blacklist_group.command(name="remove", description="【オーナー専用・全サーバー共通】ブラックリストからDiscordサーバーIDを削除します")
 @app_commands.describe(server_id="削除するDiscordサーバーID")
 async def sbl_remove(interaction: discord.Interaction, server_id: str):
-    if not await is_moderator(interaction):
+    if not await is_owner_check(interaction):
         return
     if not interaction.guild:
         return
@@ -8624,19 +8628,19 @@ async def sbl_remove(interaction: discord.Interaction, server_id: str):
         return
 
     all_data = load_data()
-    cfg = get_guild_config(all_data, str(interaction.guild.id))
-    bl = cfg.get("server_blacklist_ids", [])
+    global_cfg = get_global_config(all_data)
+    bl = global_cfg.get("global_server_blacklist_ids", [])
 
     if sid not in bl:
-        await interaction.response.send_message(f"[NG] サーバーID `{sid}` はリストに存在しません。", ephemeral=True)
+        await interaction.response.send_message(f"[NG] サーバーID `{sid}` は全サーバー共通BLに存在しません。", ephemeral=True)
         return
 
     bl.remove(sid)
     save_data(all_data)
-    await interaction.response.send_message(f"[OK] サーバーID `{sid}` をブラックリストから削除しました。", ephemeral=True)
+    await interaction.response.send_message(f"[OK] サーバーID `{sid}` を全サーバー共通ブラックリストから削除しました。", ephemeral=True)
 
 
-@server_blacklist_group.command(name="list", description="ブラックリストに登録されているサーバーID一覧を表示します")
+@server_blacklist_group.command(name="list", description="【全サーバー共通】ブラックリストに登録されているサーバーID一覧を表示します")
 async def sbl_list(interaction: discord.Interaction):
     if not await is_moderator(interaction):
         return
@@ -8644,24 +8648,28 @@ async def sbl_list(interaction: discord.Interaction):
         return
 
     all_data = load_data()
+    global_cfg = get_global_config(all_data)
     cfg = get_guild_config(all_data, str(interaction.guild.id))
-    bl = cfg.get("server_blacklist_ids", [])
+    bl = global_cfg.get("global_server_blacklist_ids", [])
     enabled = cfg.get("server_blacklist_enabled", False)
     action = cfg.get("server_blacklist_action", "ban")
 
     embed = discord.Embed(
         title="サーバーブラックリスト 設定状況",
+        description="BL対象サーバーIDは**全サーバー共通**です。ON/OFFと処置はこのサーバー個別の設定です。",
         color=discord.Color.red() if enabled else discord.Color.greyple()
     )
-    embed.add_field(name="機能状態", value="[ON] 有効" if enabled else "[OFF] 無効", inline=True)
-    embed.add_field(name="処置", value="BAN" if action == "ban" else "キック", inline=True)
+    embed.add_field(name="このサーバーの機能状態", value="[ON] 有効" if enabled else "[OFF] 無効", inline=True)
+    embed.add_field(name="このサーバーの処置", value="BAN" if action == "ban" else "キック", inline=True)
     embed.add_field(name="OAuth2設定", value="[OK]" if OAUTH_REDIRECT_URI else "[NG] 未設定", inline=True)
 
     if bl:
         lines = [f"`{sid}`" for sid in bl]
-        embed.add_field(name=f"登録サーバーID ({len(bl)}件)", value="\n".join(lines[:20]), inline=False)
+        embed.add_field(name=f"共通BL登録サーバーID ({len(bl)}件)", value="\n".join(lines[:20]), inline=False)
+        if len(bl) > 20:
+            embed.set_footer(text=f"先頭20件を表示 / 全{len(bl)}件")
     else:
-        embed.add_field(name="登録サーバーID", value="なし", inline=False)
+        embed.add_field(name="共通BL登録サーバーID", value="なし", inline=False)
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -8959,7 +8967,9 @@ async def _oauth2_callback_handler(request):
             sub="このページを閉じてサーバーをお楽しみください。"
         )
 
-    blacklist_ids = set(cfg.get("server_blacklist_ids", []))
+    # BL対象IDは全サーバー共通リストから取得
+    global_cfg_bl = get_global_config(all_data)
+    blacklist_ids = set(global_cfg_bl.get("global_server_blacklist_ids", []))
     matched = user_guild_ids & blacklist_ids
 
     target_guild = bot.get_guild(guild_id)
