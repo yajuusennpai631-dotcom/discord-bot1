@@ -18,6 +18,7 @@ import time
 import discord
 from discord.ext import commands
 import aiohttp
+import aiohttp.web
 import io
 from discord import app_commands
 
