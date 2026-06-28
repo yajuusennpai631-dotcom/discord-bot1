@@ -8638,10 +8638,85 @@ async def _oauth2_callback_handler(request):
     code = request.rel_url.query.get("code")
     state = request.rel_url.query.get("state")
 
+    def _html_page(title: str, message: str, sub: str = "", ok: bool = True) -> aiohttp.web.Response:
+        """認証結果ページのHTMLを生成して返します。"""
+        color_main = "#5865F2" if ok else "#ED4245"
+        color_bg   = "#23272A"
+        color_card = "#2C2F33"
+        color_text = "#FFFFFF"
+        color_sub  = "#B9BBBE"
+        icon = "&#10003;" if ok else "&#10007;"
+        html = f"""<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{title}</title>
+  <style>
+    * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+    body {{
+      background: {color_bg};
+      color: {color_text};
+      font-family: "Helvetica Neue", Arial, "Hiragino Kaku Gothic ProN", "Meiryo", sans-serif;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+    }}
+    .card {{
+      background: {color_card};
+      border-radius: 12px;
+      padding: 48px 40px;
+      max-width: 440px;
+      width: 90%;
+      text-align: center;
+      box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+    }}
+    .icon {{
+      width: 72px;
+      height: 72px;
+      border-radius: 50%;
+      background: {color_main};
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 36px;
+      margin: 0 auto 24px;
+    }}
+    h1 {{
+      font-size: 22px;
+      font-weight: 700;
+      margin-bottom: 12px;
+      color: {color_text};
+    }}
+    p {{
+      font-size: 14px;
+      color: {color_sub};
+      line-height: 1.6;
+    }}
+    .sub {{
+      margin-top: 16px;
+      font-size: 13px;
+      color: {color_sub};
+    }}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="icon">{icon}</div>
+    <h1>{message}</h1>
+    {f'<p class="sub">{sub}</p>' if sub else ""}
+  </div>
+</body>
+</html>"""
+        return aiohttp.web.Response(text=html, content_type="text/html")
+
     if not code or not state:
-        return aiohttp.web.Response(
-            text="<html><body><h2>[NG] 無効なリクエストです。</h2></body></html>",
-            content_type="text/html"
+        return _html_page(
+            title="認証エラー",
+            message="無効なリクエストです",
+            sub="このページを閉じて、Discordのパネルから再度お試しください。",
+            ok=False
         )
 
     # --- state の検証（HMAC署名確認） ---
@@ -8662,9 +8737,11 @@ async def _oauth2_callback_handler(request):
             raise ValueError("署名不一致")
     except Exception as e:
         print(f"[OAuth2] state検証エラー: {e}")
-        return aiohttp.web.Response(
-            text="<html><body><h2>[NG] 認証トークンが無効です。もう一度やり直してください。</h2></body></html>",
-            content_type="text/html"
+        return _html_page(
+            title="認証エラー",
+            message="認証トークンが無効です",
+            sub="リンクの有効期限が切れている可能性があります。Discordのパネルから再度お試しください。",
+            ok=False
         )
 
     # --- Discord API に code を送りアクセストークンを取得 ---
@@ -8685,9 +8762,11 @@ async def _oauth2_callback_handler(request):
     access_token = token_data.get("access_token")
     if not access_token:
         print(f"[OAuth2] トークン取得失敗: {token_data}")
-        return aiohttp.web.Response(
-            text="<html><body><h2>[NG] 認証に失敗しました。もう一度お試しください。</h2></body></html>",
-            content_type="text/html"
+        return _html_page(
+            title="認証エラー",
+            message="認証に失敗しました",
+            sub="時間をおいてから再度お試しください。",
+            ok=False
         )
 
     # --- アクセストークンでユーザーの参加サーバー一覧を取得 ---
@@ -8699,9 +8778,11 @@ async def _oauth2_callback_handler(request):
         user_guilds = await guilds_res.json()
 
     if not isinstance(user_guilds, list):
-        return aiohttp.web.Response(
-            text="<html><body><h2>[NG] サーバー情報の取得に失敗しました。</h2></body></html>",
-            content_type="text/html"
+        return _html_page(
+            title="認証エラー",
+            message="サーバー情報の取得に失敗しました",
+            sub="時間をおいてから再度お試しください。",
+            ok=False
         )
 
     user_guild_ids = {int(g["id"]) for g in user_guilds}
@@ -8713,9 +8794,10 @@ async def _oauth2_callback_handler(request):
     if not cfg.get("server_blacklist_enabled", False):
         # 機能が無効になっていれば認証OKとして終了（ロール付与のみ実行）
         await _grant_verified_role(bot, guild_id, user_id, cfg)
-        return aiohttp.web.Response(
-            text="<html><body><h2>[OK] 認証が完了しました。サーバーをお楽しみください！</h2></body></html>",
-            content_type="text/html"
+        return _html_page(
+            title="認証完了",
+            message="認証完了",
+            sub="このページを閉じてサーバーをお楽しみください。"
         )
 
     blacklist_ids = set(cfg.get("server_blacklist_ids", []))
@@ -8773,27 +8855,20 @@ async def _oauth2_callback_handler(request):
                 except Exception as e:
                     print(f"[サーバーBL] {action_label}実行エラー: {e}")
 
-        return aiohttp.web.Response(
-            text=(
-                "<html><body>"
-                f"<h2>[BL] このサーバーには参加できません。</h2>"
-                f"<p>あなたは参加が制限されているサーバーに在籍しているため、{action_label}されました。</p>"
-                "</body></html>"
-            ),
-            content_type="text/html"
+        return _html_page(
+            title="参加不可",
+            message="このサーバーには参加できません",
+            sub=f"参加が制限されているサーバーへの在籍が確認されたため、{action_label}されました。",
+            ok=False
         )
     else:
         # ブラックリスト対象サーバーに参加していない -> 認証OK
         print(f"[サーバーBL] ユーザー {user_id} はBL対象サーバーに在籍なし -> 認証OK")
         await _grant_verified_role(bot, guild_id, user_id, cfg)
-        return aiohttp.web.Response(
-            text=(
-                "<html><body>"
-                "<h2>[OK] 認証が完了しました！</h2>"
-                "<p>サーバーに問題なく参加できます。このページを閉じてください。</p>"
-                "</body></html>"
-            ),
-            content_type="text/html"
+        return _html_page(
+            title="認証完了",
+            message="認証完了",
+            sub="このページを閉じてサーバーをお楽しみください。"
         )
 
 
