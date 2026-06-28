@@ -137,6 +137,7 @@ def get_guild_config(all_data: dict, guild_id_str: str) -> dict:
         ("mod_log_channel_id", None),
         ("custom_triggers", []),
         ("custom_commands", {}),
+        ("allowed_roles", []),
         ("welcome_channel_id", None),
         ("welcome_message", None),
         ("welcome_role_id", None),
@@ -475,7 +476,14 @@ async def is_admin_or_allowed(interaction: discord.Interaction) -> bool:
     cfg = get_guild_config(all_data, str(interaction.guild.id))
     if interaction.user.id in cfg.get("allowed_users", []):
         return True
-        
+
+    # 許可ロールを持っているか確認
+    allowed_role_ids = set(cfg.get("allowed_roles", []))
+    if allowed_role_ids:
+        user_role_ids = {r.id for r in interaction.user.roles}
+        if user_role_ids & allowed_role_ids:
+            return True
+
     await interaction.response.send_message("このコマンドを実行する権限がありません（管理者または許可ユーザー専用）。", ephemeral=True)
     return False
 
@@ -506,6 +514,13 @@ async def is_moderator(interaction: discord.Interaction) -> bool:
     cfg = get_guild_config(all_data, str(interaction.guild.id))
     if user_id in cfg.get("allowed_users", []):
         return True
+
+    # 許可ロールを持っているか確認
+    allowed_role_ids = set(cfg.get("allowed_roles", []))
+    if allowed_role_ids:
+        user_role_ids = {r.id for r in interaction.user.roles}
+        if user_role_ids & allowed_role_ids:
+            return True
 
     await interaction.response.send_message(
         "このコマンドを実行する権限がありません（モデレーター権限が必要です）。", ephemeral=True
@@ -3068,6 +3083,12 @@ def _is_automod_target(author: discord.Member, guild_config: dict, all_data: dic
         return False
     if author.id in guild_config.get("allowed_users", []):
         return False
+    # 許可ロールを持っているか確認
+    allowed_role_ids = set(guild_config.get("allowed_roles", []))
+    if allowed_role_ids:
+        user_role_ids = {r.id for r in author.roles}
+        if user_role_ids & allowed_role_ids:
+            return False
     if author.id == bot.owner_id:
         return False
     global_cfg = get_global_config(all_data)
@@ -4005,6 +4026,13 @@ async def help_command(interaction: discord.Interaction):
         cfg = get_guild_config(all_data, str(interaction.guild.id))
         if interaction.user.id in cfg.get("allowed_users", []):
             is_allowed = True
+        # 許可ロールによる権限確認
+        if not is_allowed:
+            allowed_role_ids = set(cfg.get("allowed_roles", []))
+            if allowed_role_ids:
+                user_role_ids = {r.id for r in interaction.user.roles}
+                if user_role_ids & allowed_role_ids:
+                    is_allowed = True
 
     embed = discord.Embed(
         title="マクマクBOT コマンド一覧",
@@ -4468,6 +4496,180 @@ async def server_list_users(interaction: discord.Interaction):
     config = get_guild_config(all_data, g_id)
     embed = create_user_list_embed(config.get("allowed_users", []))
     await interaction.response.send_message(embed=embed, view=UserManageView(), ephemeral=True)
+
+
+# --------------------------------------------------------------------
+# /role_permission_add — ロールへのサーバー管理コマンド権限付与
+# --------------------------------------------------------------------
+
+@bot.tree.command(
+    name="role_permission_add",
+    description="【管理者専用】指定ロールにサーバー管理コマンドの使用権限を付与します"
+)
+@discord.app_commands.describe(
+    role="権限を付与するロール"
+)
+async def role_permission_add(interaction: discord.Interaction, role: discord.Role):
+    """
+    指定したロールを「許可ロールリスト」に追加します。
+    このリストに登録されたロールを持つメンバーは、
+    サーバー管理者（Administrator）と同等の権限でMAKUMAKUBOTの管理コマンドを実行できます。
+    実行にはサーバー管理者権限が必要です。
+    """
+    if not await is_guild_admin(interaction):
+        return
+    if not interaction.guild:
+        return
+
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(interaction.guild.id))
+    allowed_roles: list = cfg.setdefault("allowed_roles", [])
+
+    if role.id in allowed_roles:
+        await interaction.response.send_message(
+            f"{role.mention} はすでに許可ロールリストに登録されています。",
+            ephemeral=True
+        )
+        return
+
+    allowed_roles.append(role.id)
+    save_data(all_data)
+
+    embed = discord.Embed(
+        title="✅ 許可ロール追加",
+        description=(
+            f"{role.mention} をMAKUMAKUBOTの管理コマンド許可ロールに追加しました。\n\n"
+            "このロールを持つメンバーは、サーバー管理者と同様に\n"
+            "BOTの管理・モデレーションコマンドを実行できます。"
+        ),
+        color=discord.Color.green()
+    )
+    embed.add_field(name="対象ロール", value=f"{role.mention} (`{role.id}`)", inline=True)
+    embed.add_field(name="登録者", value=interaction.user.mention, inline=True)
+    embed.add_field(
+        name="現在の許可ロール一覧",
+        value="\n".join([f"・<@&{rid}>" for rid in allowed_roles]) or "なし",
+        inline=False
+    )
+    embed.set_footer(text="/role_permission_list で確認 | /role_permission_remove で削除")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# --------------------------------------------------------------------
+# /role_permission_remove — ロールの管理コマンド権限を剥奪
+# --------------------------------------------------------------------
+
+@bot.tree.command(
+    name="role_permission_remove",
+    description="【管理者専用】指定ロールからサーバー管理コマンドの使用権限を削除します"
+)
+@discord.app_commands.describe(
+    role="権限を削除するロール"
+)
+async def role_permission_remove(interaction: discord.Interaction, role: discord.Role):
+    """
+    指定したロールを「許可ロールリスト」から削除します。
+    削除後、そのロールを持つメンバーはBOT管理コマンドを実行できなくなります。
+    実行にはサーバー管理者権限が必要です。
+    """
+    if not await is_guild_admin(interaction):
+        return
+    if not interaction.guild:
+        return
+
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(interaction.guild.id))
+    allowed_roles: list = cfg.get("allowed_roles", [])
+
+    if role.id not in allowed_roles:
+        await interaction.response.send_message(
+            f"{role.mention} は許可ロールリストに登録されていません。",
+            ephemeral=True
+        )
+        return
+
+    allowed_roles.remove(role.id)
+    save_data(all_data)
+
+    embed = discord.Embed(
+        title="🗑️ 許可ロール削除",
+        description=(
+            f"{role.mention} をMAKUMAKUBOTの管理コマンド許可ロールから削除しました。\n"
+            "このロールのメンバーは、今後BOT管理コマンドを実行できません。"
+        ),
+        color=discord.Color.red()
+    )
+    embed.add_field(name="削除したロール", value=f"{role.mention} (`{role.id}`)", inline=True)
+    embed.add_field(name="実行者", value=interaction.user.mention, inline=True)
+    remaining = cfg.get("allowed_roles", [])
+    embed.add_field(
+        name="残りの許可ロール",
+        value="\n".join([f"・<@&{rid}>" for rid in remaining]) or "なし（管理者のみ使用可能）",
+        inline=False
+    )
+    embed.set_footer(text="/role_permission_list で確認")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# --------------------------------------------------------------------
+# /role_permission_list — 許可ロール一覧の確認
+# --------------------------------------------------------------------
+
+@bot.tree.command(
+    name="role_permission_list",
+    description="【管理者専用】管理コマンドの使用権限が付与されているロール一覧を確認します"
+)
+async def role_permission_list(interaction: discord.Interaction):
+    """
+    現在「許可ロールリスト」に登録されているロールの一覧を表示します。
+    実行にはサーバー管理者権限が必要です。
+    """
+    if not await is_guild_admin(interaction):
+        return
+    if not interaction.guild:
+        return
+
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(interaction.guild.id))
+    allowed_roles: list = cfg.get("allowed_roles", [])
+    allowed_users: list = cfg.get("allowed_users", [])
+
+    embed = discord.Embed(
+        title="🔐 BOT管理コマンド 権限付与一覧",
+        description=(
+            "以下のロール・ユーザーはサーバー管理者と同様に\n"
+            "MAKUMAKUBOTの管理・モデレーションコマンドを実行できます。\n"
+            "※サーバー管理者（Administratorパーミッション所持者）は登録不要で常に使用可能です。"
+        ),
+        color=discord.Color.blue()
+    )
+
+    # 許可ロール
+    if allowed_roles:
+        valid_roles = []
+        for rid in allowed_roles:
+            r = interaction.guild.get_role(rid)
+            valid_roles.append(r.mention if r else f"~~削除済みロール(`{rid}`)~~")
+        embed.add_field(
+            name=f"📋 許可ロール（{len(allowed_roles)}件）",
+            value="\n".join([f"・{v}" for v in valid_roles]),
+            inline=False
+        )
+    else:
+        embed.add_field(name="📋 許可ロール", value="登録なし", inline=False)
+
+    # 許可ユーザー（既存機能も合わせて表示）
+    if allowed_users:
+        embed.add_field(
+            name=f"👤 許可ユーザー（{len(allowed_users)}件）",
+            value="\n".join([f"・<@{uid}>" for uid in allowed_users]),
+            inline=False
+        )
+    else:
+        embed.add_field(name="👤 許可ユーザー", value="登録なし", inline=False)
+
+    embed.set_footer(text="/role_permission_add でロール追加 | /server_list_users でユーザー管理")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 @bot.tree.command(name="server_create_channel", description="新しいテキストチャンネルを作成します")
