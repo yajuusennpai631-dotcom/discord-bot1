@@ -305,6 +305,11 @@ def get_global_config(all_data: dict) -> dict:
         cfg["global_bank"] = {}       # {user_id_str: int} 銀行預け入れ残高
     if "global_last_work" not in cfg:
         cfg["global_last_work"] = {}  # {user_id_str: unix_timestamp}
+    if "global_last_sell" not in cfg:
+        cfg["global_last_sell"] = {}  # {user_id_str: unix_timestamp} 売る機能（週1回）
+    # ブラックリスト掲載チャンネル（サーバーごとに設定）
+    if "troll_board_channel_id" not in cfg:
+        cfg["troll_board_channel_id"] = {}  # {guild_id_str: channel_id_int}
     # グローバルコイン設定（オーナーのみ変更可能）
     if "global_coin_name" not in cfg:
         cfg["global_coin_name"] = "Mコイン"
@@ -359,18 +364,21 @@ def add_to_troll_list(all_data: dict, member: discord.Member, guild: discord.Gui
     uid_str = str(member.id)
     avatar_url = str(member.display_avatar.url) if member.display_avatar else ""
     guild_id_str = str(guild.id)
+    account_link = f"https://discord.com/users/{member.id}"
     if uid_str in troll_list:
         entry = troll_list[uid_str]
         if guild_id_str not in entry.get("banned_in", []):
             entry.setdefault("banned_in", []).append(guild_id_str)
-        # アバターURL・ユーザー名は最新情報で更新
+        # アバターURL・ユーザー名・アカウントリンクは最新情報で更新
         entry["username"] = str(member)
         entry["avatar_url"] = avatar_url
+        entry["account_link"] = account_link
     else:
         troll_list[uid_str] = {
             "username": str(member),
             "user_id": member.id,
             "avatar_url": avatar_url,
+            "account_link": account_link,
             "reason": reason,
             "date": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "banned_in": [guild_id_str],
@@ -4843,8 +4851,10 @@ class BanTrollListView(discord.ui.View):
     @discord.ui.button(label="荒らしリストに追加する", style=discord.ButtonStyle.danger)
     async def add_to_list(self, interaction: discord.Interaction, button: discord.ui.Button):
         all_data = load_data()
+        uid_str = str(self.member.id)
         add_to_troll_list(all_data, self.member, self.guild, reason=f"/ban コマンド: {self.reason}")
         save_data(all_data)
+        await _post_troll_board(all_data, uid_str)
         for item in self.children:
             item.disabled = True
         await interaction.response.edit_message(
@@ -7897,6 +7907,8 @@ class RoleShopBuyButton(discord.ui.Button):
 
         all_data = load_data()
         cfg = get_guild_config(all_data, str(interaction.guild.id))
+        global_cfg = get_global_config(all_data)
+        coin_name = global_cfg.get("global_coin_name", "Mコイン")
 
         shop_items = cfg.get("role_shop", [])
         item = next((i for i in shop_items if i["id"] == self.item_id), None)
@@ -7917,11 +7929,11 @@ class RoleShopBuyButton(discord.ui.Button):
             await interaction.response.send_message("このロールは既に購入済みです。", ephemeral=True)
             return
 
-        user_balance = get_balance(cfg, interaction.user.id)
+        user_balance = get_global_balance(all_data, interaction.user.id)
         if user_balance < item["price"]:
             await interaction.response.send_message(
-                f"所持金が不足しています。必要: {_format_currency(cfg, item['price'])} / "
-                f"所持: {_format_currency(cfg, user_balance)}",
+                f"Mコインが不足しています。必要: {item['price']:,} {coin_name} / "
+                f"所持: {user_balance:,} {coin_name}",
                 ephemeral=True
             )
             return
@@ -7934,12 +7946,13 @@ class RoleShopBuyButton(discord.ui.Button):
             )
             return
 
-        add_balance(cfg, interaction.user.id, -item["price"])
+        add_global_balance(all_data, interaction.user.id, -item["price"])
         user_owned.append(item["id"])
         save_data(all_data)
 
+        new_balance = get_global_balance(all_data, interaction.user.id)
         await interaction.response.send_message(
-            f"[OK] **{role.name}** を購入しました！ 残り所持金: {_format_currency(cfg, get_balance(cfg, interaction.user.id))}",
+            f"[OK] **{role.name}** を購入しました！ 残り所持Mコイン: {new_balance:,} {coin_name}",
             ephemeral=True
         )
 
@@ -7954,11 +7967,15 @@ class RoleShopView(discord.ui.View):
             self.add_item(RoleShopBuyButton(item))
 
 
-def _build_role_shop_embed(guild_config: dict, guild: discord.Guild) -> discord.Embed:
+def _build_role_shop_embed(guild_config: dict, guild: discord.Guild, all_data: dict = None) -> discord.Embed:
     shop_items = guild_config.get("role_shop", [])
+    if all_data is None:
+        all_data = load_data()
+    global_cfg = get_global_config(all_data)
+    coin_name = global_cfg.get("global_coin_name", "Mコイン")
     embed = discord.Embed(
         title="[SHOP] ロールショップ",
-        description="ボタンを押すとロールを購入できます。" if shop_items else "現在、販売中のロールはありません。",
+        description=f"ボタンを押すとロールを購入できます（支払い: {coin_name}）。" if shop_items else "現在、販売中のロールはありません。",
         color=discord.Color.purple()
     )
     for item in shop_items:
@@ -7966,7 +7983,7 @@ def _build_role_shop_embed(guild_config: dict, guild: discord.Guild) -> discord.
         role_text = role.mention if role else "（ロール削除済み）"
         embed.add_field(
             name=f"{item['name']}（ID: {item['id']}）",
-            value=f"{role_text}\n価格: {item['price']:,}",
+            value=f"{role_text}\n価格: {item['price']:,} {coin_name}",
             inline=True
         )
     return embed
@@ -8127,6 +8144,8 @@ class VendingBuyButton(discord.ui.Button):
 
         all_data = load_data()
         cfg = get_guild_config(all_data, str(interaction.guild.id))
+        global_cfg = get_global_config(all_data)
+        coin_name = global_cfg.get("global_coin_name", "Mコイン")
 
         items = cfg.get("vending_items", [])
         item = next((i for i in items if i["id"] == self.item_id), None)
@@ -8138,11 +8157,11 @@ class VendingBuyButton(discord.ui.Button):
             await interaction.response.send_message("この商品は売り切れです。", ephemeral=True)
             return
 
-        user_balance = get_balance(cfg, interaction.user.id)
+        user_balance = get_global_balance(all_data, interaction.user.id)
         if user_balance < item["price"]:
             await interaction.response.send_message(
-                f"所持金が不足しています。必要: {_format_currency(cfg, item['price'])} / "
-                f"所持: {_format_currency(cfg, user_balance)}",
+                f"Mコインが不足しています。必要: {item['price']:,} {coin_name} / "
+                f"所持: {user_balance:,} {coin_name}",
                 ephemeral=True
             )
             return
@@ -8164,9 +8183,9 @@ class VendingBuyButton(discord.ui.Button):
         else:
             content_text = item.get("content", "（内容が設定されていません）")
 
-        # 在庫減算・所持金減算
+        # 在庫減算・Mコイン減算（グローバル）
         item["stock"] -= 1
-        add_balance(cfg, interaction.user.id, -item["price"])
+        add_global_balance(all_data, interaction.user.id, -item["price"])
         save_data(all_data)
 
         # 購入内容はDMで送付（失敗時はephemeralメッセージにフォールバック）
@@ -8221,11 +8240,15 @@ class VendingMachineView(discord.ui.View):
             self.add_item(VendingBuyButton(item))
 
 
-def _build_vending_embed(guild_config: dict) -> discord.Embed:
+def _build_vending_embed(guild_config: dict, all_data: dict = None) -> discord.Embed:
     items = guild_config.get("vending_items", [])
+    if all_data is None:
+        all_data = load_data()
+    global_cfg = get_global_config(all_data)
+    coin_name = global_cfg.get("global_coin_name", "Mコイン")
     embed = discord.Embed(
         title="[VEND] 自販機",
-        description="ボタンを押すと商品を購入できます。内容（テキスト／ファイル）はDMで送付されます。" if items else "現在、販売中の商品はありません。",
+        description=f"ボタンを押すと商品を購入できます（支払い: {coin_name}）。内容（テキスト／ファイル）はDMで送付されます。" if items else "現在、販売中の商品はありません。",
         color=discord.Color.teal()
     )
     for item in items:
@@ -8233,7 +8256,7 @@ def _build_vending_embed(guild_config: dict) -> discord.Embed:
         type_label = "ファイル" if item.get("type") == "file" else "テキスト"
         embed.add_field(
             name=f"{item['name']}（ID: {item['id']}）",
-            value=f"価格: {item['price']:,}\n在庫: {stock if stock > 0 else '売り切れ'}\n種別: {type_label}",
+            value=f"価格: {item['price']:,} {coin_name}\n在庫: {stock if stock > 0 else '売り切れ'}\n種別: {type_label}",
             inline=True
         )
     return embed
@@ -8966,6 +8989,7 @@ async def _oauth2_callback_handler(request):
                             reason=f"サーバーBL: BL対象サーバー({matched_id_text})への参加を検出"
                         )
                         save_data(all_data_fresh)
+                        await _post_troll_board(all_data_fresh, str(member.id))
                         print(f"[荒らしリスト] {member} を荒らしリストに追加しました。")
                     else:
                         await member.kick(
@@ -9267,6 +9291,8 @@ async def troll_list(
             embed.set_thumbnail(url=entry["avatar_url"])
         embed.add_field(name="ユーザー名", value=entry.get("username", "不明"), inline=True)
         embed.add_field(name="ユーザーID", value=f"`{target_id}`", inline=True)
+        if entry.get("account_link"):
+            embed.add_field(name="アカウントリンク", value=entry["account_link"], inline=False)
         embed.add_field(name="BAN理由", value=entry.get("reason", "不明"), inline=False)
         embed.add_field(name="登録日時", value=entry.get("date", "不明")[:19].replace("T", " "), inline=True)
         banned_in = entry.get("banned_in", [])
@@ -9298,20 +9324,24 @@ async def troll_list(
             uid_str = str(ユーザー.id)
             username = str(ユーザー)
             avatar_url = str(ユーザー.display_avatar.url) if ユーザー.display_avatar else ""
+            account_link = f"https://discord.com/users/{ユーザー.id}"
         else:
             uid_str = ユーザーid.strip()
             username = f"ID:{uid_str}"
             avatar_url = ""
+            account_link = f"https://discord.com/users/{uid_str}" if uid_str.isdigit() else ""
 
         troll_dict[uid_str] = {
             "username": username,
             "user_id": int(uid_str) if uid_str.isdigit() else 0,
             "avatar_url": avatar_url,
+            "account_link": account_link,
             "reason": 理由 or "手動追加",
             "date": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "banned_in": [str(interaction.guild.id)] if interaction.guild else [],
         }
         save_data(all_data)
+        await _post_troll_board(all_data, uid_str)
         await interaction.response.send_message(
             f"荒らしリストに `{username}` (`{uid_str}`) を追加しました。",
             ephemeral=True
@@ -9461,6 +9491,172 @@ async def automod_badge_setup(interaction: discord.Interaction):
     )
     embed.set_footer(text="作成されたルールはDiscordのサーバー設定 > AutoMod から確認・編集できます")
     await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+# --------------------------------------------------------------------
+# /sell — 週に一回、Mコインを売ってポイントを得る機能
+# --------------------------------------------------------------------
+
+SELL_COOLDOWN_SECONDS = 7 * 24 * 3600  # 1週間
+
+@bot.tree.command(name="sell", description="週に一回、Mコインを売ってポイントを受け取ります")
+@discord.app_commands.describe(amount="売るMコインの枚数（1以上）")
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=False)
+async def sell(interaction: discord.Interaction, amount: int):
+    """
+    週に一回、所持しているMコインを売ってボーナスコインを受け取れます。
+    売却レートは所持数の10%が追加報酬として付与されます。
+    クールダウンは全サーバー共通（7日間）です。
+    """
+    if amount < 1:
+        await interaction.response.send_message("1以上の枚数を指定してください。", ephemeral=True)
+        return
+
+    all_data = load_data()
+    global_cfg = get_global_config(all_data)
+    coin_name = global_cfg.get("global_coin_name", "Mコイン")
+    uid_str = str(interaction.user.id)
+
+    # クールダウン確認（週1回）
+    last_sell_time = global_cfg.setdefault("global_last_sell", {}).get(uid_str, 0)
+    now = time.time()
+    elapsed = now - last_sell_time
+    if elapsed < SELL_COOLDOWN_SECONDS:
+        remaining = SELL_COOLDOWN_SECONDS - elapsed
+        days = int(remaining // 86400)
+        hours = int((remaining % 86400) // 3600)
+        minutes = int((remaining % 3600) // 60)
+        await interaction.response.send_message(
+            f"売る機能はまだ使えません。次回まで: **{days}日 {hours}時間 {minutes}分** 残っています。",
+            ephemeral=True
+        )
+        return
+
+    # 所持コイン確認
+    balance = get_global_balance(all_data, interaction.user.id)
+    if balance < amount:
+        await interaction.response.send_message(
+            f"{coin_name}が不足しています。\n所持: {balance:,} {coin_name} / 売却希望: {amount:,} {coin_name}",
+            ephemeral=True
+        )
+        return
+
+    # 売却処理: 売ったコインを差し引き、ボーナス（10%）を付与
+    bonus = max(1, int(amount * 0.10))
+    add_global_balance(all_data, interaction.user.id, -amount + bonus)
+    global_cfg["global_last_sell"][uid_str] = now
+    save_data(all_data)
+
+    new_balance = get_global_balance(all_data, interaction.user.id)
+    embed = discord.Embed(
+        title="💰 売却完了",
+        description=(
+            f"{amount:,} {coin_name} を売りました！\n"
+            f"ボーナス報酬: **+{bonus:,} {coin_name}**\n"
+            f"残り所持{coin_name}: **{new_balance:,} {coin_name}**"
+        ),
+        color=discord.Color.gold()
+    )
+    embed.set_footer(text="次回の売却は7日後に解放されます。")
+    await interaction.response.send_message(embed=embed)
+
+
+# --------------------------------------------------------------------
+# /troll_board_set — ブラックリスト情報掲載チャンネルの設定
+# --------------------------------------------------------------------
+
+@bot.tree.command(
+    name="troll_board_set",
+    description="【管理者専用】荒らしリスト（ブラックリスト）情報を自動投稿するチャンネルを設定します"
+)
+@discord.app_commands.describe(
+    チャンネル="ブラックリスト情報を投稿するチャンネル（省略するとリセット）"
+)
+async def troll_board_set(interaction: discord.Interaction, チャンネル: discord.TextChannel = None):
+    """
+    荒らしリストに新規ユーザーが追加されたとき、指定チャンネルに自動で情報を投稿します。
+    管理者・オーナーのみ設定可能です。
+    """
+    if not await is_guild_admin(interaction):
+        return
+
+    all_data = load_data()
+    global_cfg = get_global_config(all_data)
+    guild_id_str = str(interaction.guild.id)
+
+    if チャンネル is None:
+        # リセット
+        global_cfg.setdefault("troll_board_channel_id", {}).pop(guild_id_str, None)
+        save_data(all_data)
+        await interaction.response.send_message(
+            "ブラックリスト掲載チャンネルの設定をリセットしました。",
+            ephemeral=True
+        )
+        return
+
+    global_cfg.setdefault("troll_board_channel_id", {})[guild_id_str] = チャンネル.id
+    save_data(all_data)
+
+    embed = discord.Embed(
+        title=" ブラックリスト掲載チャンネル設定完了",
+        description=(
+            f"荒らしリストに新規登録があった際、{チャンネル.mention} に自動で情報が投稿されます。\n\n"
+            "投稿される情報:\n"
+            "・ユーザー名 / ID\n"
+            "・プロフィール画像\n"
+            "・アカウントリンク\n"
+            "・BAN理由\n"
+            "・登録日時"
+        ),
+        color=discord.Color.orange()
+    )
+    embed.set_footer(text=f"設定者: {interaction.user}")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+async def _post_troll_board(all_data: dict, uid_str: str):
+    """
+    荒らしリストに追加されたユーザー情報を、各サーバーの掲載チャンネルに投稿します。
+    """
+    global_cfg = get_global_config(all_data)
+    entry = global_cfg.get("troll_list", {}).get(uid_str)
+    if not entry:
+        return
+
+    board_channels = global_cfg.get("troll_board_channel_id", {})
+    if not board_channels:
+        return
+
+    embed = discord.Embed(
+        title=" ブラックリスト新規登録",
+        color=discord.Color.red(),
+        timestamp=datetime.datetime.now(datetime.timezone.utc)
+    )
+    if entry.get("avatar_url"):
+        embed.set_thumbnail(url=entry["avatar_url"])
+    embed.add_field(name="ユーザー名", value=entry.get("username", "不明"), inline=True)
+    embed.add_field(name="ユーザーID", value=f"`{uid_str}`", inline=True)
+    if entry.get("account_link"):
+        embed.add_field(name="アカウントリンク", value=entry["account_link"], inline=False)
+    embed.add_field(name="BAN理由", value=entry.get("reason", "不明"), inline=False)
+    date_str = entry.get("date", "")[:19].replace("T", " ")
+    embed.add_field(name="登録日時", value=date_str or "不明", inline=True)
+    banned_count = len(entry.get("banned_in", []))
+    embed.add_field(name="BAN済みサーバー数", value=f"{banned_count}サーバー", inline=True)
+    embed.set_footer(text="マクマクBOT 荒らし対策システム")
+
+    for guild_id_str, channel_id in board_channels.items():
+        guild = bot.get_guild(int(guild_id_str))
+        if guild is None:
+            continue
+        channel = guild.get_channel(channel_id)
+        if channel is None:
+            continue
+        try:
+            await channel.send(embed=embed)
+        except Exception:
+            pass
 
 
 # ====================================================================
