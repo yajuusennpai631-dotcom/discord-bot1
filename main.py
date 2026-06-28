@@ -230,9 +230,9 @@ class ApprovalCommandTree(app_commands.CommandTree):
         all_data = load_data()
         if not is_guild_approved(all_data, str(interaction.guild.id)):
             await interaction.response.send_message(
-                "エラー: BOT所有者の認証がまだです。\n"
-                "このサーバーはBOT所有者の利用許可を受けていないため、コマンドは無効化されています。\n"
-                "サーバー管理者に申請パネルからの許可申請をご依頼ください。",
+                "エラー: このサーバーはまだBOT利用申請が完了していません。\n"
+                "BOT所有者の承認が得られるまでコマンドは使用できません。\n"
+                "サーバー管理者は申請パネルのボタンから利用申請を送信してください。",
                 ephemeral=True
             )
             return False
@@ -460,18 +460,18 @@ def create_user_list_embed(allowed_users: list) -> discord.Embed:
 def build_approval_request_embed(guild: discord.Guild) -> discord.Embed:
     """サーバー管理者が使用する「Bot導入の利用申請パネル」用の Embed を作成します。"""
     embed = discord.Embed(
-        title="このBOTの導入にはBOT所有者の許可が必要です",
+        title="BOT利用申請",
         description=(
-            "このBOTを継続して利用するには、**BOT所有者の承認**が必要です。\n\n"
-            "下のボタンを押すと、BOT所有者に参加許可申請のDMが送信されます。\n"
-            "所有者が**許可**すればBotが利用可能になります。\n"
-            "所有者が**拒否**した場合、Botは自動的にサーバーから退出します。"
+            "このBOTを利用するには、**BOT所有者の承認**が必要です。\n\n"
+            "下のボタンを押すと、BOT所有者に利用申請のDMが送信されます。\n"
+            "所有者が**承認**するとすべての機能が利用可能になります。\n"
+            "所有者が**拒否**した場合、BOTは自動的にサーバーから退出します。"
         ),
         color=discord.Color.orange()
     )
-    embed.add_field(name="このサーバー", value=guild.name, inline=True)
+    embed.add_field(name="サーバー名", value=guild.name, inline=True)
     embed.add_field(name="メンバー数", value=f"{guild.member_count}人", inline=True)
-    embed.set_footer(text="サーバー管理者がボタンを押して申請してください")
+    embed.set_footer(text="サーバー管理者のみ申請できます")
     return embed
 
 
@@ -528,7 +528,7 @@ class ApprovalRequestView(discord.ui.View):
         super().__init__(timeout=None)
         self.guild_id = guild_id
 
-    @discord.ui.button(label="BOT所有者に許可申請を送る", style=discord.ButtonStyle.primary, custom_id="send_approval_request")
+    @discord.ui.button(label="BOT所有者に利用申請を送る", style=discord.ButtonStyle.primary, custom_id="send_approval_request")
     async def send_request(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not interaction.guild:
             return
@@ -541,7 +541,7 @@ class ApprovalRequestView(discord.ui.View):
         cfg = get_guild_config(all_data, str(interaction.guild.id))
 
         if cfg.get("approval_status") == "approved":
-            await interaction.response.send_message("このサーバーは既に許可されています。", ephemeral=True)
+            await interaction.response.send_message("このサーバーは既に承認済みです。", ephemeral=True)
             return
 
         await interaction.response.defer(ephemeral=True)
@@ -559,8 +559,8 @@ class ApprovalRequestView(discord.ui.View):
             return
 
         request_embed = discord.Embed(
-            title="新しいサーバー導入の許可申請",
-            description="以下のサーバーからBotの利用許可申請が届きました。",
+            title="BOT利用申請（新規サーバー）",
+            description="以下のサーバーからBOTの利用申請が届きました。",
             color=discord.Color.gold()
         )
         if interaction.guild.icon:
@@ -602,7 +602,7 @@ class ApprovalRequestView(discord.ui.View):
         except Exception:
             pass
 
-        await interaction.followup.send("BOT所有者に許可申請を送信しました。承認結果をお待ちください。", ephemeral=True)
+        await interaction.followup.send("BOT所有者に利用申請を送信しました。承認結果をお待ちください。", ephemeral=True)
 
 
 class ApprovalDecisionView(discord.ui.View):
@@ -649,7 +649,7 @@ class ApprovalDecisionView(discord.ui.View):
 
         await self._notify_panel_channel(
             client,
-            "BOT所有者がこのサーバーでの利用を許可しました。全機能が利用可能になりました。"
+            "BOT所有者がこのサーバーの利用申請を承認しました。全機能が利用可能になりました。"
         )
 
     @discord.ui.button(label="拒否する", style=discord.ButtonStyle.danger, custom_id="reject_guild")
@@ -1078,7 +1078,7 @@ class VerifyBlacklistButtonView(discord.ui.View):
         oauth_url = f"https://discord.com/oauth2/authorize?{params}"
 
         embed = discord.Embed(
-            title="🔗 外部連携認証",
+            title="外部連携認証",
             description=(
                 "以下のリンクからDiscordアカウントの連携認証を行ってください。\n"
                 "他サーバーの在籍状況を確認し、問題がなければ自動的に認証が完了します。\n\n"
@@ -8384,8 +8384,8 @@ async def vendingmachine(interaction: discord.Interaction):
 # ====================================================================
 
 server_blacklist_group = app_commands.Group(
-    name="server_blacklist",
-    description="特定サーバー参加者の自動BAN/KICK機能を管理します（モデレーター専用）"
+    name="web_auth",
+    description="ウェブ認証パネルおよびサーバーブラックリスト機能を管理します（モデレーター専用）"
 )
 
 
@@ -8546,7 +8546,7 @@ async def sbl_setup(interaction: discord.Interaction):
         return
 
     embed = discord.Embed(
-        title="🛡️ サーバー入室認証",
+        title="サーバー入室認証",
         description=(
             "当サーバーの荒らし・スパム対策のため、外部サービスアカウントとの連携認証が必要です。\n\n"
             "下の **「連携認証を開始する」** ボタンをクリックし、表示される専用URLより認証を完了させてください。\n"
