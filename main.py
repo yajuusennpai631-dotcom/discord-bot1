@@ -3468,7 +3468,28 @@ async def on_message_edit(before: discord.Message, after: discord.Message):
         return
 
     # 招待リンク・NGワード削除（共通ヘルパー呼び出し）
-    await _run_automod_checks(after, guild_config)
+    deleted = await _run_automod_checks(after, guild_config)
+    if deleted and guild_config.get("automod_invite_enabled", False):
+        content_lower = after.content.lower()
+        if any(kw in content_lower for kw in ("discord.gg/", "discord.com/invite/", "discord.me/", "dsc.gg/")):
+            # チャンネル全体の過去メッセージをスキャンして即削除（直近100件）
+            try:
+                async for msg in after.channel.history(limit=100):
+                    if msg.id == after.id:
+                        continue
+                    if msg.author.bot:
+                        continue
+                    if not _is_automod_target(msg.author, guild_config, all_data):
+                        continue
+                    m_content_lower = msg.content.lower()
+                    if any(kw in m_content_lower for kw in ("discord.gg/", "discord.com/invite/", "discord.me/", "dsc.gg/")):
+                        try:
+                            await msg.delete()
+                        except Exception:
+                            pass
+            except Exception as e:
+                print(f"[自動モデレーション] チャンネルスキャンエラー: {e}")
+
 
 
 @bot.event
