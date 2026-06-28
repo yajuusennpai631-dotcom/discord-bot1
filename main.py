@@ -179,6 +179,8 @@ def get_guild_config(all_data: dict, guild_id_str: str) -> dict:
         ("server_blacklist_action", "ban"),     # 'ban' または 'kick'
         ("server_blacklist_log_channel_id", None),  # 処理結果を通知するチャンネルID
         ("web_auth_verified_role_id", None),        # 認証完了時に付与するロールID
+        # --- 荒らしリスト（ブラックリスト）自動BAN ---
+        ("troll_autoban_enabled", False),       # 荒らしリスト登録ユーザーの参加時自動BAN ON/OFF
     ]:
         if key not in cfg:
             cfg[key] = default
@@ -1127,6 +1129,29 @@ class VerifyButtonView(discord.ui.View):
             await interaction.response.send_message(f"エラーが発生しました: {e}", ephemeral=True)
 
 
+def _build_discord_oauth_url(state: str) -> str:
+    """指定された state トークンを用いて Discord OAuth2 認証URLを生成します。"""
+    params = urllib.parse.urlencode({
+        "client_id": DISCORD_CLIENT_ID,
+        "redirect_uri": OAUTH_REDIRECT_URI,
+        "response_type": "code",
+        "scope": "guilds",
+        "state": state,
+    })
+    return f"https://discord.com/oauth2/authorize?{params}"
+
+
+def _build_terms_url(state: str) -> str:
+    """
+    OAUTH_REDIRECT_URI のスキーム・ホストを基に、利用規約確認ページのURLを生成します。
+    （Discordの認証画面に進む前に、必ずこのページを経由させるためのURLです）
+    """
+    parsed = urllib.parse.urlparse(OAUTH_REDIRECT_URI)
+    base = f"{parsed.scheme}://{parsed.netloc}"
+    query = urllib.parse.urlencode({"state": state})
+    return f"{base}/terms?{query}"
+
+
 class VerifyBlacklistButtonView(discord.ui.View):
     """サーバーブラックリスト認証パネル用のボタンビューです。"""
     def __init__(self):
@@ -1148,7 +1173,6 @@ class VerifyBlacklistButtonView(discord.ui.View):
         import hmac
         import hashlib
         import base64
-        import urllib.parse
         state_payload = f"{interaction.guild.id}:{interaction.user.id}"
         signature = hmac.new(
             OAUTH_SECRET_KEY.encode(),
@@ -1159,26 +1183,19 @@ class VerifyBlacklistButtonView(discord.ui.View):
             f"{state_payload}:{signature}".encode()
         ).decode()
 
-        # OAuth2 認証URL を生成
-        params = urllib.parse.urlencode({
-            "client_id": DISCORD_CLIENT_ID,
-            "redirect_uri": OAUTH_REDIRECT_URI,
-            "response_type": "code",
-            "scope": "guilds",
-            "state": state,
-        })
-        oauth_url = f"https://discord.com/oauth2/authorize?{params}"
+        # まず利用規約確認ページへ誘導する（同意後にDiscordのOAuth2認証へ進む）
+        terms_url = _build_terms_url(state)
 
         embed = discord.Embed(
             title="外部連携認証",
             description=(
-                "以下のリンクからDiscordアカウントの連携認証を行ってください。\n"
+                "以下のリンクから利用規約をご確認のうえ、Discordアカウントの連携認証を行ってください。\n"
                 "他サーバーの在籍状況を確認し、問題がなければ自動的に認証が完了します。\n\n"
                 "**注意:** このリンクはあなた専用です。他の人に共有しないでください。"
             ),
             color=discord.Color.blue()
         )
-        embed.add_field(name="認証リンク", value=f"[ここをクリックして認証する]({oauth_url})", inline=False)
+        embed.add_field(name="認証リンク（利用規約の確認 → 認証）", value=f"[ここをクリックして開始する]({terms_url})", inline=False)
         
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -3658,6 +3675,44 @@ async def on_message_edit(before: discord.Message, after: discord.Message):
 
 @bot.event
 async def on_member_join(member: discord.Member):
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(member.guild.id))
+
+    # =========================================================
+    # 荒らしリスト（ブラックリスト）: 登録済みユーザーを参加時に自動BAN
+    # =========================================================
+    if cfg.get("troll_autoban_enabled", False):
+        global_cfg_check = get_global_config(all_data)
+        troll_entry = global_cfg_check.get("troll_list", {}).get(str(member.id))
+        if troll_entry:
+            try:
+                await member.ban(
+                    reason=f"荒らしリスト(ブラックリスト)登録ユーザーのため自動BAN: {troll_entry.get('reason', '不明')}"
+                )
+                add_to_troll_list(
+                    all_data, member, member.guild,
+                    reason=troll_entry.get("reason", "荒らしリスト登録ユーザー")
+                )
+                save_data(all_data)
+
+                ban_embed = discord.Embed(
+                    title="[BL] 荒らしリスト自動BAN",
+                    description=f"{member.mention} (`{member.id}`) は荒らしリスト（ブラックリスト）に登録されているため、参加時に自動BANされました。",
+                    color=discord.Color.red()
+                )
+                ban_embed.set_thumbnail(url=member.display_avatar.url)
+                ban_embed.add_field(name="登録理由", value=troll_entry.get("reason", "不明"), inline=False)
+                ban_embed.add_field(name="登録日時", value=(troll_entry.get("date", "") or "不明")[:19].replace("T", " "), inline=True)
+                ban_embed.timestamp = discord.utils.utcnow()
+                await _send_mod_log(member.guild, ban_embed)
+                print(f"[荒らしリスト] {member} を自動BANしました。")
+                return  # BAN済みのため以降のウェルカム処理等は行わない
+            except discord.Forbidden:
+                print(f"[荒らしリスト] {member} の自動BAN権限がありません。Botのロール権限をご確認ください。")
+            except Exception as e:
+                print(f"[荒らしリスト] 自動BANエラー: {e}")
+            # BANに失敗した場合は通常の参加処理を続行する
+
     embed = discord.Embed(
         title="[ログ] メンバー参加",
         description=f"{member.mention} (`{member.id}`)",
@@ -3668,8 +3723,6 @@ async def on_member_join(member: discord.Member):
     await _send_mod_log(member.guild, embed)
 
     # ウェルカムメッセージ送信
-    all_data = load_data()
-    cfg = get_guild_config(all_data, str(member.guild.id))
     welcome_ch_id = cfg.get("welcome_channel_id")
     welcome_msg = cfg.get("welcome_message")
     welcome_role_id = cfg.get("welcome_role_id")
@@ -8793,6 +8846,160 @@ async def _grant_verified_role(bot_client, guild_id: int, user_id: int, cfg: dic
         print(f"[ウェブ認証] ロール付与エラー: {e}")
 
 
+def _terms_page_html(state: str, oauth_url: str, error: bool = False, error_message: str = "") -> str:
+    """
+    利用規約確認ページのHTMLを生成します。
+    チェックボックスに同意しないと「同意して認証へ進む」ボタンが有効化されない簡易JSを含みます。
+    """
+    color_bg   = "#23272A"
+    color_card = "#2C2F33"
+    color_main = "#5865F2"
+    color_text = "#FFFFFF"
+    color_sub  = "#B9BBBE"
+    color_box  = "#1E2124"
+
+    if error:
+        return f"""<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>認証エラー</title>
+  <style>
+    * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+    body {{
+      background: {color_bg}; color: {color_text};
+      font-family: "Helvetica Neue", Arial, "Hiragino Kaku Gothic ProN", "Meiryo", sans-serif;
+      display: flex; align-items: center; justify-content: center; min-height: 100vh;
+    }}
+    .card {{
+      background: {color_card}; border-radius: 12px; padding: 48px 40px;
+      max-width: 460px; width: 90%; text-align: center; box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+    }}
+    h1 {{ font-size: 20px; margin-bottom: 12px; color: #ED4245; }}
+    p {{ font-size: 14px; color: {color_sub}; line-height: 1.6; }}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>認証リンクが無効です</h1>
+    <p>{error_message or "リンクの有効期限が切れている可能性があります。Discordのパネルから再度お試しください。"}</p>
+  </div>
+</body>
+</html>"""
+
+    return f"""<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>利用規約の確認</title>
+  <style>
+    * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+    body {{
+      background: {color_bg}; color: {color_text};
+      font-family: "Helvetica Neue", Arial, "Hiragino Kaku Gothic ProN", "Meiryo", sans-serif;
+      display: flex; align-items: center; justify-content: center; min-height: 100vh; padding: 24px;
+    }}
+    .card {{
+      background: {color_card}; border-radius: 12px; padding: 40px;
+      max-width: 560px; width: 100%; box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+    }}
+    h1 {{ font-size: 20px; font-weight: 700; margin-bottom: 16px; }}
+    .terms-box {{
+      background: {color_box}; border-radius: 8px; padding: 20px;
+      max-height: 320px; overflow-y: auto; font-size: 13px; color: {color_sub};
+      line-height: 1.8; margin-bottom: 20px; text-align: left;
+    }}
+    .terms-box h2 {{ font-size: 14px; color: {color_text}; margin: 14px 0 6px; }}
+    .terms-box h2:first-child {{ margin-top: 0; }}
+    .terms-box ul {{ margin: 6px 0 6px 18px; }}
+    label.agree {{
+      display: flex; align-items: flex-start; gap: 10px; font-size: 13px;
+      color: {color_sub}; margin-bottom: 20px; cursor: pointer; text-align: left;
+    }}
+    label.agree input {{ margin-top: 3px; width: 16px; height: 16px; flex-shrink: 0; }}
+    .btn {{
+      display: block; width: 100%; text-align: center; padding: 14px;
+      border-radius: 8px; background: {color_main}; color: #fff; font-weight: 700;
+      text-decoration: none; font-size: 15px; transition: opacity 0.2s;
+      pointer-events: none; opacity: 0.4;
+    }}
+    .btn.enabled {{ pointer-events: auto; opacity: 1; }}
+    .sub {{ margin-top: 14px; font-size: 12px; color: {color_sub}; text-align: center; }}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>ご利用前に利用規約をご確認ください</h1>
+    <div class="terms-box">
+      <h2>1. 本認証システムについて</h2>
+      <p>このページは、サーバー管理者が荒らし・スパム対策として導入している入室認証システムです。「同意して認証へ進む」ボタンを押すと、Discordの認証画面に移動します。</p>
+
+      <h2>2. 取得・確認する情報</h2>
+      <ul>
+        <li>あなたのDiscordユーザー情報（ユーザー名・ID・アイコン）</li>
+        <li>あなたが参加しているDiscordサーバーの一覧（<b>guilds</b> スコープのみ。メッセージの送受信やメールアドレス等は取得しません）</li>
+      </ul>
+
+      <h2>3. 判定と処置について</h2>
+      <p>取得したサーバー一覧を、当サーバー管理者が設定した「ブラックリスト対象サーバー」と照合します。該当があった場合、当サーバーから自動的にBANまたはキックされ、複数サーバー共有の荒らしリスト（ブラックリスト）に登録される場合があります。該当がなければ認証は完了し、必要に応じて認証ロールが付与されます。</p>
+
+      <h2>4. 同意について</h2>
+      <p>下記チェックボックスにチェックを入れて「同意して認証へ進む」を押すことで、上記内容に同意したものとみなされます。同意しない場合はこのページを閉じてください。認証を行わない場合、サーバー側の設定によっては一部機能が利用できない場合があります。</p>
+    </div>
+
+    <label class="agree">
+      <input type="checkbox" id="agreeCheckbox" onchange="document.getElementById('proceedBtn').classList.toggle('enabled', this.checked)">
+      上記の利用規約を読み、内容に同意します。
+    </label>
+
+    <a id="proceedBtn" class="btn" href="{oauth_url}">同意して認証へ進む</a>
+    <p class="sub">このリンクはあなた専用です。第三者に共有しないでください。</p>
+  </div>
+</body>
+</html>"""
+
+
+async def _terms_page_handler(request):
+    """
+    利用規約確認ページ。Discord OAuth2 認証へ進む前に必ずこのページを経由させます。
+    state を検証し、問題なければ同意ボタン付きの利用規約ページを表示します。
+    """
+    import hmac
+    import hashlib
+
+    state = request.rel_url.query.get("state")
+    if not state:
+        return aiohttp.web.Response(
+            text=_terms_page_html("", "", error=True, error_message="リンクが不正です。"),
+            content_type="text/html"
+        )
+
+    try:
+        decoded = base64.urlsafe_b64decode(state.encode()).decode()
+        parts = decoded.split(":")
+        if len(parts) != 3:
+            raise ValueError("state フォーマット不正")
+        guild_id_str, user_id_str, sig = parts
+        expected_sig = hmac.new(
+            OAUTH_SECRET_KEY.encode(),
+            f"{guild_id_str}:{user_id_str}".encode(),
+            hashlib.sha256
+        ).hexdigest()
+        if not hmac.compare_digest(sig, expected_sig):
+            raise ValueError("署名不一致")
+    except Exception as e:
+        print(f"[利用規約ページ] state検証エラー: {e}")
+        return aiohttp.web.Response(
+            text=_terms_page_html("", "", error=True, error_message="リンクの有効期限が切れている可能性があります。Discordのパネルから再度お試しください。"),
+            content_type="text/html"
+        )
+
+    oauth_url = _build_discord_oauth_url(state)
+    return aiohttp.web.Response(text=_terms_page_html(state, oauth_url), content_type="text/html")
+
+
 async def _oauth2_callback_handler(request):
     """
     Discord OAuth2 コールバックエンドポイント。
@@ -9056,6 +9263,7 @@ async def _start_web_server():
     """aiohttp による OAuth2 コールバック受け取り用 Webサーバーを起動します。"""
     app = aiohttp.web.Application()
     app.router.add_get("/callback", _oauth2_callback_handler)
+    app.router.add_get("/terms", _terms_page_handler)
     app.router.add_get("/", lambda req: aiohttp.web.Response(text="Bot is running."))
     runner = aiohttp.web.AppRunner(app)
     await runner.setup()
@@ -9570,6 +9778,44 @@ async def sell(interaction: discord.Interaction, amount: int):
     )
     embed.set_footer(text="次回の売却は7日後に解放されます。")
     await interaction.response.send_message(embed=embed)
+
+
+# --------------------------------------------------------------------
+# /troll_autoban_toggle — 荒らしリスト登録ユーザーの参加時自動BAN ON/OFF
+# --------------------------------------------------------------------
+
+@bot.tree.command(
+    name="troll_autoban_toggle",
+    description="【管理者専用】荒らしリスト（ブラックリスト）に登録済みのユーザーが参加した際に自動BANする機能のON/OFFを切り替えます"
+)
+async def troll_autoban_toggle(interaction: discord.Interaction):
+    """
+    荒らしリスト（全サーバー共有）に既に登録されているユーザーが当サーバーに参加した場合、
+    ウェブ認証を待たずに即座に自動BANするかどうかを切り替えます。
+    BAN実行結果は mod_log_channel_id 設定先のチャンネルに通知されます。
+    """
+    if not await is_guild_admin(interaction):
+        return
+
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(interaction.guild.id))
+    new_state = not cfg.get("troll_autoban_enabled", False)
+    cfg["troll_autoban_enabled"] = new_state
+    save_data(all_data)
+
+    if new_state:
+        desc = (
+            "荒らしリスト（ブラックリスト）登録済みユーザーの**自動BAN**を有効にしました。\n"
+            "今後、登録済みユーザーが参加すると即座にBANされます。\n"
+            "（通知先はモデレーションログチャンネルの設定に従います。`/modlog_set` で未設定の場合は通知されません）"
+        )
+        color = discord.Color.green()
+    else:
+        desc = "荒らしリスト（ブラックリスト）登録済みユーザーの自動BANを無効にしました。"
+        color = discord.Color.dark_gray()
+
+    embed = discord.Embed(title="荒らしリスト自動BAN設定", description=desc, color=color)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 # --------------------------------------------------------------------
