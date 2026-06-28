@@ -179,6 +179,7 @@ def get_guild_config(all_data: dict, guild_id_str: str) -> dict:
         ("server_blacklist_action", "ban"),     # 'ban' または 'kick'
         ("server_blacklist_log_channel_id", None),  # 処理結果を通知するチャンネルID
         ("web_auth_verified_role_id", None),        # 認証完了時に付与するロールID
+        ("web_auth_mode", "panel"),                 # 認証誘導方式: "panel"（パネル設置）/ "dm"（参加時DM自動送信）
         # --- 荒らしリスト（ブラックリスト）自動BAN ---
         ("troll_autoban_enabled", True),        # 荒らしリスト登録ユーザーの参加時自動BAN ON/OFF ★デフォルトON
     ]:
@@ -1152,6 +1153,25 @@ def _build_terms_url(state: str) -> str:
     return f"{base}/terms?{query}"
 
 
+def _generate_web_auth_state(guild_id: int, user_id: int) -> str:
+    """
+    ウェブ認証用の HMAC署名付き state トークンを生成します。
+    VerifyBlacklistButtonView（パネルボタン）と on_member_join（DM自動送信）の
+    両方から呼び出せるよう共通関数として定義します。
+    """
+    import hmac
+    import hashlib
+    state_payload = f"{guild_id}:{user_id}"
+    signature = hmac.new(
+        OAUTH_SECRET_KEY.encode(),
+        state_payload.encode(),
+        hashlib.sha256
+    ).hexdigest()
+    return base64.urlsafe_b64encode(
+        f"{state_payload}:{signature}".encode()
+    ).decode()
+
+
 class VerifyBlacklistButtonView(discord.ui.View):
     """サーバーブラックリスト認証パネル用のボタンビューです。"""
     def __init__(self):
@@ -1170,18 +1190,7 @@ class VerifyBlacklistButtonView(discord.ui.View):
             return
 
         # HMAC署名付きのstateトークンを生成（guild_id:user_id）
-        import hmac
-        import hashlib
-        import base64
-        state_payload = f"{interaction.guild.id}:{interaction.user.id}"
-        signature = hmac.new(
-            OAUTH_SECRET_KEY.encode(),
-            state_payload.encode(),
-            hashlib.sha256
-        ).hexdigest()
-        state = base64.urlsafe_b64encode(
-            f"{state_payload}:{signature}".encode()
-        ).decode()
+        state = _generate_web_auth_state(interaction.guild.id, interaction.user.id)
 
         # まず利用規約確認ページへ誘導する（同意後にDiscordのOAuth2認証へ進む）
         terms_url = _build_terms_url(state)
@@ -3800,24 +3809,70 @@ async def on_member_join(member: discord.Member):
         global_bl_cfg = get_global_config(all_data)
         blacklist_ids = global_bl_cfg.get("global_server_blacklist_ids", [])
         if blacklist_ids:
-            # ユーザーにDMで認証チャンネルでの認証を促す
-            verify_ch_id = cfg.get("server_blacklist_verify_channel_id")
-            if verify_ch_id:
-                try:
-                    dm_embed = discord.Embed(
-                        title=f"[!] {member.guild.name} への入室認証について",
-                        description=(
-                            f"当サーバーへ参加するには、認証チャンネル <#{verify_ch_id}> にて\n"
-                            "外部サービスアカウント連携認証を完了させてください。"
-                        ),
-                        color=discord.Color.orange()
-                    )
-                    await member.send(embed=dm_embed)
-                    print(f"[サーバーBL] {member} に認証案内DMを送信しました")
-                except discord.Forbidden:
-                    print(f"[サーバーBL] {member} へのDM送信に失敗しました（DM無効）")
-                except Exception as e:
-                    print(f"[サーバーBL] DM送信エラー: {e}")
+            web_auth_mode = cfg.get("web_auth_mode", "panel")
+
+            if web_auth_mode == "dm":
+                # --- DMモード: 参加時に個人宛て認証URLをDMで直接送信 ---
+                if OAUTH_REDIRECT_URI and DISCORD_CLIENT_ID and DISCORD_CLIENT_SECRET:
+                    try:
+                        state = _generate_web_auth_state(member.guild.id, member.id)
+                        terms_url = _build_terms_url(state)
+                        dm_embed = discord.Embed(
+                            title=f"[!] {member.guild.name} への入室認証が必要です",
+                            description=(
+                                "当サーバーへ参加するには、**ウェブ認証**を完了させる必要があります。\n\n"
+                                "下のリンクをクリックし、利用規約をご確認のうえ認証を進めてください。\n"
+                                "他サーバーの在籍状況を確認し、問題がなければ自動的に認証が完了します。\n\n"
+                                "⚠️ このリンクはあなた専用です。他の人に共有しないでください。"
+                            ),
+                            color=discord.Color.orange()
+                        )
+                        dm_embed.add_field(
+                            name="認証リンク（利用規約の確認 → 認証）",
+                            value=f"[ここをクリックして認証を開始する]({terms_url})",
+                            inline=False
+                        )
+                        dm_embed.set_footer(text=f"送信元: {member.guild.name} の管理Bot")
+                        await member.send(embed=dm_embed)
+                        print(f"[ウェブ認証/DM] {member} に認証URL付きDMを送信しました")
+                    except discord.Forbidden:
+                        print(f"[ウェブ認証/DM] {member} へのDM送信に失敗しました（DM無効）")
+                        # DM無効のユーザーへのフォールバック: パネルチャンネルがあれば案内
+                        verify_ch_id = cfg.get("server_blacklist_verify_channel_id")
+                        if verify_ch_id:
+                            ch = member.guild.get_channel(verify_ch_id)
+                            if ch:
+                                try:
+                                    await ch.send(
+                                        f"{member.mention} DMが届かなかったため、こちらで認証をお願いします。",
+                                        delete_after=60
+                                    )
+                                except Exception:
+                                    pass
+                    except Exception as e:
+                        print(f"[ウェブ認証/DM] DM送信エラー: {e}")
+                else:
+                    print(f"[ウェブ認証/DM] OAuth2設定が不完全なためDMを送信できません（{member}）")
+
+            else:
+                # --- パネルモード（従来動作）: 認証チャンネルへ誘導するDMを送信 ---
+                verify_ch_id = cfg.get("server_blacklist_verify_channel_id")
+                if verify_ch_id:
+                    try:
+                        dm_embed = discord.Embed(
+                            title=f"[!] {member.guild.name} への入室認証について",
+                            description=(
+                                f"当サーバーへ参加するには、認証チャンネル <#{verify_ch_id}> にて\n"
+                                "外部サービスアカウント連携認証を完了させてください。"
+                            ),
+                            color=discord.Color.orange()
+                        )
+                        await member.send(embed=dm_embed)
+                        print(f"[サーバーBL] {member} に認証案内DMを送信しました")
+                    except discord.Forbidden:
+                        print(f"[サーバーBL] {member} へのDM送信に失敗しました（DM無効）")
+                    except Exception as e:
+                        print(f"[サーバーBL] DM送信エラー: {e}")
 
 
 @bot.event
@@ -8716,6 +8771,10 @@ async def sbl_list(interaction: discord.Interaction):
     embed.add_field(name="このサーバーの処置", value="BAN" if action == "ban" else "キック", inline=True)
     embed.add_field(name="OAuth2設定", value="[OK]" if OAUTH_REDIRECT_URI else "[NG] 未設定", inline=True)
 
+    web_auth_mode = cfg.get("web_auth_mode", "panel")
+    mode_label = "パネル設置（チャンネルにボタンを常設）" if web_auth_mode == "panel" else "DM自動送信（参加時に個人宛てURL送信）"
+    embed.add_field(name="認証誘導方式", value=mode_label, inline=False)
+
     if bl:
         lines = [f"`{sid}`" for sid in bl]
         embed.add_field(name=f"共通BL登録サーバーID ({len(bl)}件)", value="\n".join(lines[:20]), inline=False)
@@ -8748,50 +8807,93 @@ async def sbl_action(interaction: discord.Interaction, action: str):
     await interaction.response.send_message(f"[OK] ブラックリスト対象者への処置を **{label}** に設定しました。", ephemeral=True)
 
 
-@server_blacklist_group.command(name="setup", description="このチャンネルにウェブ認証パネルを設置します")
-@app_commands.describe(verified_role="認証完了時に付与するロール（省略可）")
-async def sbl_setup(interaction: discord.Interaction, verified_role: discord.Role = None):
+@server_blacklist_group.command(name="setup", description="ウェブ認証の誘導方式を設定します（パネル設置 or 参加時DM自動送信）")
+@app_commands.describe(
+    mode="認証誘導方式（パネル設置 or 参加時DM自動送信）",
+    verified_role="認証完了時に付与するロール（省略可）"
+)
+@app_commands.choices(mode=[
+    app_commands.Choice(name="パネル設置（チャンネルにボタンを常設）", value="panel"),
+    app_commands.Choice(name="DM自動送信（参加した瞬間に認証URLをDM）", value="dm"),
+])
+async def sbl_setup(
+    interaction: discord.Interaction,
+    mode: app_commands.Choice[str],
+    verified_role: discord.Role = None
+):
     if not await is_moderator(interaction):
         return
     if not interaction.guild:
         return
 
-    all_data = load_data()
-    cfg = get_guild_config(all_data, str(interaction.guild.id))
-
-    # OAuth2設定チェック
+    # OAuth2設定チェック（どちらのモードでも必須）
     if not OAUTH_REDIRECT_URI or not DISCORD_CLIENT_ID or not DISCORD_CLIENT_SECRET:
         await interaction.response.send_message(
-            "[NG] 環境変数（CLIENT_ID等）が未設定のため、認証パネルを設置できません。",
+            "[NG] 環境変数（CLIENT_ID等）が未設定のため、認証機能を設定できません。",
             ephemeral=True
         )
         return
+
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(interaction.guild.id))
 
     # 認証後付与ロールを保存（省略時は既存設定を維持）
     if verified_role is not None:
         cfg["web_auth_verified_role_id"] = verified_role.id
 
-    embed = discord.Embed(
-        title="サーバー入室認証",
-        description=(
-            "当サーバーの荒らし・スパム対策のため、外部サービスアカウントとの連携認証が必要です。\n\n"
-            "下の **「連携認証を開始する」** ボタンをクリックし、表示される専用URLより認証を完了させてください。\n"
-            "（他の特定サーバーへの参加履歴を確認し、問題なければ認証が完了します）"
-        ),
-        color=discord.Color.blue()
+    cfg["web_auth_mode"] = mode.value
+
+    role_text = f"認証後付与ロール: {verified_role.mention}" if verified_role else (
+        f"認証後付与ロール: <@&{cfg['web_auth_verified_role_id']}>" if cfg.get("web_auth_verified_role_id") else "認証後付与ロール: 未設定"
     )
 
-    view = VerifyBlacklistButtonView()
+    if mode.value == "dm":
+        # --- DMモード: パネル不要、参加時に自動送信 ---
+        save_data(all_data)
+        embed = discord.Embed(
+            title="ウェブ認証: DM自動送信モードに設定しました",
+            description=(
+                "サーバーに参加したメンバーへ、参加した瞬間に**個人宛ての認証URL**をDMで自動送信します。\n\n"
+                "パネルをチャンネルに設置する必要はありません。\n"
+                "認証URLはメンバーごとに異なる専用URLのため、使い回しはできません。\n\n"
+                "⚠️ DMを受け取れない設定のユーザーには届きません。\n"
+                "　パネルチャンネルも設置しておくと、そのユーザー向けのフォールバックとして機能します。"
+            ),
+            color=discord.Color.green()
+        )
+        embed.add_field(name="設定", value=role_text, inline=False)
+        embed.set_footer(text="/web_auth setup でいつでも切り替えられます")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    await interaction.response.send_message("認証パネルを設置中...", ephemeral=True)
-    panel_msg = await interaction.channel.send(embed=embed, view=view)
+    else:
+        # --- パネルモード: このチャンネルにボタンを設置 ---
+        embed_panel = discord.Embed(
+            title="サーバー入室認証",
+            description=(
+                "当サーバーの荒らし・スパム対策のため、外部サービスアカウントとの連携認証が必要です。\n\n"
+                "下の **「連携認証を開始する」** ボタンをクリックし、表示される専用URLより認証を完了させてください。\n"
+                "（他の特定サーバーへの参加履歴を確認し、問題なければ認証が完了します）"
+            ),
+            color=discord.Color.blue()
+        )
 
-    cfg["server_blacklist_verify_channel_id"] = interaction.channel.id
-    cfg["server_blacklist_verify_message_id"] = panel_msg.id
-    save_data(all_data)
+        view = VerifyBlacklistButtonView()
 
-    role_text = f"認証後付与ロール: {verified_role.mention}" if verified_role else "認証後付与ロール: 未設定"
-    await interaction.edit_original_response(content=f"[OK] 認証パネルを設置しました。{role_text}")
+        await interaction.response.send_message("認証パネルを設置中...", ephemeral=True)
+        panel_msg = await interaction.channel.send(embed=embed_panel, view=view)
+
+        cfg["server_blacklist_verify_channel_id"] = interaction.channel.id
+        cfg["server_blacklist_verify_message_id"] = panel_msg.id
+        save_data(all_data)
+
+        result_embed = discord.Embed(
+            title="ウェブ認証: パネル設置モードに設定しました",
+            description=f"このチャンネルに認証パネルを設置しました。\nメンバーはボタンを押して認証を行います。",
+            color=discord.Color.green()
+        )
+        result_embed.add_field(name="設定", value=role_text, inline=False)
+        result_embed.set_footer(text="/web_auth setup でいつでも切り替えられます")
+        await interaction.edit_original_response(content=None, embed=result_embed)
 
 
 @server_blacklist_group.command(name="role_clear", description="認証完了時に付与するロールの設定を解除します")
