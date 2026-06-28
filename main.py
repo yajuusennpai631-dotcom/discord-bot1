@@ -7753,16 +7753,16 @@ async def work(interaction: discord.Interaction):
 
 
 # --------------------------------------------------------------------
-# /economy_give — 管理者による手動付与・没収（グローバルMコイン対応）
+# /economy_give — オーナーによる手動付与・没収（グローバルMコイン対応）
 # --------------------------------------------------------------------
 
-@bot.tree.command(name="economy_give", description="【管理者専用】指定ユーザーのMコイン（財布）を増減させます")
+@bot.tree.command(name="economy_give", description="【オーナー専用】指定ユーザーのMコイン（財布）を増減させます")
 @discord.app_commands.describe(
     ユーザー="対象ユーザー",
     金額="増減させる金額（負の数を指定すると没収）"
 )
 async def economy_give(interaction: discord.Interaction, ユーザー: discord.Member, 金額: int):
-    if not await is_admin_or_allowed(interaction):
+    if not await is_owner_check(interaction):
         return
     if not interaction.guild:
         return
