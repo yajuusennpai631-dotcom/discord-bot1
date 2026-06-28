@@ -174,13 +174,13 @@ def get_guild_config(all_data: dict, guild_id_str: str) -> dict:
         ("economy_work_cooldown_seconds", 7200),  # 既定2時間
         ("economy_last_work", {}),      # {user_id_str: unix_timestamp}
         # --- サーバーブラックリスト（特定サーバー参加者自動BAN） ---
-        ("server_blacklist_enabled", False),    # 機能ON/OFF
+        ("server_blacklist_enabled", True),     # 機能ON/OFF ★ウェブパネル設置時点でデフォルトON
         ("server_blacklist_ids", []),           # BANの対象となるDiscordサーバーID一覧（int）
         ("server_blacklist_action", "ban"),     # 'ban' または 'kick'
         ("server_blacklist_log_channel_id", None),  # 処理結果を通知するチャンネルID
         ("web_auth_verified_role_id", None),        # 認証完了時に付与するロールID
         # --- 荒らしリスト（ブラックリスト）自動BAN ---
-        ("troll_autoban_enabled", False),       # 荒らしリスト登録ユーザーの参加時自動BAN ON/OFF
+        ("troll_autoban_enabled", True),        # 荒らしリスト登録ユーザーの参加時自動BAN ON/OFF ★デフォルトON
     ]:
         if key not in cfg:
             cfg[key] = default
@@ -8943,7 +8943,12 @@ def _terms_page_html(state: str, oauth_url: str, error: bool = False, error_mess
       </ul>
 
       <h2>3. 判定と処置について</h2>
-      <p>取得したサーバー一覧を、当サーバー管理者が設定した「ブラックリスト対象サーバー」と照合します。該当があった場合、当サーバーから自動的にBANまたはキックされ、複数サーバー共有の荒らしリスト（ブラックリスト）に登録される場合があります。該当がなければ認証は完了し、必要に応じて認証ロールが付与されます。</p>
+      <p>取得した情報をもとに、以下の2段階でチェックを行います。</p>
+      <ul>
+        <li><b>荒らしリスト照合:</b> 複数のサーバーで問題行為が報告され登録済みのユーザーは、サーバーBL設定に関わらず自動的にBANまたはキックされます。</li>
+        <li><b>サーバーブラックリスト照合:</b> 取得したサーバー一覧を、当サーバー管理者が設定した「ブラックリスト対象サーバー」と照合します。該当があった場合、当サーバーから自動的にBANまたはキックされ、荒らしリストに登録される場合があります。</li>
+      </ul>
+      <p>いずれにも該当しなければ認証は完了し、必要に応じて認証ロールが付与されます。</p>
 
       <h2>4. 同意について</h2>
       <p>下記チェックボックスにチェックを入れて「同意して認証へ進む」を押すことで、上記内容に同意したものとみなされます。同意しない場合はこのページを閉じてください。認証を行わない場合、サーバー側の設定によっては一部機能が利用できない場合があります。</p>
@@ -9161,11 +9166,93 @@ async def _oauth2_callback_handler(request):
 
     user_guild_ids = {int(g["id"]) for g in user_guilds}
 
-    # --- ブラックリストとの照合 ---
+    # --- 各種BLとの照合 ---
     all_data = load_data()
     cfg = get_guild_config(all_data, str(guild_id))
+    global_cfg_bl = get_global_config(all_data)
+    target_guild = bot.get_guild(guild_id)
+    action = cfg.get("server_blacklist_action", "ban")
+    action_label = "BAN" if action == "ban" else "キック"
 
-    if not cfg.get("server_blacklist_enabled", False):
+    # =========================================================
+    # ① 荒らしリスト（ブラックリスト）照合 — 常時実行
+    #    サーバーBL機能のON/OFFに関わらず、荒らしリストに登録済みなら弾く
+    # =========================================================
+    troll_list = global_cfg_bl.get("troll_list", {})
+    troll_entry = troll_list.get(str(user_id))
+    if troll_entry:
+        print(f"[ウェブ認証/荒らしリスト] ユーザー {user_id} は荒らしリストに登録済み -> {action_label} 実行")
+        if target_guild:
+            member = target_guild.get_member(user_id)
+            if member:
+                try:
+                    if action == "ban":
+                        await target_guild.ban(
+                            discord.Object(id=user_id),
+                            reason=f"ウェブ認証: 荒らしリスト(ブラックリスト)登録ユーザーを検出: {troll_entry.get('reason', '不明')}"
+                        )
+                        # 荒らしリストのbanned_inを更新
+                        all_data_fresh = load_data()
+                        add_to_troll_list(
+                            all_data_fresh,
+                            member,
+                            target_guild,
+                            reason=troll_entry.get("reason", "荒らしリスト登録ユーザー")
+                        )
+                        save_data(all_data_fresh)
+                        await _post_troll_board(all_data_fresh, str(member.id))
+                        print(f"[ウェブ認証/荒らしリスト] {member} を自動BANしました。")
+                    else:
+                        await member.kick(
+                            reason=f"ウェブ認証: 荒らしリスト(ブラックリスト)登録ユーザーを検出: {troll_entry.get('reason', '不明')}"
+                        )
+                        print(f"[ウェブ認証/荒らしリスト] {member} をキックしました。")
+
+                    # ログチャンネルへ通知
+                    log_ch_id = cfg.get("server_blacklist_log_channel_id") or cfg.get("mod_log_channel_id")
+                    if log_ch_id and target_guild:
+                        log_ch = target_guild.get_channel(log_ch_id)
+                        if log_ch:
+                            troll_embed = discord.Embed(
+                                title=f"[BL] ウェブ認証: 荒らしリスト - {action_label}実行",
+                                color=discord.Color.red()
+                            )
+                            troll_embed.add_field(
+                                name="対象ユーザー",
+                                value=f"<@{user_id}> (`{user_id}`)",
+                                inline=False
+                            )
+                            troll_embed.add_field(
+                                name="登録理由",
+                                value=troll_entry.get("reason", "不明"),
+                                inline=False
+                            )
+                            troll_embed.add_field(
+                                name="登録日時",
+                                value=(troll_entry.get("date", "") or "不明")[:19].replace("T", " "),
+                                inline=True
+                            )
+                            troll_embed.add_field(name="実行した処置", value=action_label, inline=True)
+                            troll_embed.add_field(name="検出経路", value="ウェブ認証 (OAuth2)", inline=True)
+                            troll_embed.timestamp = discord.utils.utcnow()
+                            try:
+                                await log_ch.send(embed=troll_embed)
+                            except Exception:
+                                pass
+                except Exception as e:
+                    print(f"[ウェブ認証/荒らしリスト] {action_label}実行エラー: {e}")
+
+        return _html_page(
+            title="参加不可",
+            message="このサーバーには参加できません",
+            sub=f"複数サーバーで報告済みのユーザーとして登録されているため、{action_label}されました。",
+            ok=False
+        )
+
+    # =========================================================
+    # ② サーバーブラックリスト照合 — server_blacklist_enabled がONの場合のみ
+    # =========================================================
+    if not cfg.get("server_blacklist_enabled", True):
         # 機能が無効になっていれば認証OKとして終了（ロール付与のみ実行）
         await _grant_verified_role(bot, guild_id, user_id, cfg)
         return _html_page(
@@ -9175,13 +9262,8 @@ async def _oauth2_callback_handler(request):
         )
 
     # BL対象IDは全サーバー共通リストから取得
-    global_cfg_bl = get_global_config(all_data)
     blacklist_ids = set(global_cfg_bl.get("global_server_blacklist_ids", []))
     matched = user_guild_ids & blacklist_ids
-
-    target_guild = bot.get_guild(guild_id)
-    action = cfg.get("server_blacklist_action", "ban")
-    action_label = "BAN" if action == "ban" else "キック"
 
     if matched:
         # ブラックリスト対象サーバーに参加しているため処置を実行
