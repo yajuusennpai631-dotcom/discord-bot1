@@ -294,7 +294,87 @@ def get_global_config(all_data: dict) -> dict:
         all_data["global_config"] = {
             "trusted_users": []
         }
-    return all_data["global_config"]
+    cfg = all_data["global_config"]
+    # 荒らしリスト（全サーバー共有）
+    if "troll_list" not in cfg:
+        cfg["troll_list"] = {}  # {user_id_str: {"username": str, "avatar_url": str, "reason": str, "date": str, "banned_in": [guild_id_str...]}}
+    # グローバルコイン（全サーバー共通）
+    if "global_balances" not in cfg:
+        cfg["global_balances"] = {}   # {user_id_str: int}
+    if "global_bank" not in cfg:
+        cfg["global_bank"] = {}       # {user_id_str: int} 銀行預け入れ残高
+    if "global_last_work" not in cfg:
+        cfg["global_last_work"] = {}  # {user_id_str: unix_timestamp}
+    # グローバルコイン設定（オーナーのみ変更可能）
+    if "global_coin_name" not in cfg:
+        cfg["global_coin_name"] = "Mコイン"
+    if "global_work_reward_min" not in cfg:
+        cfg["global_work_reward_min"] = 10
+    if "global_work_reward_max" not in cfg:
+        cfg["global_work_reward_max"] = 50
+    if "global_work_cooldown_seconds" not in cfg:
+        cfg["global_work_cooldown_seconds"] = 7200  # 2時間
+    if "global_msg_reward_min" not in cfg:
+        cfg["global_msg_reward_min"] = 1
+    if "global_msg_reward_max" not in cfg:
+        cfg["global_msg_reward_max"] = 5
+    if "global_msg_cooldown_seconds" not in cfg:
+        cfg["global_msg_cooldown_seconds"] = 60
+    if "global_msg_last_earned" not in cfg:
+        cfg["global_msg_last_earned"] = {}  # {user_id_str: unix_timestamp}
+    return cfg
+
+
+def get_global_balance(all_data: dict, user_id: int) -> int:
+    """ユーザーのグローバル所持金（財布）を取得します。"""
+    global_cfg = get_global_config(all_data)
+    return global_cfg["global_balances"].get(str(user_id), 0)
+
+
+def get_global_bank(all_data: dict, user_id: int) -> int:
+    """ユーザーのグローバル銀行残高を取得します。"""
+    global_cfg = get_global_config(all_data)
+    return global_cfg["global_bank"].get(str(user_id), 0)
+
+
+def add_global_balance(all_data: dict, user_id: int, amount: int):
+    """ユーザーのグローバル所持金に amount を加算（負数で減算、0未満にはならない）。"""
+    global_cfg = get_global_config(all_data)
+    uid = str(user_id)
+    current = global_cfg["global_balances"].get(uid, 0)
+    global_cfg["global_balances"][uid] = max(0, current + amount)
+
+
+def format_mcoin(all_data: dict, amount: int) -> str:
+    """Mコイン形式の金額表示文字列を作成します。"""
+    global_cfg = get_global_config(all_data)
+    name = global_cfg.get("global_coin_name", "Mコイン")
+    return f"{amount:,} {name}"
+
+
+def add_to_troll_list(all_data: dict, member: discord.Member, guild: discord.Guild, reason: str = "サーバーBLによるBAN"):
+    """BANされたユーザーを全サーバー共有の荒らしリストに追加・更新します。"""
+    global_cfg = get_global_config(all_data)
+    troll_list = global_cfg["troll_list"]
+    uid_str = str(member.id)
+    avatar_url = str(member.display_avatar.url) if member.display_avatar else ""
+    guild_id_str = str(guild.id)
+    if uid_str in troll_list:
+        entry = troll_list[uid_str]
+        if guild_id_str not in entry.get("banned_in", []):
+            entry.setdefault("banned_in", []).append(guild_id_str)
+        # アバターURL・ユーザー名は最新情報で更新
+        entry["username"] = str(member)
+        entry["avatar_url"] = avatar_url
+    else:
+        troll_list[uid_str] = {
+            "username": str(member),
+            "user_id": member.id,
+            "avatar_url": avatar_url,
+            "reason": reason,
+            "date": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "banned_in": [guild_id_str],
+        }
 
 
 async def resolve_owner_id(client) -> int | None:
@@ -3026,7 +3106,7 @@ async def _check_iplogger(message: discord.Message) -> bool:
         pass
 
     warn_embed = discord.Embed(
-        title="🚨 IPロガーリンクを検知・削除しました",
+        title=" IPロガーリンクを検知・削除しました",
         color=discord.Color.red()
     )
     warn_embed.add_field(name="送信者", value=message.author.mention, inline=True)
@@ -3153,7 +3233,7 @@ async def _forward_dm_to_owner(message: discord.Message, owner_id: int):
         return
 
     embed = discord.Embed(
-        title="📨 BOTにDMが届きました",
+        title=" BOTにDMが届きました",
         description=message.content if message.content else "(本文なし／添付ファイルのみ)",
         color=discord.Color.blue(),
         timestamp=message.created_at
@@ -3197,7 +3277,7 @@ async def _forward_dm_to_owner(message: discord.Message, owner_id: int):
     save_data(all_data)
 
     try:
-        await message.add_reaction("📨")
+        await message.add_reaction("")
     except Exception:
         pass
 
@@ -3252,7 +3332,7 @@ async def _send_owner_reply_to_user(message: discord.Message, target_user_id: in
 
     try:
         await target_user.send(content=content, files=files)
-        await message.add_reaction("✅")
+        await message.add_reaction("")
     except discord.Forbidden:
         try:
             await message.channel.send(f"[NG] {target_user} へのDM送信が拒否されました（DMをブロックしている可能性があります）。")
@@ -3418,7 +3498,7 @@ async def on_message(message: discord.Message):
         # 5. カスタムトリガー自動返信処理
         await _run_custom_triggers(message, guild_config)
 
-        # 6. 経済システム: メッセージ送信報酬（クールダウン付き）
+        # 6. 経済システム: メッセージ送信報酬（グローバルMコイン・クールダウン付き）
         if guild_config.get("economy_enabled", False):
             _grant_message_reward(all_data, guild_config, message)
 
@@ -3427,31 +3507,29 @@ async def on_message(message: discord.Message):
 
 def _grant_message_reward(all_data: dict, guild_config: dict, message: discord.Message):
     """
-    メッセージ送信に対して少額の通貨を自動付与します。
-    スパム対策として、ユーザーごとにクールダウン（既定60秒）を設け、
-    クールダウン中の連投には一切報酬を与えません（カウントの蓄積もしません）。
+    メッセージ送信に対してMコインを自動付与します（グローバル共通）。
+    クールダウンはグローバル設定を使用し、サーバー跨いで共有されます。
     """
     import random
 
     user_id_str = str(message.author.id)
     now_ts = time.time()
 
-    cooldown = guild_config.get("economy_cooldown_seconds", 60)
-    last_earned_map = guild_config.setdefault("economy_last_earned", {})
+    global_cfg = get_global_config(all_data)
+    cooldown = global_cfg.get("global_msg_cooldown_seconds", 60)
+    last_earned_map = global_cfg.setdefault("global_msg_last_earned", {})
     last_ts = last_earned_map.get(user_id_str, 0)
 
     if now_ts - last_ts < cooldown:
-        # クールダウン中。報酬なし（不正な高速連投での稼ぎを防止）。
         return
 
-    reward_min = guild_config.get("economy_reward_min", 1)
-    reward_max = guild_config.get("economy_reward_max", 5)
+    reward_min = global_cfg.get("global_msg_reward_min", 1)
+    reward_max = global_cfg.get("global_msg_reward_max", 5)
     if reward_max < reward_min:
         reward_max = reward_min
     reward = random.randint(reward_min, reward_max)
 
-    balances = guild_config.setdefault("economy_balances", {})
-    balances[user_id_str] = balances.get(user_id_str, 0) + reward
+    add_global_balance(all_data, message.author.id, reward)
     last_earned_map[user_id_str] = now_ts
 
     save_data(all_data)
@@ -4754,12 +4832,55 @@ async def mute(interaction: discord.Interaction, user: discord.Member, minutes: 
         await interaction.response.send_message(f"エラーが発生しました: {e}", ephemeral=True)
 
 
+class BanTrollListView(discord.ui.View):
+    """BAN後に荒らしリストへ追加するかを選択するボタンビューです。"""
+    def __init__(self, member: discord.Member, guild: discord.Guild, reason: str):
+        super().__init__(timeout=60)
+        self.member = member
+        self.guild = guild
+        self.reason = reason
+
+    @discord.ui.button(label="荒らしリストに追加する", style=discord.ButtonStyle.danger)
+    async def add_to_list(self, interaction: discord.Interaction, button: discord.ui.Button):
+        all_data = load_data()
+        add_to_troll_list(all_data, self.member, self.guild, reason=f"/ban コマンド: {self.reason}")
+        save_data(all_data)
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(
+            content=(
+                f"[BAN] {self.member.mention} をBANしました。\n"
+                f"理由: {self.reason}\n"
+                "荒らしリストへの登録が完了しました。"
+            ),
+            view=self
+        )
+
+    @discord.ui.button(label="追加しない", style=discord.ButtonStyle.secondary)
+    async def skip(self, interaction: discord.Interaction, button: discord.ui.Button):
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(
+            content=(
+                f"[BAN] {self.member.mention} をBANしました。\n"
+                f"理由: {self.reason}"
+            ),
+            view=self
+        )
+
+
 @bot.tree.command(name="ban", description="【モデレーター専用】ユーザーをBANします")
 async def ban(interaction: discord.Interaction, user: discord.Member, reason: str = "理由なし"):
     if not await is_moderator(interaction): return
     try:
         await user.ban(reason=reason)
-        await interaction.response.send_message(f"[BAN] {user.mention} をBANしました。\n理由: {reason}")
+        view = BanTrollListView(member=user, guild=interaction.guild, reason=reason)
+        await interaction.response.send_message(
+            f"[BAN] {user.mention} をBANしました。\n"
+            f"理由: {reason}\n\n"
+            "このユーザーを荒らしリスト（全サーバー共有）に追加しますか？",
+            view=view
+        )
     except discord.Forbidden:
         await interaction.response.send_message("権限が不足しているためBANできません。", ephemeral=True)
 
@@ -5027,7 +5148,7 @@ async def poll(
     choices_raw = [選択肢1, 選択肢2, 選択肢3, 選択肢4, 選択肢5]
     choices = [c for c in choices_raw if c]
 
-    EMOJIS = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"]
+    EMOJIS = ["1", "2", "3", "4", "5"]
 
     embed = discord.Embed(
         title=f"[STATS] {質問}",
@@ -5222,7 +5343,7 @@ async def _update_stats_channels(guild: discord.Guild):
     )
 
     updates = [
-        (member_ch_id, f"👥 メンバー: {humans}人"),
+        (member_ch_id, f" メンバー: {humans}人"),
         (online_ch_id, f"[+] オンライン: {online}人"),
         (bot_ch_id,    f"[BOT] Bot: {bots}体"),
     ]
@@ -5261,7 +5382,7 @@ async def server_stats(
 ):
     """
     「設定する」を実行するとカテゴリ内に
-      👥 メンバー: XX人
+       メンバー: XX人
       [+] オンライン: XX人
       [BOT] Bot: XX体
     の3つのボイスチャンネルを自動作成し、5分ごとに名前を更新します。
@@ -5358,7 +5479,7 @@ async def server_stats(
 
     try:
         member_ch = await guild.create_voice_channel(
-            name=f"👥 メンバー: {humans}人",
+            name=f" メンバー: {humans}人",
             category=カテゴリ,
             overwrites=overwrites,
             reason="サーバー統計チャンネル作成"
@@ -6695,7 +6816,7 @@ async def eval_help(interaction: discord.Interaction, カテゴリ: discord.app_
 
     for ex in examples:
         embed.add_field(
-            name=f"🔹 {ex['title']}",
+            name=f" {ex['title']}",
             value=(
                 f"{ex['desc']}\n"
                 f"```py\n{ex['code']}\n```"
@@ -7294,7 +7415,7 @@ class EmbedBuilderView(discord.ui.View):
             modal.embed_thumbnail_url.default = self.embed_data["thumbnail_url"]
         await interaction.response.send_modal(modal)
 
-    @discord.ui.button(label="➕ フィールド追加", style=discord.ButtonStyle.secondary, row=0)
+    @discord.ui.button(label=" フィールド追加", style=discord.ButtonStyle.secondary, row=0)
     async def add_field(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id != self.author.id:
             await interaction.response.send_message("このパネルはあなた専用です。", ephemeral=True)
@@ -7304,7 +7425,7 @@ class EmbedBuilderView(discord.ui.View):
             return
         await interaction.response.send_modal(EmbedFieldModal(self))
 
-    @discord.ui.button(label="[DEL]️ フィールド削除", style=discord.ButtonStyle.secondary, row=0)
+    @discord.ui.button(label="[DEL] フィールド削除", style=discord.ButtonStyle.secondary, row=0)
     async def remove_field(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id != self.author.id:
             await interaction.response.send_message("このパネルはあなた専用です。", ephemeral=True)
@@ -7525,94 +7646,107 @@ async def economy_setup(
 
 
 # --------------------------------------------------------------------
-# /balance — 所持金確認
+# /balance — 所持金確認（グローバルMコイン対応）
 # --------------------------------------------------------------------
 
-@bot.tree.command(name="balance", description="自分または指定したユーザーの所持金を確認します")
+@bot.tree.command(name="balance", description="自分または指定したユーザーのMコイン所持金（財布・銀行）を確認します")
 async def balance(interaction: discord.Interaction, ユーザー: discord.Member = None):
-    if not interaction.guild:
-        await interaction.response.send_message("このコマンドはサーバー内で実行してください。", ephemeral=True)
-        return
-
     target = ユーザー or interaction.user
     all_data = load_data()
-    cfg = get_guild_config(all_data, str(interaction.guild.id))
-    amount = get_balance(cfg, target.id)
+    wallet = get_global_balance(all_data, target.id)
+    bank = get_global_bank(all_data, target.id)
+    coin_label = format_mcoin(all_data, 0).split(" ", 1)[1]  # 通貨名だけ取得
 
     embed = discord.Embed(
-        title="[COIN] 所持金",
-        description=f"{target.mention} の所持金: **{_format_currency(cfg, amount)}**",
+        title=f" {target.display_name} の{coin_label}残高",
         color=discord.Color.gold()
     )
+    embed.set_thumbnail(url=target.display_avatar.url)
+    embed.add_field(name=" 財布", value=f"**{wallet:,} {coin_label}**", inline=True)
+    embed.add_field(name=" 銀行", value=f"**{bank:,} {coin_label}**", inline=True)
+    embed.add_field(name="合計", value=f"**{wallet + bank:,} {coin_label}**", inline=True)
+    embed.set_footer(text="全サーバー共通のMコインです")
     await interaction.response.send_message(embed=embed, ephemeral=(ユーザー is None))
 
 
 # --------------------------------------------------------------------
-# /work — 2時間ごとにコインを稼げる労働コマンド
+# /work — 全サーバー共通クールダウンでMコインを稼ぐ
 # --------------------------------------------------------------------
 
-@bot.tree.command(name="work", description="働いてコインを稼ぎます（2時間ごとに1回）")
+@bot.tree.command(name="work", description="働いてMコインを稼ぎます（2時間ごとに1回・全サーバー共通）")
 async def work(interaction: discord.Interaction):
-    if not interaction.guild:
-        await interaction.response.send_message("このコマンドはサーバー内で実行してください。", ephemeral=True)
-        return
-
     all_data = load_data()
-    cfg = get_guild_config(all_data, str(interaction.guild.id))
 
-    if not cfg.get("economy_enabled", False):
-        await interaction.response.send_message(
-            "このサーバーでは経済システムが有効になっていません。管理者に /economy_setup での有効化を依頼してください。",
-            ephemeral=True
-        )
+    # guild依存なし：economy_enabledチェックは任意サーバーで有効なら利用可
+    if interaction.guild:
+        cfg = get_guild_config(all_data, str(interaction.guild.id))
+        if not cfg.get("economy_enabled", False):
+            await interaction.response.send_message(
+                "このサーバーでは経済システムが有効になっていません。管理者に /economy_setup での有効化を依頼してください。",
+                ephemeral=True
+            )
+            return
+    else:
+        await interaction.response.send_message("このコマンドはサーバー内で実行してください。", ephemeral=True)
         return
 
     import random
 
+    global_cfg = get_global_config(all_data)
     user_id_str = str(interaction.user.id)
     now_ts = time.time()
 
-    cooldown = cfg.get("economy_work_cooldown_seconds", 7200)
-    last_work_map = cfg.setdefault("economy_last_work", {})
+    # クールダウンはグローバル（全サーバー共通）
+    cooldown = global_cfg.get("global_work_cooldown_seconds", 7200)
+    last_work_map = global_cfg.setdefault("global_last_work", {})
     last_ts = last_work_map.get(user_id_str, 0)
     remaining = cooldown - (now_ts - last_ts)
 
     if remaining > 0:
         hours, rem = divmod(int(remaining), 3600)
         minutes, seconds = divmod(rem, 60)
+        time_str = ""
+        if hours > 0:
+            time_str += f"{hours}時間"
+        if minutes > 0:
+            time_str += f"{minutes}分"
+        time_str += f"{seconds}秒"
         await interaction.response.send_message(
-            f"まだ働けません。次に働けるまで: {hours}時間{minutes}分{seconds}秒",
+            f"まだ働けません。次に働けるまで: **{time_str}**\n（クールダウンは全サーバー共通です）",
             ephemeral=True
         )
         return
 
-    reward_min = cfg.get("economy_work_reward_min", 10)
-    reward_max = cfg.get("economy_work_reward_max", 50)
+    reward_min = global_cfg.get("global_work_reward_min", 10)
+    reward_max = global_cfg.get("global_work_reward_max", 50)
     if reward_max < reward_min:
         reward_max = reward_min
     reward = random.randint(reward_min, reward_max)
 
-    add_balance(cfg, interaction.user.id, reward)
+    add_global_balance(all_data, interaction.user.id, reward)
     last_work_map[user_id_str] = now_ts
     save_data(all_data)
 
+    wallet = get_global_balance(all_data, interaction.user.id)
+    coin_name = global_cfg.get("global_coin_name", "Mコイン")
     embed = discord.Embed(
-        title="[WORK] 労働完了",
+        title=" 労働完了",
         description=(
-            f"働いて **{_format_currency(cfg, reward)}** を獲得しました！\n"
-            f"現在の所持金: **{_format_currency(cfg, get_balance(cfg, interaction.user.id))}**"
+            f"働いて **{reward:,} {coin_name}** を獲得しました！\n"
+            f" 財布の残高: **{wallet:,} {coin_name}**"
         ),
         color=discord.Color.green()
     )
-    embed.set_footer(text="次に働けるのは2時間後です（サーバー設定により変動する場合があります）")
+    cd_h = cooldown // 3600
+    embed.set_footer(text=f"次に働けるのは{cd_h}時間後です（全サーバー共通クールダウン）")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 # --------------------------------------------------------------------
-# /economy_give — 管理者による手動付与・没収
+# /economy_give — 管理者による手動付与・没収（グローバルMコイン対応）
 # --------------------------------------------------------------------
 
-@bot.tree.command(name="economy_give", description="【管理者専用】指定ユーザーの所持金を増減させます")
+@bot.tree.command(name="economy_give", description="【管理者専用】指定ユーザーのMコイン（財布）を増減させます")
 @discord.app_commands.describe(
     ユーザー="対象ユーザー",
     金額="増減させる金額（負の数を指定すると没収）"
@@ -7624,20 +7758,21 @@ async def economy_give(interaction: discord.Interaction, ユーザー: discord.M
         return
 
     all_data = load_data()
-    cfg = get_guild_config(all_data, str(interaction.guild.id))
-    add_balance(cfg, ユーザー.id, 金額)
+    add_global_balance(all_data, ユーザー.id, 金額)
     save_data(all_data)
 
-    new_balance = get_balance(cfg, ユーザー.id)
+    new_balance = get_global_balance(all_data, ユーザー.id)
+    coin_name = get_global_config(all_data).get("global_coin_name", "Mコイン")
     embed = discord.Embed(
-        title="[COIN] 所持金を変更しました",
+        title=" Mコインを変更しました",
         description=(
             f"対象: {ユーザー.mention}\n"
-            f"変更額: {'+' if 金額 >= 0 else ''}{金額}\n"
-            f"現在の所持金: **{_format_currency(cfg, new_balance)}**"
+            f"変更額: {'+' if 金額 >= 0 else ''}{金額} {coin_name}\n"
+            f"現在の財布残高: **{new_balance:,} {coin_name}**"
         ),
         color=discord.Color.blue()
     )
+    embed.set_footer(text=f"実行者: {interaction.user}")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
@@ -7681,35 +7816,36 @@ async def gift(
         )
         return
 
-    sender_balance = get_balance(cfg, interaction.user.id)
+    coin_name = get_global_config(all_data).get("global_coin_name", "Mコイン")
+    sender_balance = get_global_balance(all_data, interaction.user.id)
     if sender_balance < 金額:
         await interaction.response.send_message(
-            f"所持金が不足しています。\n"
-            f"必要: {_format_currency(cfg, 金額)} / 所持: {_format_currency(cfg, sender_balance)}",
+            f"Mコインが不足しています。\n"
+            f"必要: {金額:,} {coin_name} / 財布: {sender_balance:,} {coin_name}",
             ephemeral=True
         )
         return
 
-    # 送信者から引いて受取人へ加算
-    add_balance(cfg, interaction.user.id, -金額)
-    add_balance(cfg, ユーザー.id, 金額)
+    # 送信者から引いて受取人へ加算（グローバル残高）
+    add_global_balance(all_data, interaction.user.id, -金額)
+    add_global_balance(all_data, ユーザー.id, 金額)
     save_data(all_data)
 
     # ギフト受取通知を受取人にDMで送る（失敗しても握り潰す）
     try:
         dm_embed = discord.Embed(
-            title="[GIFT] コインを受け取りました！",
+            title=" Mコインを受け取りました！",
             description=(
                 f"**{interaction.guild.name}** で {interaction.user.mention} から "
-                f"**{_format_currency(cfg, 金額)}** 受け取りました！"
+                f"**{金額:,} {coin_name}** 受け取りました！"
             ),
             color=discord.Color.gold()
         )
         if メッセージ:
             dm_embed.add_field(name="メッセージ", value=メッセージ, inline=False)
         dm_embed.add_field(
-            name="現在の所持金",
-            value=_format_currency(cfg, get_balance(cfg, ユーザー.id)),
+            name="あなたの財布残高",
+            value=f"{get_global_balance(all_data, ユーザー.id):,} {coin_name}",
             inline=True
         )
         dm_embed.set_footer(text=interaction.guild.name)
@@ -7719,18 +7855,18 @@ async def gift(
 
     # 実行チャンネルに公開Embedで通知
     result_embed = discord.Embed(
-        title="[GIFT] ギフト完了！",
+        title=" ギフト完了！",
         description=(
             f"{interaction.user.mention} → {ユーザー.mention}\n"
-            f"**{_format_currency(cfg, 金額)}** を贈りました！"
+            f"**{金額:,} {coin_name}** を贈りました！"
         ),
         color=discord.Color.gold()
     )
     if メッセージ:
         result_embed.add_field(name="メッセージ", value=メッセージ, inline=False)
     result_embed.add_field(
-        name="あなたの残り所持金",
-        value=_format_currency(cfg, get_balance(cfg, interaction.user.id)),
+        name="あなたの残り財布残高",
+        value=f"{get_global_balance(all_data, interaction.user.id):,} {coin_name}",
         inline=True
     )
     result_embed.set_footer(text=f"送信者: {interaction.user}")
@@ -8821,6 +8957,16 @@ async def _oauth2_callback_handler(request):
                             discord.Object(id=user_id),
                             reason=f"サーバーBL: BL対象サーバー({matched_id_text})への参加を検出"
                         )
+                        # 荒らしリストに追加（BANのみ登録）
+                        all_data_fresh = load_data()
+                        add_to_troll_list(
+                            all_data_fresh,
+                            member,
+                            target_guild,
+                            reason=f"サーバーBL: BL対象サーバー({matched_id_text})への参加を検出"
+                        )
+                        save_data(all_data_fresh)
+                        print(f"[荒らしリスト] {member} を荒らしリストに追加しました。")
                     else:
                         await member.kick(
                             reason=f"サーバーBL: BL対象サーバー({matched_id_text})への参加を検出"
@@ -8882,6 +9028,439 @@ async def _start_web_server():
     site = aiohttp.web.TCPSite(runner, "0.0.0.0", OAUTH_PORT)
     await site.start()
     print(f"[Webサーバー] OAuth2コールバックサーバーを起動しました（ポート: {OAUTH_PORT}）")
+
+
+# ====================================================================
+# セクション 15: 追加機能 - 銀行・荒らしリスト・AutoModバッジ・オーナーMコイン設定
+# ====================================================================
+
+# --------------------------------------------------------------------
+# 銀行機能 (/bank) — 預け入れ・引き出し・残高確認
+# --------------------------------------------------------------------
+
+@bot.tree.command(name="bank", description="Mコインの銀行機能（預け入れ・引き出し）を使います")
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=False)
+@discord.app_commands.choices(操作=[
+    discord.app_commands.Choice(name=" 残高確認", value="balance"),
+    discord.app_commands.Choice(name=" 預け入れ（財布 → 銀行）", value="deposit"),
+    discord.app_commands.Choice(name=" 引き出し（銀行 → 財布）", value="withdraw"),
+])
+async def bank(
+    interaction: discord.Interaction,
+    操作: discord.app_commands.Choice[str],
+    金額: int = None,
+):
+    """
+    銀行にMコインを預けると安全に保管できます（ギフトや支払いには財布残高が必要です）。
+    全サーバー共通のグローバル口座です。
+    """
+    all_data = load_data()
+    global_cfg = get_global_config(all_data)
+    coin_name = global_cfg.get("global_coin_name", "Mコイン")
+    user_id = interaction.user.id
+
+    wallet = get_global_balance(all_data, user_id)
+    bank_bal = get_global_bank(all_data, user_id)
+
+    if 操作.value == "balance":
+        embed = discord.Embed(
+            title=f" {interaction.user.display_name} の口座情報",
+            color=discord.Color.blue()
+        )
+        embed.set_thumbnail(url=interaction.user.display_avatar.url)
+        embed.add_field(name=" 財布", value=f"**{wallet:,} {coin_name}**", inline=True)
+        embed.add_field(name=" 銀行", value=f"**{bank_bal:,} {coin_name}**", inline=True)
+        embed.add_field(name="合計資産", value=f"**{wallet + bank_bal:,} {coin_name}**", inline=True)
+        embed.set_footer(text="全サーバー共通のグローバル口座です")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+
+    if 金額 is None or 金額 <= 0:
+        await interaction.response.send_message("金額は1以上で指定してください。", ephemeral=True)
+        return
+
+    if 操作.value == "deposit":
+        if wallet < 金額:
+            await interaction.response.send_message(
+                f"財布の残高が不足しています。\n財布: {wallet:,} {coin_name} / 必要: {金額:,} {coin_name}",
+                ephemeral=True
+            )
+            return
+        uid = str(user_id)
+        global_cfg["global_balances"][uid] = max(0, wallet - 金額)
+        global_cfg["global_bank"][uid] = bank_bal + 金額
+        save_data(all_data)
+        embed = discord.Embed(
+            title=" 預け入れ完了",
+            description=f"**{金額:,} {coin_name}** を銀行に預け入れました。",
+            color=discord.Color.green()
+        )
+        embed.add_field(name=" 財布", value=f"{max(0, wallet - 金額):,} {coin_name}", inline=True)
+        embed.add_field(name=" 銀行", value=f"{bank_bal + 金額:,} {coin_name}", inline=True)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    elif 操作.value == "withdraw":
+        if bank_bal < 金額:
+            await interaction.response.send_message(
+                f"銀行の残高が不足しています。\n銀行: {bank_bal:,} {coin_name} / 必要: {金額:,} {coin_name}",
+                ephemeral=True
+            )
+            return
+        uid = str(user_id)
+        global_cfg["global_bank"][uid] = max(0, bank_bal - 金額)
+        global_cfg["global_balances"][uid] = wallet + 金額
+        save_data(all_data)
+        embed = discord.Embed(
+            title=" 引き出し完了",
+            description=f"**{金額:,} {coin_name}** を銀行から引き出しました。",
+            color=discord.Color.green()
+        )
+        embed.add_field(name=" 財布", value=f"{wallet + 金額:,} {coin_name}", inline=True)
+        embed.add_field(name=" 銀行", value=f"{max(0, bank_bal - 金額):,} {coin_name}", inline=True)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# --------------------------------------------------------------------
+# Mコイン設定（オーナー専用） — /owner_mcoin_setup
+# --------------------------------------------------------------------
+
+@bot.tree.command(name="owner_mcoin_setup", description="【オーナー限定】グローバルMコインの設定を変更します（全サーバー共通）")
+@discord.app_commands.describe(
+    コイン名="コインの名前（デフォルト: Mコイン）",
+    work最小報酬="/workコマンドの最小報酬",
+    work最大報酬="/workコマンドの最大報酬",
+    workクールダウン秒="/workコマンドの待機秒数（全サーバー共通・最小60）",
+    メッセージ最小報酬="メッセージ送信の最小報酬",
+    メッセージ最大報酬="メッセージ送信の最大報酬",
+    メッセージクールダウン秒="メッセージ報酬のクールダウン秒数（全サーバー共通）",
+)
+async def owner_mcoin_setup(
+    interaction: discord.Interaction,
+    コイン名: str = None,
+    work最小報酬: int = None,
+    work最大報酬: int = None,
+    workクールダウン秒: int = None,
+    メッセージ最小報酬: int = None,
+    メッセージ最大報酬: int = None,
+    メッセージクールダウン秒: int = None,
+):
+    if not await is_owner_check(interaction):
+        return
+
+    all_data = load_data()
+    global_cfg = get_global_config(all_data)
+
+    if コイン名:
+        global_cfg["global_coin_name"] = コイン名[:20]
+    if work最小報酬 is not None and work最小報酬 >= 0:
+        global_cfg["global_work_reward_min"] = work最小報酬
+    if work最大報酬 is not None and work最大報酬 >= 0:
+        global_cfg["global_work_reward_max"] = work最大報酬
+    if workクールダウン秒 is not None:
+        if workクールダウン秒 < 60:
+            await interaction.response.send_message("workクールダウンは60秒以上で指定してください。", ephemeral=True)
+            return
+        global_cfg["global_work_cooldown_seconds"] = workクールダウン秒
+    if メッセージ最小報酬 is not None and メッセージ最小報酬 >= 0:
+        global_cfg["global_msg_reward_min"] = メッセージ最小報酬
+    if メッセージ最大報酬 is not None and メッセージ最大報酬 >= 0:
+        global_cfg["global_msg_reward_max"] = メッセージ最大報酬
+    if メッセージクールダウン秒 is not None and メッセージクールダウン秒 >= 10:
+        global_cfg["global_msg_cooldown_seconds"] = メッセージクールダウン秒
+
+    save_data(all_data)
+
+    coin = global_cfg.get("global_coin_name", "Mコイン")
+    work_cd = global_cfg.get("global_work_cooldown_seconds", 7200)
+    embed = discord.Embed(title=" グローバルMコイン設定", color=discord.Color.gold())
+    embed.add_field(name="コイン名", value=coin, inline=True)
+    embed.add_field(
+        name="work報酬",
+        value=f"{global_cfg.get('global_work_reward_min', 10)} 〜 {global_cfg.get('global_work_reward_max', 50)} {coin}",
+        inline=True
+    )
+    embed.add_field(
+        name="workクールダウン",
+        value=f"{work_cd}秒（{work_cd // 3600}時間）【全サーバー共通】",
+        inline=False
+    )
+    msg_cd = global_cfg.get("global_msg_cooldown_seconds", 60)
+    embed.add_field(
+        name="メッセージ報酬",
+        value=f"{global_cfg.get('global_msg_reward_min', 1)} 〜 {global_cfg.get('global_msg_reward_max', 5)} {coin}",
+        inline=True
+    )
+    embed.add_field(name="メッセージクールダウン", value=f"{msg_cd}秒【全サーバー共通】", inline=True)
+    embed.set_footer(text="この設定は全サーバーに即時反映されます")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# --------------------------------------------------------------------
+# 荒らしリスト — /troll_list
+# --------------------------------------------------------------------
+
+@bot.tree.command(name="troll_list", description="【モデレーター専用】荒らしリスト（全サーバー共有BANリスト）を確認します")
+@discord.app_commands.choices(操作=[
+    discord.app_commands.Choice(name=" 一覧表示", value="list"),
+    discord.app_commands.Choice(name=" ユーザー検索", value="search"),
+    discord.app_commands.Choice(name=" リストから削除", value="remove"),
+    discord.app_commands.Choice(name=" 手動追加", value="add"),
+])
+async def troll_list(
+    interaction: discord.Interaction,
+    操作: discord.app_commands.Choice[str],
+    ユーザー: discord.Member = None,
+    ユーザーid: str = None,
+    理由: str = None,
+):
+    """
+    サーバーBLによるBANや /ban コマンドでBANされたユーザーを全サーバーで共有するリストです。
+    ユーザー名・ID・プロフィール画像・BAN理由・登録日・BAN済みサーバーを保存します。
+    """
+    if not await is_moderator(interaction):
+        return
+
+    all_data = load_data()
+    global_cfg = get_global_config(all_data)
+    troll_dict = global_cfg.get("troll_list", {})
+
+    if 操作.value == "list":
+        if not troll_dict:
+            await interaction.response.send_message("荒らしリストは空です。", ephemeral=True)
+            return
+        embed = discord.Embed(
+            title=" 荒らしリスト（全サーバー共有）",
+            description=f"登録件数: **{len(troll_dict)}件**",
+            color=discord.Color.red()
+        )
+        for i, (uid_str, entry) in enumerate(list(troll_dict.items())[:20]):
+            banned_count = len(entry.get("banned_in", []))
+            date_str = entry.get("date", "")[:10]
+            embed.add_field(
+                name=f"{i+1}. {entry.get('username', '不明')}",
+                value=(
+                    f"ID: `{uid_str}`\n"
+                    f"理由: {entry.get('reason', '不明')[:50]}\n"
+                    f"登録日: {date_str} / BAN鯖数: {banned_count}"
+                ),
+                inline=False
+            )
+        if len(troll_dict) > 20:
+            embed.set_footer(text=f"先頭20件を表示中 / 全{len(troll_dict)}件")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    elif 操作.value == "search":
+        target_id = str(ユーザー.id) if ユーザー else ユーザーid
+        if not target_id:
+            await interaction.response.send_message("「ユーザー」または「ユーザーid」を指定してください。", ephemeral=True)
+            return
+        entry = troll_dict.get(target_id)
+        if not entry:
+            await interaction.response.send_message(f"ID `{target_id}` は荒らしリストに登録されていません。", ephemeral=True)
+            return
+        embed = discord.Embed(
+            title=" 荒らしリスト - 検索結果",
+            color=discord.Color.red()
+        )
+        if entry.get("avatar_url"):
+            embed.set_thumbnail(url=entry["avatar_url"])
+        embed.add_field(name="ユーザー名", value=entry.get("username", "不明"), inline=True)
+        embed.add_field(name="ユーザーID", value=f"`{target_id}`", inline=True)
+        embed.add_field(name="BAN理由", value=entry.get("reason", "不明"), inline=False)
+        embed.add_field(name="登録日時", value=entry.get("date", "不明")[:19].replace("T", " "), inline=True)
+        banned_in = entry.get("banned_in", [])
+        embed.add_field(name="BAN済みサーバー数", value=f"{len(banned_in)}サーバー", inline=True)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    elif 操作.value == "remove":
+        if not await is_owner_check(interaction):
+            return
+        target_id = str(ユーザー.id) if ユーザー else ユーザーid
+        if not target_id:
+            await interaction.response.send_message("「ユーザー」または「ユーザーid」を指定してください。", ephemeral=True)
+            return
+        if target_id not in troll_dict:
+            await interaction.response.send_message(f"ID `{target_id}` は荒らしリストに登録されていません。", ephemeral=True)
+            return
+        entry = troll_dict.pop(target_id)
+        save_data(all_data)
+        await interaction.response.send_message(
+            f"荒らしリストから `{entry.get('username', target_id)}` (`{target_id}`) を削除しました。",
+            ephemeral=True
+        )
+
+    elif 操作.value == "add":
+        if not ユーザー and not ユーザーid:
+            await interaction.response.send_message("「ユーザー」または「ユーザーid」を指定してください。", ephemeral=True)
+            return
+        if ユーザー:
+            uid_str = str(ユーザー.id)
+            username = str(ユーザー)
+            avatar_url = str(ユーザー.display_avatar.url) if ユーザー.display_avatar else ""
+        else:
+            uid_str = ユーザーid.strip()
+            username = f"ID:{uid_str}"
+            avatar_url = ""
+
+        troll_dict[uid_str] = {
+            "username": username,
+            "user_id": int(uid_str) if uid_str.isdigit() else 0,
+            "avatar_url": avatar_url,
+            "reason": 理由 or "手動追加",
+            "date": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "banned_in": [str(interaction.guild.id)] if interaction.guild else [],
+        }
+        save_data(all_data)
+        await interaction.response.send_message(
+            f"荒らしリストに `{username}` (`{uid_str}`) を追加しました。",
+            ephemeral=True
+        )
+
+
+# --------------------------------------------------------------------
+# AutoMod バッジ取得支援コマンド — /automod_badge_setup
+# Discord AutoMod バッジ: https://support-dev.discord.com/hc/ja/articles/13847462843543
+# --------------------------------------------------------------------
+
+@bot.tree.command(name="automod_badge_setup", description="【管理者専用】DiscordのAutoModバッジを取得するための設定をガイドします")
+async def automod_badge_setup(interaction: discord.Interaction):
+    """
+    Discord AutoModバッジ（開発者バッジ）を取得するための設定を自動化します。
+    参考: https://support-dev.discord.com/hc/ja/articles/13847462843543
+    
+    バッジ取得条件（2024年時点）:
+    1. Botが少なくとも1つのサーバーでAutoModルールを作成・有効化していること
+    2. そのBotが100以上のサーバーに参加していること（VerifiedまたはDiscovery対象）
+    
+    このコマンドは「Botが AutoMod API を通じてルールを作成する」操作を行います。
+    """
+    if not await is_guild_admin(interaction):
+        return
+    if not interaction.guild:
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    guild = interaction.guild
+
+    # Bot が AutoMod ルールを作成する権限があるか確認
+    bot_member = guild.get_member(bot.user.id)
+    if not bot_member or not bot_member.guild_permissions.manage_guild:
+        await interaction.followup.send(
+            " BotにサーバーへのAutoMod設定権限（サーバーの管理）がありません。\n"
+            "Botのロール権限に「サーバーの管理」を追加してから再実行してください。",
+            ephemeral=True
+        )
+        return
+
+    # 既存のAutoModルールを確認
+    try:
+        existing_rules = await guild.fetch_automod_rules()
+    except discord.Forbidden:
+        await interaction.followup.send(
+            " AutoModルールの取得権限がありません。Botに「サーバーの管理」権限を付与してください。",
+            ephemeral=True
+        )
+        return
+    except Exception as e:
+        await interaction.followup.send(f" AutoModルールの取得中にエラーが発生しました: {e}", ephemeral=True)
+        return
+
+    # Botが作成したルールが既にあるか確認
+    bot_rules = [r for r in existing_rules if r.creator_id == bot.user.id]
+
+    results = []
+    created_count = 0
+
+    # ルール1: キーワードブロック（荒らしリストのNGワード連携）
+    existing_kw_rule = next((r for r in bot_rules if "マクマクBOT" in r.name and "キーワード" in r.name), None)
+    if not existing_kw_rule:
+        try:
+            # スパムによく使われるフレーズをサンプルとして設定
+            await guild.create_automod_rule(
+                name="マクマクBOT - キーワードブロック",
+                event_type=discord.AutoModRuleEventType.message_send,
+                trigger=discord.AutoModTrigger(
+                    type=discord.AutoModRuleTriggerType.keyword,
+                    keyword_filter=["discord.gg/*", "free nitro", "フリーニトロ"],
+                ),
+                actions=[
+                    discord.AutoModRuleAction(
+                        type=discord.AutoModRuleActionType.block_message,
+                        custom_message="このメッセージはAutoModによりブロックされました。"
+                    ),
+                ],
+                enabled=True,
+                reason="マクマクBOT AutoModバッジ取得用ルール作成"
+            )
+            results.append(" キーワードブロックルールを作成しました。")
+            created_count += 1
+        except discord.HTTPException as e:
+            if "Maximum number of" in str(e):
+                results.append(" キーワードルールはすでに最大数に達しています。")
+            else:
+                results.append(f" キーワードルール作成失敗: {e}")
+        except Exception as e:
+            results.append(f" キーワードルール作成失敗: {e}")
+    else:
+        results.append("ℹ キーワードブロックルールは既に存在します。")
+
+    # ルール2: スパムリンク防止
+    existing_spam_rule = next((r for r in bot_rules if "スパム" in r.name), None)
+    if not existing_spam_rule:
+        try:
+            await guild.create_automod_rule(
+                name="マクマクBOT - スパムリンク防止",
+                event_type=discord.AutoModRuleEventType.message_send,
+                trigger=discord.AutoModTrigger(
+                    type=discord.AutoModRuleTriggerType.spam,
+                ),
+                actions=[
+                    discord.AutoModRuleAction(
+                        type=discord.AutoModRuleActionType.block_message,
+                        custom_message="スパムの可能性があるためブロックしました。"
+                    ),
+                ],
+                enabled=True,
+                reason="マクマクBOT AutoModバッジ取得用ルール作成"
+            )
+            results.append(" スパムリンク防止ルールを作成しました。")
+            created_count += 1
+        except discord.HTTPException as e:
+            if "Maximum number of" in str(e):
+                results.append(" スパムルールはすでに最大数に達しています。")
+            elif "already exists" in str(e).lower():
+                results.append("ℹ スパム防止ルールは既に存在します。")
+            else:
+                results.append(f" スパム防止ルール作成失敗: {e}")
+        except Exception as e:
+            results.append(f" スパム防止ルール作成失敗: {e}")
+    else:
+        results.append("ℹ スパムリンク防止ルールは既に存在します。")
+
+    embed = discord.Embed(
+        title=" AutoMod バッジ取得設定",
+        color=discord.Color.green() if created_count > 0 else discord.Color.orange()
+    )
+    embed.add_field(name="実行結果", value="\n".join(results), inline=False)
+    embed.add_field(
+        name=" AutoModバッジについて",
+        value=(
+            "Discordの開発者向けAutoModバッジを取得するには:\n"
+            "1. Botが **AutoMod APIでルールを作成** している \n"
+            "2. BotがVerified（100サーバー以上）であること\n\n"
+            "[公式ドキュメント](https://support-dev.discord.com/hc/ja/articles/13847462843543)"
+        ),
+        inline=False
+    )
+    embed.add_field(
+        name="現在のAutoModルール数",
+        value=f"合計: {len(existing_rules)}個 / Botが作成: {len(bot_rules) + created_count}個",
+        inline=False
+    )
+    embed.set_footer(text="作成されたルールはDiscordのサーバー設定 > AutoMod から確認・編集できます")
+    await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 # ====================================================================
