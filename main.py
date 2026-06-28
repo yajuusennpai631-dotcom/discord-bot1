@@ -1035,6 +1035,62 @@ class VerifyButtonView(discord.ui.View):
             await interaction.response.send_message(f"エラーが発生しました: {e}", ephemeral=True)
 
 
+class VerifyBlacklistButtonView(discord.ui.View):
+    """サーバーブラックリスト認証パネル用のボタンビューです。"""
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="連携認証を開始する", style=discord.ButtonStyle.success, custom_id="persistent_verify_blacklist_button")
+    async def verify_blacklist(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.guild: return
+        
+        # OAuth2設定が不完全な場合はエラー
+        if not OAUTH_REDIRECT_URI or not DISCORD_CLIENT_ID or not DISCORD_CLIENT_SECRET:
+            await interaction.response.send_message(
+                "エラー: Bot側のOAuth2設定が完了していないため、認証を開始できません。管理者にお問い合わせください。",
+                ephemeral=True
+            )
+            return
+
+        # HMAC署名付きのstateトークンを生成（guild_id:user_id）
+        import hmac
+        import hashlib
+        import base64
+        import urllib.parse
+        state_payload = f"{interaction.guild.id}:{interaction.user.id}"
+        signature = hmac.new(
+            OAUTH_SECRET_KEY.encode(),
+            state_payload.encode(),
+            hashlib.sha256
+        ).hexdigest()
+        state = base64.urlsafe_b64encode(
+            f"{state_payload}:{signature}".encode()
+        ).decode()
+
+        # OAuth2 認証URL を生成
+        params = urllib.parse.urlencode({
+            "client_id": DISCORD_CLIENT_ID,
+            "redirect_uri": OAUTH_REDIRECT_URI,
+            "response_type": "code",
+            "scope": "guilds",
+            "state": state,
+        })
+        oauth_url = f"https://discord.com/oauth2/authorize?{params}"
+
+        embed = discord.Embed(
+            title="🔗 外部連携認証",
+            description=(
+                "以下のリンクからDiscordアカウントの連携認証を行ってください。\n"
+                "他サーバーの在籍状況を確認し、問題がなければ自動的に認証が完了します。\n\n"
+                "**注意:** このリンクはあなた専用です。他の人に共有しないでください。"
+            ),
+            color=discord.Color.blue()
+        )
+        embed.add_field(name="認証リンク", value=f"[ここをクリックして認証する]({oauth_url})", inline=False)
+        
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
 class RestoreConfirmView(discord.ui.View):
     """
     サーバーリストアの実行確認用ボタンビューです。
@@ -2702,6 +2758,7 @@ async def on_ready():
                 print("[警告] Opusライブラリが見つかりませんでした。音声機能が使えない可能性があります。")
 
     bot.add_view(VerifyButtonView())
+    bot.add_view(VerifyBlacklistButtonView())  # サーバーブラックリスト認証ボタンの永続化
     bot.add_view(GiveawayJoinView())  # プレゼント参加ボタンの永続化
     all_data = load_data()
 
@@ -2756,6 +2813,22 @@ async def on_ready():
             bot.add_view(view, message_id=panel_message_id)
         except Exception as e:
             print(f"[警告] 自販機パネルの再登録に失敗しました（guild={guild_id_str}）: {e}")
+
+    # 設置型サーバーブラックリスト認証パネルの永続化View再登録
+    for guild_id_str, config in all_data.items():
+        if guild_id_str in ("user_apps", "global_config"):
+            continue
+        if not isinstance(config, dict):
+            continue
+        panel_message_id = config.get("server_blacklist_verify_message_id")
+        panel_channel_id = config.get("server_blacklist_verify_channel_id")
+        if not panel_message_id or not panel_channel_id:
+            continue
+        try:
+            bot.add_view(VerifyBlacklistButtonView(), message_id=panel_message_id)
+            print(f"  > サーバーBL認証パネル: 再活性化しました（message_id={panel_message_id}）")
+        except Exception as e:
+            print(f"[警告] サーバーBL認証パネルの再登録に失敗しました（guild={guild_id_str}）: {e}")
 
     try:
         await update_bot_status(bot)
@@ -3580,56 +3653,27 @@ async def on_member_join(member: discord.Member):
     # =========================================================
     # サーバーブラックリスト: 特定サーバー参加者を自動BAN/KICK
     # =========================================================
-    if cfg.get("server_blacklist_enabled", False) and OAUTH_REDIRECT_URI:
+    if cfg.get("server_blacklist_enabled", False):
         blacklist_ids = cfg.get("server_blacklist_ids", [])
         if blacklist_ids:
-            # HMAC署名付きのstateトークンを生成（guild_id:user_id）
-            import hmac
-            import hashlib
-            state_payload = f"{member.guild.id}:{member.id}"
-            signature = hmac.new(
-                OAUTH_SECRET_KEY.encode(),
-                state_payload.encode(),
-                hashlib.sha256
-            ).hexdigest()
-            state = base64.urlsafe_b64encode(
-                f"{state_payload}:{signature}".encode()
-            ).decode()
-
-            # OAuth2 認証URL を生成
-            params = urllib.parse.urlencode({
-                "client_id": DISCORD_CLIENT_ID,
-                "redirect_uri": OAUTH_REDIRECT_URI,
-                "response_type": "code",
-                "scope": "guilds",
-                "state": state,
-            })
-            oauth_url = f"https://discord.com/oauth2/authorize?{params}"
-
-            # ユーザーにDMで認証URLを送信
-            try:
-                dm_embed = discord.Embed(
-                    title=f"[!] {member.guild.name} への参加確認",
-                    description=(
-                        "このサーバーへの参加には**認証**が必要です。\n\n"
-                        "下のリンクをクリックしてDiscord認証を完了してください。\n"
-                        "**認証を行わない場合、参加確認ができないため処理が行われません。**"
-                    ),
-                    color=discord.Color.orange()
-                )
-                dm_embed.add_field(
-                    name="認証リンク",
-                    value=f"[こちらをクリックして認証する]({oauth_url})",
-                    inline=False
-                )
-                dm_embed.set_footer(text="このリンクはあなた専用です。他の人と共有しないでください。")
-                await member.send(embed=dm_embed)
-                print(f"[サーバーBL] {member} に認証URLをDM送信しました（サーバー: {member.guild.name}）")
-            except discord.Forbidden:
-                # DMが無効の場合はログのみ
-                print(f"[サーバーBL] {member} へのDM送信に失敗しました（DM無効）")
-            except Exception as e:
-                print(f"[サーバーBL] DM送信エラー: {e}")
+            # ユーザーにDMで認証チャンネルでの認証を促す
+            verify_ch_id = cfg.get("server_blacklist_verify_channel_id")
+            if verify_ch_id:
+                try:
+                    dm_embed = discord.Embed(
+                        title=f"[!] {member.guild.name} への入室認証について",
+                        description=(
+                            f"当サーバーへ参加するには、認証チャンネル <#{verify_ch_id}> にて\n"
+                            "外部サービスアカウント連携認証を完了させてください。"
+                        ),
+                        color=discord.Color.orange()
+                    )
+                    await member.send(embed=dm_embed)
+                    print(f"[サーバーBL] {member} に認証案内DMを送信しました")
+                except discord.Forbidden:
+                    print(f"[サーバーBL] {member} へのDM送信に失敗しました（DM無効）")
+                except Exception as e:
+                    print(f"[サーバーBL] DM送信エラー: {e}")
 
 
 @bot.event
@@ -8481,6 +8525,46 @@ async def sbl_action(interaction: discord.Interaction, action: str):
 
     label = "BAN（永久追放）" if action == "ban" else "キック（退出のみ）"
     await interaction.response.send_message(f"[OK] ブラックリスト対象者への処置を **{label}** に設定しました。", ephemeral=True)
+
+
+@server_blacklist_group.command(name="setup", description="このチャンネルにサーバーブラックリストのウェブ認証パネルを設置します")
+async def sbl_setup(interaction: discord.Interaction):
+    if not await is_moderator(interaction):
+        return
+    if not interaction.guild:
+        return
+
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(interaction.guild.id))
+
+    # OAuth2設定チェック
+    if not OAUTH_REDIRECT_URI or not DISCORD_CLIENT_ID or not DISCORD_CLIENT_SECRET:
+        await interaction.response.send_message(
+            "[NG] 環境変数（CLIENT_ID等）が未設定のため、認証パネルを設置できません。",
+            ephemeral=True
+        )
+        return
+
+    embed = discord.Embed(
+        title="🛡️ サーバー入室認証",
+        description=(
+            "当サーバーの荒らし・スパム対策のため、外部サービスアカウントとの連携認証が必要です。\n\n"
+            "下の **「連携認証を開始する」** ボタンをクリックし、表示される専用URLより認証を完了させてください。\n"
+            "（他の特定サーバーへの参加履歴を確認し、問題なければ認証が完了します）"
+        ),
+        color=discord.Color.blue()
+    )
+    
+    view = VerifyBlacklistButtonView()
+    
+    await interaction.response.send_message("認証パネルを設置中...", ephemeral=True)
+    panel_msg = await interaction.channel.send(embed=embed, view=view)
+    
+    cfg["server_blacklist_verify_channel_id"] = interaction.channel.id
+    cfg["server_blacklist_verify_message_id"] = panel_msg.id
+    save_data(all_data)
+    
+    await interaction.edit_original_response(content="[OK] 認証パネルを設置しました！")
 
 
 bot.tree.add_command(server_blacklist_group)
