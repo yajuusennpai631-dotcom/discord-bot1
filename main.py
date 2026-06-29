@@ -4070,14 +4070,7 @@ async def help_command(interaction: discord.Interaction):
         ),
         inline=False
     )
-    embed.add_field(
-        name="個人用プライベート機能 (他の人には見えません)",
-        value=(
-            "`/my_memo` : あなた専用の個人メモを追加・一覧表示・削除・全消去します\n"
-            "`/my_clip` : あなた専用のクリップ（テキストやリンク）を保存・管理します"
-        ),
-        inline=False
-    )
+
     if is_admin or is_allowed or is_owner:
         embed.add_field(
             name="管理者・許可ユーザー専用コマンド",
@@ -4138,6 +4131,7 @@ async def help_command(interaction: discord.Interaction):
             value=(
                 "`!sync` : スラッシュコマンドをDiscord側へ即時同期します (通常チャット形式)\n"
                 "`/owner_status` : Botの視聴中ステータス文字をリアルタイムで変更します\n"
+                "`/owner_set_avatar` : BOTのプロフィール画像を変更します（画像添付またはURL指定）\n"
                 "`/owner_guilds` : 導入中のサーバー一覧を確認し、任意のサーバーから脱退できます\n"
                 "`/owner_guild_detail` : サーバーの詳細情報（ch数・ロール数・Bot設定状況）と招待リンクを取得します\n"
                 "`/owner_broadcast` : 指定サーバーにEmbedでお知らせを一斉送信します\n"
@@ -4262,72 +4256,6 @@ async def apology(interaction: discord.Interaction):
     )
 
 
-@bot.tree.command(name="my_memo", description="あなた専用の個人メモを追加・一覧表示・削除・全消去します")
-@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-@app_commands.allowed_installs(guilds=True, users=False)
-@discord.app_commands.choices(action=[
-    discord.app_commands.Choice(name="メモを追加する", value="add"),
-    discord.app_commands.Choice(name="一覧を表示する", value="list"),
-    discord.app_commands.Choice(name="選択して削除する", value="delete"),
-    discord.app_commands.Choice(name="全て消去する", value="clear")
-])
-async def my_memo(interaction: discord.Interaction, action: discord.app_commands.Choice[str], content: str = None):
-    all_data = load_data()
-    user_data = get_user_app_data(all_data, str(interaction.user.id))
-    act = action.value
-    if act == "add":
-        if not content:
-            await interaction.response.send_message("保存する内容を入力してください。", ephemeral=True)
-            return
-        user_data["memos"].append(content)
-        save_data(all_data)
-        await interaction.response.send_message(f"個人メモを保存しました:\n`{content}`", ephemeral=True)
-    elif act == "list":
-        memos = user_data.get("memos", [])
-        embed = discord.Embed(title="あなた専用の個人メモ一覧", color=discord.Color.gold())
-        embed.description = "\n".join([f"**{i+1}.** {m}" for i, m in enumerate(memos)]) if memos else "保存されているメモはありません。"
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-    elif act == "delete":
-        memos = user_data.get("memos", [])
-        if not memos:
-            await interaction.response.send_message("削除できるメモがありません。", ephemeral=True)
-            return
-        view = MemoDeleteView(memos)
-        await interaction.response.send_message("削除したい個人メモをメニューから選んでください：", view=view, ephemeral=True)
-    elif act == "clear":
-        user_data["memos"] = []
-        save_data(all_data)
-        await interaction.response.send_message("全ての個人メモを消去しました。", ephemeral=True)
-
-
-@bot.tree.command(name="my_clip", description="あなた専用のクリップ（テキストやリンク）を保存・管理します")
-@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-@app_commands.allowed_installs(guilds=True, users=False)
-@discord.app_commands.choices(action=[
-    discord.app_commands.Choice(name="クリップを追加する", value="add"),
-    discord.app_commands.Choice(name="一覧を表示する", value="list"),
-    discord.app_commands.Choice(name="全て消去する", value="clear")
-])
-async def my_clip(interaction: discord.Interaction, action: discord.app_commands.Choice[str], content: str = None):
-    all_data = load_data()
-    user_data = get_user_app_data(all_data, str(interaction.user.id))
-    act = action.value
-    if act == "add":
-        if not content:
-            await interaction.response.send_message("内容を入力してください。", ephemeral=True)
-            return
-        user_data["bookmarks"].append(content)
-        save_data(all_data)
-        await interaction.response.send_message("個人クリップに保存しました。", ephemeral=True)
-    elif act == "list":
-        bks = user_data.get("bookmarks", [])
-        embed = discord.Embed(title="あなた専用のクリップ一覧", color=discord.Color.magenta())
-        embed.description = "\n".join([f"・{b}" for b in bks]) if bks else "保存されているクリップはありません。"
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-    elif act == "clear":
-        user_data["bookmarks"] = []
-        save_data(all_data)
-        await interaction.response.send_message("全ての個人クリップを消去しました。", ephemeral=True)
 
 
 @bot.tree.command(name="say", description="Botに指定したメッセージを代わりに発言させます")
@@ -5400,6 +5328,65 @@ async def owner_trust_list(interaction: discord.Interaction):
         color=discord.Color.blue()
     )
     await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# --------------------------------------------------------------------
+# /owner_set_avatar — BOTのプロフィール画像を変更する（オーナー専用）
+# --------------------------------------------------------------------
+
+@bot.tree.command(name="owner_set_avatar", description="【オーナー限定】BOTのプロフィール画像を変更します（画像を添付してください）")
+async def owner_set_avatar(interaction: discord.Interaction, 画像: discord.Attachment = None, url: str = None):
+    """
+    添付画像またはURLを使ってBOTのアイコンを変更します。
+    画像ファイル（PNG/JPG/GIF等）またはURLを指定してください。
+    Discordのレート制限により変更は短時間に何度もできません。
+    """
+    if not await is_owner_check(interaction):
+        return
+
+    if 画像 is None and url is None:
+        await interaction.response.send_message(
+            "画像を添付するか、URLを指定してください。\n"
+            "例: `/owner_set_avatar` に画像ファイルを添付、または `url` に画像URLを入力",
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        if 画像 is not None:
+            # 添付ファイルから読み込み
+            image_data = await 画像.read()
+        else:
+            # URLから読み込み
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url) as resp:
+                    if resp.status != 200:
+                        await interaction.followup.send(f"URLから画像を取得できませんでした（ステータス: {resp.status}）。", ephemeral=True)
+                        return
+                    image_data = await resp.read()
+
+        await bot.user.edit(avatar=image_data)
+
+        embed = discord.Embed(
+            title="✅ プロフィール画像を変更しました",
+            color=discord.Color.green()
+        )
+        embed.set_image(url=bot.user.display_avatar.url)
+        embed.set_footer(text=f"変更者: {interaction.user} | Discordのレート制限により短時間での連続変更はできません")
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    except discord.HTTPException as e:
+        if e.status == 429:
+            await interaction.followup.send(
+                "⚠️ レート制限中です。プロフィール画像の変更は短時間に何度もできません。しばらく待ってから再試行してください。",
+                ephemeral=True
+            )
+        else:
+            await interaction.followup.send(f"エラーが発生しました: {e}", ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"予期しないエラーが発生しました: {e}", ephemeral=True)
 
 
 # ====================================================================
