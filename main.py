@@ -5331,60 +5331,132 @@ async def owner_trust_list(interaction: discord.Interaction):
 
 
 # --------------------------------------------------------------------
-# /owner_set_avatar — BOTのプロフィール画像を変更する（オーナー専用）
+# /owner_set_avatar — サーバープロフィール画像を変更する（オーナー専用）
+# Discord の PATCH /applications/@me/guilds/{guild_id} を使い、
+# そのサーバー内でのみ表示されるアバターを設定します。
 # --------------------------------------------------------------------
 
-@bot.tree.command(name="owner_set_avatar", description="【オーナー限定】BOTのプロフィール画像を変更します（画像を添付してください）")
-async def owner_set_avatar(interaction: discord.Interaction, 画像: discord.Attachment = None, url: str = None):
+@bot.tree.command(
+    name="owner_set_avatar",
+    description="【オーナー限定】このサーバー専用のBOTプロフィール画像を設定します（サーバープロフィール）"
+)
+@discord.app_commands.describe(
+    画像="設定する画像ファイルを添付してください（PNG/JPG/GIF等）",
+    url="画像のURLを直接指定する場合はこちら",
+    リセット="Trueにするとこのサーバーのサーバープロフィール画像をリセットします"
+)
+async def owner_set_avatar(
+    interaction: discord.Interaction,
+    画像: discord.Attachment = None,
+    url: str = None,
+    リセット: bool = False
+):
     """
-    添付画像またはURLを使ってBOTのアイコンを変更します。
-    画像ファイル（PNG/JPG/GIF等）またはURLを指定してください。
-    Discordのレート制限により変更は短時間に何度もできません。
+    Discord のサーバープロフィール機能を使い、このサーバー内でのみ表示される
+    BOTのアバターを変更します。グローバルアバターは変わりません。
+    PATCH /applications/@me/guilds/{guild_id} エンドポイントを直接呼び出します。
     """
     if not await is_owner_check(interaction):
         return
 
-    if 画像 is None and url is None:
+    if not interaction.guild:
+        await interaction.response.send_message("このコマンドはサーバー内で実行してください。", ephemeral=True)
+        return
+
+    if not リセット and 画像 is None and url is None:
         await interaction.response.send_message(
             "画像を添付するか、URLを指定してください。\n"
-            "例: `/owner_set_avatar` に画像ファイルを添付、または `url` に画像URLを入力",
+            "サーバープロフィールをリセットする場合は `リセット: True` を指定してください。",
             ephemeral=True
         )
         return
 
     await interaction.response.defer(ephemeral=True)
 
+    app_id = interaction.client.application_id
+    guild_id = interaction.guild.id
+    endpoint = f"https://discord.com/api/v10/applications/{app_id}/guilds/{guild_id}"
+    headers = {
+        "Authorization": f"Bot {TOKEN}",
+        "Content-Type": "application/json",
+    }
+
     try:
+        if リセット:
+            # サーバープロフィール画像をリセット（nullを送信）
+            payload = {"icon": None}
+            async with aiohttp.ClientSession() as session:
+                async with session.patch(endpoint, json=payload, headers=headers) as resp:
+                    if resp.status in (200, 204):
+                        embed = discord.Embed(
+                            title="✅ サーバープロフィール画像をリセットしました",
+                            description="このサーバーのBOTアバターがグローバル設定に戻りました。",
+                            color=discord.Color.blue()
+                        )
+                        await interaction.followup.send(embed=embed, ephemeral=True)
+                    else:
+                        body = await resp.text()
+                        await interaction.followup.send(f"リセットに失敗しました（{resp.status}）: {body}", ephemeral=True)
+            return
+
+        # 画像データ取得
         if 画像 is not None:
-            # 添付ファイルから読み込み
             image_data = await 画像.read()
+            content_type = 画像.content_type or "image/png"
         else:
-            # URLから読み込み
             async with aiohttp.ClientSession() as session:
                 async with session.get(url) as resp:
                     if resp.status != 200:
-                        await interaction.followup.send(f"URLから画像を取得できませんでした（ステータス: {resp.status}）。", ephemeral=True)
+                        await interaction.followup.send(
+                            f"URLから画像を取得できませんでした（ステータス: {resp.status}）。",
+                            ephemeral=True
+                        )
                         return
                     image_data = await resp.read()
+                    content_type = resp.headers.get("Content-Type", "image/png").split(";")[0].strip()
 
-        await bot.user.edit(avatar=image_data)
+        # Base64エンコードしてData URIに変換
+        b64 = base64.b64encode(image_data).decode("utf-8")
+        data_uri = f"data:{content_type};base64,{b64}"
 
-        embed = discord.Embed(
-            title="✅ プロフィール画像を変更しました",
-            color=discord.Color.green()
-        )
-        embed.set_image(url=bot.user.display_avatar.url)
-        embed.set_footer(text=f"変更者: {interaction.user} | Discordのレート制限により短時間での連続変更はできません")
-        await interaction.followup.send(embed=embed, ephemeral=True)
+        payload = {"icon": data_uri}
 
-    except discord.HTTPException as e:
-        if e.status == 429:
-            await interaction.followup.send(
-                "⚠️ レート制限中です。プロフィール画像の変更は短時間に何度もできません。しばらく待ってから再試行してください。",
-                ephemeral=True
-            )
-        else:
-            await interaction.followup.send(f"エラーが発生しました: {e}", ephemeral=True)
+        async with aiohttp.ClientSession() as session:
+            async with session.patch(endpoint, json=payload, headers=headers) as resp:
+                if resp.status in (200, 204):
+                    # 変更後のアバターURLを取得して表示
+                    resp_json = await resp.json() if resp.status == 200 else {}
+                    guild_icon_hash = resp_json.get("icon")
+                    if guild_icon_hash:
+                        avatar_display_url = (
+                            f"https://cdn.discordapp.com/app-icons/{app_id}/{guild_icon_hash}.png"
+                        )
+                    else:
+                        avatar_display_url = interaction.client.user.display_avatar.url
+
+                    embed = discord.Embed(
+                        title="✅ サーバープロフィール画像を設定しました",
+                        description=(
+                            f"**{interaction.guild.name}** 内でのみ、このアバターが表示されます。\n"
+                            "他のサーバーやDMではグローバルアバターが引き続き表示されます。"
+                        ),
+                        color=discord.Color.green()
+                    )
+                    embed.set_thumbnail(url=avatar_display_url)
+                    embed.set_footer(text=f"設定者: {interaction.user}")
+                    await interaction.followup.send(embed=embed, ephemeral=True)
+                elif resp.status == 429:
+                    await interaction.followup.send(
+                        "⚠️ レート制限中です。しばらく待ってから再試行してください。",
+                        ephemeral=True
+                    )
+                else:
+                    body = await resp.text()
+                    await interaction.followup.send(
+                        f"設定に失敗しました（{resp.status}）: {body}",
+                        ephemeral=True
+                    )
+
     except Exception as e:
         await interaction.followup.send(f"予期しないエラーが発生しました: {e}", ephemeral=True)
 
