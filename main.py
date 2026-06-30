@@ -10,6 +10,7 @@ import asyncio
 import urllib.request
 import urllib.parse
 import base64
+import html
 import requests
 import io
 import datetime
@@ -44,6 +45,9 @@ DISCORD_CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET", "")
 OAUTH_REDIRECT_URI = os.getenv("OAUTH_REDIRECT_URI", "")
 OAUTH_SECRET_KEY = os.getenv("OAUTH_SECRET_KEY", "default_secret_change_me")
 OAUTH_PORT = int(os.getenv("PORT", "8080"))  # Railway は PORT 環境変数で起動ポートを渡す
+
+# --- 荒らし対策ダッシュボード（Botオーナー専用の秘密リンクで保護）---
+ADMIN_DASHBOARD_KEY = os.getenv("ADMIN_DASHBOARD_KEY", "")
 
 if not TOKEN:
     print("エラー: 環境変数 'DISCORD_TOKEN' が見つかりません。")
@@ -1177,6 +1181,18 @@ def _build_complete_url(token: str) -> str:
     base = f"{parsed.scheme}://{parsed.netloc}"
     query = urllib.parse.urlencode({"token": token})
     return f"{base}/complete?{query}"
+
+
+def _build_admin_dashboard_url() -> str:
+    """
+    OAUTH_REDIRECT_URI のスキーム・ホストを基に、荒らしサーバー一覧・荒らしユーザー一覧を表示する
+    管理者専用ダッシュボードのURLを生成します。
+    ADMIN_DASHBOARD_KEY を知っている人だけがアクセスできる「秘密リンク」方式です。
+    """
+    parsed = urllib.parse.urlparse(OAUTH_REDIRECT_URI)
+    base = f"{parsed.scheme}://{parsed.netloc}"
+    query = urllib.parse.urlencode({"key": ADMIN_DASHBOARD_KEY})
+    return f"{base}/admin/blacklist?{query}"
 
 
 def _generate_web_auth_state(guild_id: int, user_id: int) -> str:
@@ -9185,6 +9201,49 @@ async def sbl_role_clear(interaction: discord.Interaction):
 bot.tree.add_command(server_blacklist_group)
 
 
+@bot.tree.command(
+    name="admin_dashboard_link",
+    description="【オーナー限定】荒らしサーバー一覧・荒らしユーザー一覧を表示するダッシュボードの秘密リンクを取得します"
+)
+async def admin_dashboard_link(interaction: discord.Interaction):
+    """
+    荒らし対策ダッシュボード（/admin/blacklist）の秘密リンクをBotオーナーへ表示します。
+    リンクには ADMIN_DASHBOARD_KEY が含まれるため、必ず ephemeral（本人にのみ表示）で送信します。
+    """
+    if not await is_owner_check(interaction):
+        return
+
+    if not OAUTH_REDIRECT_URI:
+        await interaction.response.send_message(
+            "エラー: OAuth2用のWebサーバーが起動していないため、ダッシュボードを利用できません。"
+            "DISCORD_CLIENT_ID / DISCORD_CLIENT_SECRET / OAUTH_REDIRECT_URI を設定してください。",
+            ephemeral=True
+        )
+        return
+
+    if not ADMIN_DASHBOARD_KEY:
+        await interaction.response.send_message(
+            "エラー: 環境変数 `ADMIN_DASHBOARD_KEY` が未設定です。\n"
+            "Railway等の環境変数に、推測されにくいランダムな文字列を `ADMIN_DASHBOARD_KEY` として設定してから、"
+            "再度このコマンドを実行してください。",
+            ephemeral=True
+        )
+        return
+
+    dashboard_url = _build_admin_dashboard_url()
+    embed = discord.Embed(
+        title="荒らし対策ダッシュボード",
+        description=(
+            f"[ダッシュボードを開く]({dashboard_url})\n\n"
+            "荒らしサーバー一覧・荒らしユーザー一覧をブラウザで確認できます。\n\n"
+            "**注意:** このリンクには秘密キーが含まれています。第三者に共有しないでください。"
+        ),
+        color=discord.Color.blurple()
+    )
+    embed.set_footer(text="リンクが漏えいした場合は ADMIN_DASHBOARD_KEY を変更して再起動してください。")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
 # ====================================================================
 # OAuth2 コールバック Webサーバー（aiohttp）
 # ====================================================================
@@ -9923,12 +9982,252 @@ async def _oauth2_callback_handler(request):
         )
 
 
+# ====================================================================
+# 荒らし対策ダッシュボード（Botオーナー専用 / 秘密リンク方式）
+# ====================================================================
+
+def _admin_dashboard_html(blacklist_ids: list, troll_list: dict) -> str:
+    """
+    荒らしサーバー一覧・荒らしユーザー一覧を表示する管理者専用ダッシュボードのHTMLを生成します。
+    ユーザー由来の値（ユーザー名・登録理由など）は html.escape で必ずエスケープし、
+    悪意あるDiscordユーザー名等によるHTML/JSインジェクションを防ぎます。
+    """
+    color_bg     = "#23272A"
+    color_card   = "#2C2F33"
+    color_main   = "#5865F2"
+    color_text   = "#FFFFFF"
+    color_sub    = "#B9BBBE"
+    color_box    = "#1E2124"
+    color_danger = "#ED4245"
+
+    def esc(value) -> str:
+        return html.escape(str(value), quote=True)
+
+    # --- 荒らしサーバー一覧 ---
+    if blacklist_ids:
+        server_rows = "".join(
+            f'<tr><td class="mono">{esc(sid)}</td></tr>' for sid in blacklist_ids
+        )
+    else:
+        server_rows = '<tr><td class="empty">登録されているサーバーはありません</td></tr>'
+
+    # --- 荒らしユーザー一覧（登録日時の新しい順） ---
+    sorted_entries = sorted(
+        troll_list.items(),
+        key=lambda kv: kv[1].get("date", ""),
+        reverse=True
+    )
+    if sorted_entries:
+        user_rows_list = []
+        for uid_str, entry in sorted_entries:
+            username = entry.get("username", "不明")
+            reason = entry.get("reason", "不明")
+            date_str = (entry.get("date", "") or "")[:19].replace("T", " ") or "不明"
+            banned_count = len(entry.get("banned_in", []))
+            account_link = entry.get("account_link") or f"https://discord.com/users/{uid_str}"
+            avatar_url = entry.get("avatar_url", "")
+            search_key = esc(f"{username} {uid_str} {reason}".lower())
+            avatar_html = (
+                f'<img src="{esc(avatar_url)}" class="avatar" loading="lazy" alt="">'
+                if avatar_url else '<div class="avatar avatar-fallback"></div>'
+            )
+            user_rows_list.append(f"""<tr class="user-row" data-search="{search_key}">
+                <td>
+                  <div class="user-cell">
+                    {avatar_html}
+                    <div>
+                      <div class="username">{esc(username)}</div>
+                      <div class="uid mono">{esc(uid_str)}</div>
+                    </div>
+                  </div>
+                </td>
+                <td>{esc(reason)}</td>
+                <td class="mono">{esc(date_str)}</td>
+                <td>{banned_count}サーバー</td>
+                <td><a href="{esc(account_link)}" target="_blank" rel="noopener noreferrer" class="link">プロフィール</a></td>
+              </tr>""")
+        user_rows = "".join(user_rows_list)
+    else:
+        user_rows = '<tr><td colspan="5" class="empty">登録されているユーザーはいません</td></tr>'
+
+    return f"""<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="robots" content="noindex, nofollow">
+  <title>荒らし対策ダッシュボード</title>
+  <style>
+    * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+    body {{
+      background: {color_bg}; color: {color_text};
+      font-family: "Helvetica Neue", Arial, "Hiragino Kaku Gothic ProN", "Meiryo", sans-serif;
+      padding: 32px 20px 64px;
+    }}
+    .wrap {{
+      max-width: 920px; margin: 0 auto;
+      opacity: 0; transform: translateY(12px);
+      animation: pageIn 0.45s ease-out forwards;
+    }}
+    h1 {{ font-size: 24px; font-weight: 700; margin-bottom: 6px; }}
+    .caption {{ font-size: 13px; color: {color_sub}; margin-bottom: 28px; }}
+    .stats {{ display: flex; gap: 16px; margin-bottom: 32px; flex-wrap: wrap; }}
+    .stat-card {{
+      background: {color_card}; border-radius: 12px; padding: 18px 24px;
+      min-width: 160px; box-shadow: 0 4px 16px rgba(0,0,0,0.3);
+    }}
+    .stat-num {{ font-size: 28px; font-weight: 700; color: {color_main}; }}
+    .stat-label {{ font-size: 12px; color: {color_sub}; margin-top: 4px; }}
+    .card {{
+      background: {color_card}; border-radius: 12px; padding: 24px;
+      margin-bottom: 24px; box-shadow: 0 4px 16px rgba(0,0,0,0.3);
+    }}
+    .section-head {{
+      display: flex; align-items: center; justify-content: space-between;
+      flex-wrap: wrap; gap: 12px; margin-bottom: 16px;
+    }}
+    h2 {{ font-size: 16px; font-weight: 700; }}
+    #searchBox {{
+      background: {color_box}; border: 1px solid #3a3e44; border-radius: 8px;
+      color: {color_text}; padding: 8px 12px; font-size: 13px; min-width: 220px;
+      outline: none; transition: border-color 0.15s ease;
+    }}
+    #searchBox:focus {{ border-color: {color_main}; }}
+    table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
+    thead th {{
+      text-align: left; color: {color_sub}; font-weight: 700; font-size: 12px;
+      padding: 8px 10px; border-bottom: 1px solid #3a3e44;
+    }}
+    tbody td {{
+      padding: 10px; border-bottom: 1px solid #34383e; vertical-align: middle;
+    }}
+    tbody tr {{ transition: background 0.12s ease; }}
+    tbody tr:hover {{ background: rgba(255,255,255,0.03); }}
+    .mono {{ font-family: "SFMono-Regular", Consolas, monospace; color: {color_sub}; }}
+    .empty {{ text-align: center; color: {color_sub}; padding: 24px 0; }}
+    .user-cell {{ display: flex; align-items: center; gap: 10px; }}
+    .avatar {{ width: 32px; height: 32px; border-radius: 50%; object-fit: cover; flex-shrink: 0; }}
+    .avatar-fallback {{ background: #4a4e54; }}
+    .username {{ font-weight: 700; }}
+    .uid {{ font-size: 11px; }}
+    .link {{ color: {color_main}; text-decoration: none; font-weight: 700; }}
+    .link:hover {{ text-decoration: underline; }}
+    .warn-banner {{
+      background: rgba(237, 66, 69, 0.12); border: 1px solid {color_danger};
+      color: #ff9a9c; border-radius: 8px; padding: 10px 14px; font-size: 12px;
+      margin-bottom: 24px;
+    }}
+    @media (max-width: 640px) {{
+      table, thead, tbody, tr, td {{ display: block; }}
+      thead {{ display: none; }}
+      tbody tr {{ border: 1px solid #34383e; border-radius: 8px; margin-bottom: 10px; padding: 8px; }}
+      tbody td {{ border-bottom: none; padding: 4px 4px; }}
+    }}
+    @keyframes pageIn {{
+      to {{ opacity: 1; transform: translateY(0); }}
+    }}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>荒らし対策ダッシュボード</h1>
+    <p class="caption">このページはBotオーナー専用です。リンク（秘密キー付きURL）を第三者に共有しないでください。</p>
+    <div class="warn-banner">このリンクを知っている人は誰でも閲覧できます。漏えいした場合は ADMIN_DASHBOARD_KEY を変更してください。</div>
+
+    <div class="stats">
+      <div class="stat-card">
+        <div class="stat-num">{len(blacklist_ids)}</div>
+        <div class="stat-label">荒らしサーバー登録数</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-num">{len(troll_list)}</div>
+        <div class="stat-label">荒らしユーザー登録数</div>
+      </div>
+    </div>
+
+    <section class="card">
+      <h2>荒らしサーバー一覧</h2>
+      <table>
+        <thead><tr><th>サーバーID</th></tr></thead>
+        <tbody>{server_rows}</tbody>
+      </table>
+    </section>
+
+    <section class="card">
+      <div class="section-head">
+        <h2>荒らしユーザー一覧</h2>
+        <input type="text" id="searchBox" placeholder="ユーザー名・ID・理由で検索" oninput="filterUsers()">
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>ユーザー</th>
+            <th>登録理由</th>
+            <th>登録日時</th>
+            <th>BAN済みサーバー数</th>
+            <th>リンク</th>
+          </tr>
+        </thead>
+        <tbody id="userTableBody">{user_rows}</tbody>
+      </table>
+    </section>
+  </div>
+  <script>
+    function filterUsers() {{
+      var q = document.getElementById('searchBox').value.toLowerCase();
+      var rows = document.querySelectorAll('#userTableBody .user-row');
+      for (var i = 0; i < rows.length; i++) {{
+        var row = rows[i];
+        var match = row.getAttribute('data-search').indexOf(q) !== -1;
+        row.style.display = match ? '' : 'none';
+      }}
+    }}
+  </script>
+</body>
+</html>"""
+
+
+async def _admin_dashboard_handler(request):
+    """
+    荒らしサーバー一覧・荒らしユーザー一覧を表示する管理者専用ダッシュボードのエンドポイント。
+    ADMIN_DASHBOARD_KEY が未設定、またはキーが一致しない場合は存在を悟られないよう
+    汎用的な404ページを返します（秘密リンク方式のため、誤ったキーには詳細を返しません）。
+    """
+    import hmac
+
+    def _not_found():
+        return aiohttp.web.Response(
+            text="404 Not Found",
+            status=404,
+            content_type="text/plain"
+        )
+
+    if not ADMIN_DASHBOARD_KEY:
+        print("[管理者ダッシュボード] ADMIN_DASHBOARD_KEY が未設定のため、アクセスを拒否しました。")
+        return _not_found()
+
+    provided_key = request.rel_url.query.get("key", "")
+    if not provided_key or not hmac.compare_digest(provided_key, ADMIN_DASHBOARD_KEY):
+        return _not_found()
+
+    all_data = load_data()
+    global_cfg = get_global_config(all_data)
+    blacklist_ids = global_cfg.get("global_server_blacklist_ids", [])
+    troll_list = global_cfg.get("troll_list", {})
+
+    return aiohttp.web.Response(
+        text=_admin_dashboard_html(blacklist_ids, troll_list),
+        content_type="text/html"
+    )
+
+
 async def _start_web_server():
     """aiohttp による OAuth2 コールバック受け取り用 Webサーバーを起動します。"""
     app = aiohttp.web.Application()
     app.router.add_get("/callback", _oauth2_callback_handler)
     app.router.add_get("/complete", _complete_handler)
     app.router.add_get("/terms", _terms_page_handler)
+    app.router.add_get("/admin/blacklist", _admin_dashboard_handler)
     app.router.add_get("/", lambda req: aiohttp.web.Response(text="Bot is running."))
     runner = aiohttp.web.AppRunner(app)
     await runner.setup()
