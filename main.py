@@ -9249,9 +9249,14 @@ def _terms_page_html(state: str, oauth_url: str, error: bool = False, error_mess
     .card {{
       background: {color_card}; border-radius: 12px; padding: 48px 40px;
       max-width: 460px; width: 90%; text-align: center; box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+      opacity: 0; transform: translateY(16px);
+      animation: cardIn 0.5s ease-out forwards;
     }}
     h1 {{ font-size: 20px; margin-bottom: 12px; color: #ED4245; }}
     p {{ font-size: 14px; color: {color_sub}; line-height: 1.6; }}
+    @keyframes cardIn {{
+      to {{ opacity: 1; transform: translateY(0); }}
+    }}
   </style>
 </head>
 <body>
@@ -9278,6 +9283,8 @@ def _terms_page_html(state: str, oauth_url: str, error: bool = False, error_mess
     .card {{
       background: {color_card}; border-radius: 12px; padding: 40px;
       max-width: 560px; width: 100%; box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+      opacity: 0; transform: translateY(16px);
+      animation: cardIn 0.5s ease-out forwards;
     }}
     h1 {{ font-size: 20px; font-weight: 700; margin-bottom: 16px; }}
     .terms-box {{
@@ -9292,15 +9299,36 @@ def _terms_page_html(state: str, oauth_url: str, error: bool = False, error_mess
       display: flex; align-items: flex-start; gap: 10px; font-size: 13px;
       color: {color_sub}; margin-bottom: 20px; cursor: pointer; text-align: left;
     }}
-    label.agree input {{ margin-top: 3px; width: 16px; height: 16px; flex-shrink: 0; }}
+    label.agree input {{ margin-top: 3px; width: 16px; height: 16px; flex-shrink: 0; cursor: pointer; transition: transform 0.15s ease; }}
+    label.agree input:checked {{ transform: scale(1.1); }}
     .btn {{
       display: block; width: 100%; text-align: center; padding: 14px;
       border-radius: 8px; background: {color_main}; color: #fff; font-weight: 700;
-      text-decoration: none; font-size: 15px; transition: opacity 0.2s;
-      pointer-events: none; opacity: 0.4;
+      text-decoration: none; font-size: 15px;
+      transition: opacity 0.25s ease, transform 0.25s ease, filter 0.15s ease, box-shadow 0.15s ease;
+      pointer-events: none; opacity: 0.4; transform: scale(0.98);
     }}
-    .btn.enabled {{ pointer-events: auto; opacity: 1; }}
+    .btn.enabled {{
+      pointer-events: auto; opacity: 1; transform: scale(1);
+      animation: pulse 2s ease-in-out 0.3s infinite;
+    }}
+    .btn.enabled:hover {{
+      transform: translateY(-2px) scale(1);
+      filter: brightness(1.08);
+      box-shadow: 0 6px 18px rgba(88, 101, 242, 0.45);
+    }}
+    .btn.enabled:active {{
+      transform: translateY(0) scale(1);
+      filter: brightness(0.96);
+    }}
     .sub {{ margin-top: 14px; font-size: 12px; color: {color_sub}; text-align: center; }}
+    @keyframes cardIn {{
+      to {{ opacity: 1; transform: translateY(0); }}
+    }}
+    @keyframes pulse {{
+      0%, 100% {{ box-shadow: 0 0 0 0 rgba(88, 101, 242, 0.5); }}
+      50% {{ box-shadow: 0 0 0 8px rgba(88, 101, 242, 0); }}
+    }}
   </style>
 </head>
 <body>
@@ -9412,6 +9440,9 @@ def _result_page_html(title: str, message: str, sub: str = "", ok: bool = True) 
       width: 90%;
       text-align: center;
       box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+      opacity: 0;
+      transform: translateY(16px);
+      animation: cardIn 0.5s ease-out forwards;
     }}
     .icon {{
       width: 72px;
@@ -9423,12 +9454,28 @@ def _result_page_html(title: str, message: str, sub: str = "", ok: bool = True) 
       justify-content: center;
       font-size: 36px;
       margin: 0 auto 24px;
+      opacity: 0;
+      transform: scale(0.3);
+      animation: iconPop 0.5s cubic-bezier(0.34, 1.56, 0.64, 1) 0.25s forwards;
+      box-shadow: 0 0 0 0 {color_main}66;
+    }}
+    .icon::after {{
+      content: "";
+      position: absolute;
+      width: 72px;
+      height: 72px;
+      border-radius: 50%;
+      border: 2px solid {color_main};
+      opacity: 0;
+      animation: iconRing 0.9s ease-out 0.45s forwards;
     }}
     h1 {{
       font-size: 22px;
       font-weight: 700;
       margin-bottom: 12px;
       color: {color_text};
+      opacity: 0;
+      animation: fadeUp 0.5s ease-out 0.45s forwards;
     }}
     p {{
       font-size: 14px;
@@ -9439,12 +9486,28 @@ def _result_page_html(title: str, message: str, sub: str = "", ok: bool = True) 
       margin-top: 16px;
       font-size: 13px;
       color: {color_sub};
+      opacity: 0;
+      animation: fadeUp 0.5s ease-out 0.6s forwards;
+    }}
+    @keyframes cardIn {{
+      to {{ opacity: 1; transform: translateY(0); }}
+    }}
+    @keyframes iconPop {{
+      to {{ opacity: 1; transform: scale(1); }}
+    }}
+    @keyframes iconRing {{
+      0% {{ opacity: 0.6; transform: scale(1); }}
+      100% {{ opacity: 0; transform: scale(1.5); }}
+    }}
+    @keyframes fadeUp {{
+      from {{ opacity: 0; transform: translateY(8px); }}
+      to {{ opacity: 1; transform: translateY(0); }}
     }}
   </style>
 </head>
 <body>
   <div class="card">
-    <div class="icon">{icon}</div>
+    <div class="icon" style="position: relative;">{icon}</div>
     <h1>{message}</h1>
     {f'<p class="sub">{sub}</p>' if sub else ""}
   </div>
@@ -9479,17 +9542,53 @@ def _confirm_complete_page_html(complete_url: str) -> str:
     .card {{
       background: {color_card}; border-radius: 12px; padding: 48px 40px;
       max-width: 440px; width: 100%; text-align: center; box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+      opacity: 0; transform: translateY(16px);
+      animation: cardIn 0.5s ease-out forwards;
     }}
     .icon {{
       width: 72px; height: 72px; border-radius: 50%; background: {color_main};
       display: flex; align-items: center; justify-content: center; font-size: 36px; margin: 0 auto 24px;
+      opacity: 0; transform: scale(0.3);
+      animation: iconPop 0.5s cubic-bezier(0.34, 1.56, 0.64, 1) 0.25s forwards;
     }}
-    h1 {{ font-size: 22px; font-weight: 700; margin-bottom: 12px; }}
-    p {{ font-size: 14px; color: {color_sub}; line-height: 1.6; margin-bottom: 28px; }}
+    h1 {{
+      font-size: 22px; font-weight: 700; margin-bottom: 12px;
+      opacity: 0; animation: fadeUp 0.5s ease-out 0.45s forwards;
+    }}
+    p {{
+      font-size: 14px; color: {color_sub}; line-height: 1.6; margin-bottom: 28px;
+      opacity: 0; animation: fadeUp 0.5s ease-out 0.6s forwards;
+    }}
     .btn {{
       display: block; width: 100%; text-align: center; padding: 14px;
       border-radius: 8px; background: {color_main}; color: #fff; font-weight: 700;
       text-decoration: none; font-size: 15px;
+      opacity: 0; transform: translateY(8px);
+      animation: fadeUp 0.5s ease-out 0.8s forwards, pulse 2s ease-in-out 1.4s infinite;
+      transition: transform 0.15s ease, box-shadow 0.15s ease, filter 0.15s ease;
+    }}
+    .btn:hover {{
+      transform: translateY(-2px);
+      filter: brightness(1.08);
+      box-shadow: 0 6px 18px rgba(88, 101, 242, 0.45);
+    }}
+    .btn:active {{
+      transform: translateY(0);
+      filter: brightness(0.96);
+    }}
+    @keyframes cardIn {{
+      to {{ opacity: 1; transform: translateY(0); }}
+    }}
+    @keyframes iconPop {{
+      to {{ opacity: 1; transform: scale(1); }}
+    }}
+    @keyframes fadeUp {{
+      from {{ opacity: 0; transform: translateY(8px); }}
+      to {{ opacity: 1; transform: translateY(0); }}
+    }}
+    @keyframes pulse {{
+      0%, 100% {{ box-shadow: 0 0 0 0 rgba(88, 101, 242, 0.5); }}
+      50% {{ box-shadow: 0 0 0 8px rgba(88, 101, 242, 0); }}
     }}
   </style>
 </head>
