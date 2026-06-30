@@ -6,6 +6,7 @@ Railway 動作対応 / 各種ビュー・永続化対応版
 import os
 import sys
 import json
+import math
 import asyncio
 import urllib.request
 import urllib.parse
@@ -9986,12 +9987,30 @@ async def _oauth2_callback_handler(request):
 # 荒らし対策ダッシュボード（Botオーナー専用 / 秘密リンク方式）
 # ====================================================================
 
-def _admin_dashboard_html(blacklist_ids: list, troll_list: dict) -> str:
+def _admin_dashboard_html(
+    blacklist_ids: list,
+    troll_list: dict,
+    dashboard_key: str,
+    bot_guilds: list = None,
+    bot_latency_ms: int = 0,
+    bot_user_str: str = "",
+    custom_status_text: str = None,
+    flash_message: str = None,
+    flash_is_error: bool = False,
+) -> str:
     """
-    荒らしサーバー一覧・荒らしユーザー一覧を表示する管理者専用ダッシュボードのHTMLを生成します。
+    荒らし対策ダッシュボードのHTMLを生成します。
+    ・荒らしユーザー一覧の表示・追加・削除
+    ・荒らしサーバー（サーバーブラックリスト）一覧の表示・追加・削除
+    ・BOTコントロール（導入サーバー一覧・ステータス文言変更）
+    を1ページにタブ形式でまとめています。
     ユーザー由来の値（ユーザー名・登録理由など）は html.escape で必ずエスケープし、
     悪意あるDiscordユーザー名等によるHTML/JSインジェクションを防ぎます。
+    書き込み系の操作はすべてPOSTフォームで送信し、フォーム内に秘密キーを
+    hidden inputとして埋め込むことで認証します（URLクエリのkeyと同じ値）。
     """
+    bot_guilds = bot_guilds or []
+
     color_bg     = "#23272A"
     color_card   = "#2C2F33"
     color_main   = "#5865F2"
@@ -9999,17 +10018,36 @@ def _admin_dashboard_html(blacklist_ids: list, troll_list: dict) -> str:
     color_sub    = "#B9BBBE"
     color_box    = "#1E2124"
     color_danger = "#ED4245"
+    color_green  = "#3BA55D"
 
     def esc(value) -> str:
         return html.escape(str(value), quote=True)
 
-    # --- 荒らしサーバー一覧 ---
+    key_esc = esc(dashboard_key)
+
+    # --- フラッシュメッセージ（操作結果通知） ---
+    if flash_message:
+        flash_cls = "flash-error" if flash_is_error else "flash-ok"
+        flash_html = f'<div class="flash {flash_cls}">{esc(flash_message)}</div>'
+    else:
+        flash_html = ""
+
+    # --- 荒らしサーバー（サーバーブラックリスト）一覧 ---
     if blacklist_ids:
         server_rows = "".join(
-            f'<tr><td class="mono">{esc(sid)}</td></tr>' for sid in blacklist_ids
+            f'''<tr>
+                <td class="mono">{esc(sid)}</td>
+                <td>
+                  <form method="post" action="/admin/blacklist/server/delete" class="inline-form" onsubmit="return confirm('このサーバーIDをブラックリストから削除しますか？');">
+                    <input type="hidden" name="key" value="{key_esc}">
+                    <input type="hidden" name="server_id" value="{esc(sid)}">
+                    <button type="submit" class="btn btn-danger btn-sm">削除</button>
+                  </form>
+                </td>
+              </tr>''' for sid in blacklist_ids
         )
     else:
-        server_rows = '<tr><td class="empty">登録されているサーバーはありません</td></tr>'
+        server_rows = '<tr><td colspan="2" class="empty">登録されているサーバーはありません</td></tr>'
 
     # --- 荒らしユーザー一覧（登録日時の新しい順） ---
     sorted_entries = sorted(
@@ -10045,10 +10083,57 @@ def _admin_dashboard_html(blacklist_ids: list, troll_list: dict) -> str:
                 <td class="mono">{esc(date_str)}</td>
                 <td>{banned_count}サーバー</td>
                 <td><a href="{esc(account_link)}" target="_blank" rel="noopener noreferrer" class="link">プロフィール</a></td>
+                <td>
+                  <form method="post" action="/admin/blacklist/user/delete" class="inline-form" onsubmit="return confirm('このユーザーを荒らしリストから削除しますか？');">
+                    <input type="hidden" name="key" value="{key_esc}">
+                    <input type="hidden" name="user_id" value="{esc(uid_str)}">
+                    <button type="submit" class="btn btn-danger btn-sm">削除</button>
+                  </form>
+                </td>
               </tr>""")
         user_rows = "".join(user_rows_list)
     else:
-        user_rows = '<tr><td colspan="5" class="empty">登録されているユーザーはいません</td></tr>'
+        user_rows = '<tr><td colspan="6" class="empty">登録されているユーザーはいません</td></tr>'
+
+    # --- 導入サーバー一覧（BOTコントロール用） ---
+    sorted_guilds = sorted(bot_guilds, key=lambda g: (g.member_count or 0), reverse=True)
+    if sorted_guilds:
+        guild_rows_list = []
+        for g in sorted_guilds:
+            owner_id = getattr(g, "owner_id", None)
+            owner_text = esc(owner_id) if owner_id else "不明"
+            icon_url = str(g.icon.url) if getattr(g, "icon", None) else ""
+            icon_html = (
+                f'<img src="{esc(icon_url)}" class="avatar" loading="lazy" alt="">'
+                if icon_url else '<div class="avatar avatar-fallback"></div>'
+            )
+            guild_search_key = esc(f"{g.name} {g.id}".lower())
+            guild_rows_list.append(f"""<tr class="guild-row" data-search="{guild_search_key}">
+                <td>
+                  <div class="user-cell">
+                    {icon_html}
+                    <div>
+                      <div class="username">{esc(g.name)}</div>
+                      <div class="uid mono">{esc(g.id)}</div>
+                    </div>
+                  </div>
+                </td>
+                <td>{g.member_count or 0:,}人</td>
+                <td class="mono">{owner_text}</td>
+                <td>
+                  <form method="post" action="/admin/blacklist/server/add" class="inline-form" onsubmit="return confirm('このサーバーを荒らしサーバー（ブラックリスト）に登録しますか？');">
+                    <input type="hidden" name="key" value="{key_esc}">
+                    <input type="hidden" name="server_id" value="{esc(g.id)}">
+                    <button type="submit" class="btn btn-danger btn-sm">BL登録</button>
+                  </form>
+                </td>
+              </tr>""")
+        guild_rows = "".join(guild_rows_list)
+    else:
+        guild_rows = '<tr><td colspan="4" class="empty">導入されているサーバーがありません</td></tr>'
+
+    current_status_display = esc(custom_status_text) if custom_status_text else "（未設定：自動でサーバー数を表示）"
+    current_status_value = esc(custom_status_text) if custom_status_text else ""
 
     return f"""<!DOCTYPE html>
 <html lang="ja">
@@ -10117,6 +10202,46 @@ def _admin_dashboard_html(blacklist_ids: list, troll_list: dict) -> str:
       color: #ff9a9c; border-radius: 8px; padding: 10px 14px; font-size: 12px;
       margin-bottom: 24px;
     }}
+    .flash {{
+      border-radius: 8px; padding: 10px 14px; font-size: 13px; font-weight: 700;
+      margin-bottom: 20px;
+    }}
+    .flash-ok {{ background: rgba(59, 165, 93, 0.15); border: 1px solid {color_green}; color: #8fe3ac; }}
+    .flash-error {{ background: rgba(237, 66, 69, 0.15); border: 1px solid {color_danger}; color: #ff9a9c; }}
+    .tabs {{ display: flex; gap: 6px; margin-bottom: 20px; flex-wrap: wrap; }}
+    .tab-btn {{
+      background: {color_card}; color: {color_sub}; border: 1px solid #3a3e44;
+      border-radius: 8px; padding: 9px 16px; font-size: 13px; font-weight: 700;
+      cursor: pointer; transition: all 0.12s ease;
+    }}
+    .tab-btn:hover {{ color: {color_text}; }}
+    .tab-btn.active {{ background: {color_main}; color: {color_text}; border-color: {color_main}; }}
+    .tab-panel {{ display: none; }}
+    .tab-panel.active {{ display: block; }}
+    .form-grid {{
+      display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 12px; margin-bottom: 14px;
+    }}
+    label {{ display: block; font-size: 11px; color: {color_sub}; margin-bottom: 4px; font-weight: 700; }}
+    input[type="text"], input[type="number"], textarea {{
+      width: 100%; background: {color_box}; border: 1px solid #3a3e44; border-radius: 8px;
+      color: {color_text}; padding: 9px 12px; font-size: 13px; outline: none;
+      transition: border-color 0.15s ease; font-family: inherit;
+    }}
+    input[type="text"]:focus, input[type="number"]:focus, textarea:focus {{ border-color: {color_main}; }}
+    .btn {{
+      border: none; border-radius: 8px; padding: 9px 18px; font-size: 13px; font-weight: 700;
+      cursor: pointer; transition: opacity 0.12s ease; color: {color_text};
+    }}
+    .btn:hover {{ opacity: 0.85; }}
+    .btn-main {{ background: {color_main}; }}
+    .btn-danger {{ background: {color_danger}; }}
+    .btn-sm {{ padding: 6px 12px; font-size: 12px; }}
+    .inline-form {{ display: inline-block; }}
+    .add-form {{ margin-bottom: 24px; padding-bottom: 20px; border-bottom: 1px solid #34383e; }}
+    .sub-label {{ font-size: 12px; color: {color_sub}; margin-bottom: 12px; }}
+    .status-form {{ display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end; }}
+    .status-form .field {{ flex: 1; min-width: 220px; }}
     @media (max-width: 640px) {{
       table, thead, tbody, tr, td {{ display: block; }}
       thead {{ display: none; }}
@@ -10133,6 +10258,7 @@ def _admin_dashboard_html(blacklist_ids: list, troll_list: dict) -> str:
     <h1>荒らし対策ダッシュボード</h1>
     <p class="caption">このページはBotオーナー専用です。リンク（秘密キー付きURL）を第三者に共有しないでください。</p>
     <div class="warn-banner">このリンクを知っている人は誰でも閲覧できます。漏えいした場合は ADMIN_DASHBOARD_KEY を変更してください。</div>
+    {flash_html}
 
     <div class="stats">
       <div class="stat-card">
@@ -10143,39 +10269,146 @@ def _admin_dashboard_html(blacklist_ids: list, troll_list: dict) -> str:
         <div class="stat-num">{len(troll_list)}</div>
         <div class="stat-label">荒らしユーザー登録数</div>
       </div>
+      <div class="stat-card">
+        <div class="stat-num">{len(bot_guilds)}</div>
+        <div class="stat-label">導入サーバー数</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-num">{bot_latency_ms}ms</div>
+        <div class="stat-label">レイテンシ</div>
+      </div>
     </div>
 
-    <section class="card">
-      <h2>荒らしサーバー一覧</h2>
-      <table>
-        <thead><tr><th>サーバーID</th></tr></thead>
-        <tbody>{server_rows}</tbody>
-      </table>
-    </section>
+    <div class="tabs">
+      <button class="tab-btn active" onclick="showTab('tab-users', this)">荒らしユーザー管理</button>
+      <button class="tab-btn" onclick="showTab('tab-servers', this)">荒らしサーバー管理</button>
+      <button class="tab-btn" onclick="showTab('tab-bot', this)">BOTコントロール</button>
+    </div>
 
-    <section class="card">
-      <div class="section-head">
-        <h2>荒らしユーザー一覧</h2>
-        <input type="text" id="searchBox" placeholder="ユーザー名・ID・理由で検索" oninput="filterUsers()">
-      </div>
-      <table>
-        <thead>
-          <tr>
-            <th>ユーザー</th>
-            <th>登録理由</th>
-            <th>登録日時</th>
-            <th>BAN済みサーバー数</th>
-            <th>リンク</th>
-          </tr>
-        </thead>
-        <tbody id="userTableBody">{user_rows}</tbody>
-      </table>
-    </section>
+    <!-- ============ タブ1: 荒らしユーザー管理 ============ -->
+    <div id="tab-users" class="tab-panel active">
+      <section class="card">
+        <h2>荒らしユーザーを追加</h2>
+        <p class="sub-label">全サーバー共有の荒らしリストに新しいユーザーを登録します（参加時の自動BAN対象になります）。</p>
+        <form method="post" action="/admin/blacklist/user/add" class="add-form">
+          <input type="hidden" name="key" value="{key_esc}">
+          <div class="form-grid">
+            <div>
+              <label>ユーザーID（必須）</label>
+              <input type="text" name="user_id" placeholder="例: 123456789012345678" required pattern="[0-9]+" title="数字のみのDiscordユーザーIDを入力してください">
+            </div>
+            <div>
+              <label>理由</label>
+              <input type="text" name="reason" placeholder="例: 複数サーバーでの荒らし行為">
+            </div>
+            <div>
+              <label>アカウントリンク（任意）</label>
+              <input type="text" name="account_link" placeholder="https://discord.com/users/...">
+            </div>
+          </div>
+          <button type="submit" class="btn btn-main">追加する</button>
+        </form>
+
+        <div class="section-head">
+          <h2>荒らしユーザー一覧</h2>
+          <input type="text" id="searchBox" placeholder="ユーザー名・ID・理由で検索" oninput="filterUsers()">
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>ユーザー</th>
+              <th>登録理由</th>
+              <th>登録日時</th>
+              <th>BAN済みサーバー数</th>
+              <th>リンク</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody id="userTableBody">{user_rows}</tbody>
+        </table>
+      </section>
+    </div>
+
+    <!-- ============ タブ2: 荒らしサーバー管理 ============ -->
+    <div id="tab-servers" class="tab-panel">
+      <section class="card">
+        <h2>荒らしサーバーを追加</h2>
+        <p class="sub-label">登録したサーバーIDに参加しているユーザーは、各導入サーバーで自動BAN/Kickの対象になります（サーバーごとの設定 /serverbl_action に従います）。</p>
+        <form method="post" action="/admin/blacklist/server/add" class="add-form">
+          <input type="hidden" name="key" value="{key_esc}">
+          <div class="form-grid">
+            <div>
+              <label>サーバーID（必須）</label>
+              <input type="text" name="server_id" placeholder="例: 123456789012345678" required pattern="[0-9]+" title="数字のみのDiscordサーバーIDを入力してください">
+            </div>
+          </div>
+          <button type="submit" class="btn btn-main">追加する</button>
+        </form>
+
+        <h2>荒らしサーバー一覧</h2>
+        <table>
+          <thead><tr><th>サーバーID</th><th>操作</th></tr></thead>
+          <tbody>{server_rows}</tbody>
+        </table>
+      </section>
+    </div>
+
+    <!-- ============ タブ3: BOTコントロール ============ -->
+    <div id="tab-bot" class="tab-panel">
+      <section class="card">
+        <h2>BOT情報</h2>
+        <p class="sub-label">ログイン中: <strong>{esc(bot_user_str)}</strong> ／ レイテンシ: <strong>{bot_latency_ms}ms</strong> ／ 導入サーバー数: <strong>{len(bot_guilds)}</strong></p>
+
+        <h2 style="margin-top:20px;">ステータス文言を変更</h2>
+        <p class="sub-label">現在の表示: {current_status_display}</p>
+        <form method="post" action="/admin/bot/status" class="status-form">
+          <input type="hidden" name="key" value="{key_esc}">
+          <div class="field">
+            <label>新しいステータス文言（空欄でデフォルトに戻す）</label>
+            <input type="text" name="status_text" placeholder="例: /help で使い方を確認" value="{current_status_value}">
+          </div>
+          <button type="submit" class="btn btn-main">更新する</button>
+        </form>
+      </section>
+
+      <section class="card">
+        <div class="section-head">
+          <h2>導入サーバー一覧</h2>
+          <input type="text" id="guildSearchBox" placeholder="サーバー名・IDで検索" oninput="filterGuilds()">
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>サーバー</th>
+              <th>メンバー数</th>
+              <th>オーナーID</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody id="guildTableBody">{guild_rows}</tbody>
+        </table>
+      </section>
+    </div>
   </div>
   <script>
+    function showTab(id, btn) {{
+      document.querySelectorAll('.tab-panel').forEach(function(p) {{ p.classList.remove('active'); }});
+      document.querySelectorAll('.tab-btn').forEach(function(b) {{ b.classList.remove('active'); }});
+      document.getElementById(id).classList.add('active');
+      btn.classList.add('active');
+    }}
     function filterUsers() {{
       var q = document.getElementById('searchBox').value.toLowerCase();
       var rows = document.querySelectorAll('#userTableBody .user-row');
+      for (var i = 0; i < rows.length; i++) {{
+        var row = rows[i];
+        var match = row.getAttribute('data-search').indexOf(q) !== -1;
+        row.style.display = match ? '' : 'none';
+      }}
+    }}
+    function filterGuilds() {{
+      var q = document.getElementById('guildSearchBox').value.toLowerCase();
+      var rows = document.querySelectorAll('#guildTableBody .guild-row');
       for (var i = 0; i < rows.length; i++) {{
         var row = rows[i];
         var match = row.getAttribute('data-search').indexOf(q) !== -1;
@@ -10187,38 +10420,244 @@ def _admin_dashboard_html(blacklist_ids: list, troll_list: dict) -> str:
 </html>"""
 
 
+def _check_dashboard_key(request) -> bool:
+    """
+    リクエストに含まれるキー（GETはクエリパラメータ、POSTはフォームの場合は呼び出し側で渡す）が
+    ADMIN_DASHBOARD_KEY と一致するかをタイミング攻撃耐性のある比較で確認します。
+    """
+    import hmac
+    if not ADMIN_DASHBOARD_KEY:
+        return False
+    provided_key = request.rel_url.query.get("key", "")
+    return bool(provided_key) and hmac.compare_digest(provided_key, ADMIN_DASHBOARD_KEY)
+
+
+def _check_dashboard_key_value(provided_key: str) -> bool:
+    """POSTフォームのkey値を検証します。"""
+    import hmac
+    if not ADMIN_DASHBOARD_KEY:
+        return False
+    return bool(provided_key) and hmac.compare_digest(provided_key, ADMIN_DASHBOARD_KEY)
+
+
+def _dashboard_not_found():
+    """
+    キー不一致時に存在を悟られないよう返す汎用404ページ。
+    """
+    return aiohttp.web.Response(
+        text="404 Not Found",
+        status=404,
+        content_type="text/plain"
+    )
+
+
+def _dashboard_redirect(dashboard_key: str, message: str, is_error: bool = False):
+    """
+    POST処理後、結果メッセージ付きでダッシュボードのGETページへリダイレクトします（PRGパターン）。
+    """
+    query = urllib.parse.urlencode({
+        "key": dashboard_key,
+        "msg": message,
+        "err": "1" if is_error else "0",
+    })
+    return aiohttp.web.HTTPSeeOther(location=f"/admin/blacklist?{query}")
+
+
 async def _admin_dashboard_handler(request):
     """
-    荒らしサーバー一覧・荒らしユーザー一覧を表示する管理者専用ダッシュボードのエンドポイント。
+    荒らしサーバー一覧・荒らしユーザー一覧・BOTコントロールを表示する管理者専用ダッシュボードのエンドポイント。
     ADMIN_DASHBOARD_KEY が未設定、またはキーが一致しない場合は存在を悟られないよう
     汎用的な404ページを返します（秘密リンク方式のため、誤ったキーには詳細を返しません）。
     """
-    import hmac
-
-    def _not_found():
-        return aiohttp.web.Response(
-            text="404 Not Found",
-            status=404,
-            content_type="text/plain"
-        )
-
     if not ADMIN_DASHBOARD_KEY:
         print("[管理者ダッシュボード] ADMIN_DASHBOARD_KEY が未設定のため、アクセスを拒否しました。")
-        return _not_found()
+        return _dashboard_not_found()
+
+    if not _check_dashboard_key(request):
+        return _dashboard_not_found()
 
     provided_key = request.rel_url.query.get("key", "")
-    if not provided_key or not hmac.compare_digest(provided_key, ADMIN_DASHBOARD_KEY):
-        return _not_found()
+    flash_message = request.rel_url.query.get("msg") or None
+    flash_is_error = request.rel_url.query.get("err") == "1"
 
     all_data = load_data()
     global_cfg = get_global_config(all_data)
     blacklist_ids = global_cfg.get("global_server_blacklist_ids", [])
     troll_list = global_cfg.get("troll_list", {})
 
+    bot_guilds = list(bot.guilds)
+    try:
+        bot_latency_ms = round(bot.latency * 1000) if not math.isnan(bot.latency) else 0
+    except (TypeError, ValueError):
+        bot_latency_ms = 0
+    bot_user_str = str(bot.user) if bot.user else "未ログイン"
+
     return aiohttp.web.Response(
-        text=_admin_dashboard_html(blacklist_ids, troll_list),
+        text=_admin_dashboard_html(
+            blacklist_ids,
+            troll_list,
+            dashboard_key=provided_key,
+            bot_guilds=bot_guilds,
+            bot_latency_ms=bot_latency_ms,
+            bot_user_str=bot_user_str,
+            custom_status_text=current_custom_status,
+            flash_message=flash_message,
+            flash_is_error=flash_is_error,
+        ),
         content_type="text/html"
     )
+
+
+async def _admin_user_add_handler(request):
+    """荒らしユーザーをWebダッシュボードから追加するハンドラー（POST）。"""
+    data = await request.post()
+    provided_key = data.get("key", "")
+    if not _check_dashboard_key_value(provided_key):
+        return _dashboard_not_found()
+
+    user_id_raw = (data.get("user_id") or "").strip()
+    reason = (data.get("reason") or "").strip() or "Webダッシュボードからの手動登録"
+    account_link = (data.get("account_link") or "").strip()
+
+    if not user_id_raw.isdigit():
+        return _dashboard_redirect(provided_key, "ユーザーIDは数字のみで入力してください。", is_error=True)
+
+    user_id = int(user_id_raw)
+
+    # 既にDiscord上でキャッシュ済みのユーザー情報があれば取得（無ければAPIで取得を試みる）
+    user_obj = bot.get_user(user_id)
+    if user_obj is None:
+        try:
+            user_obj = await bot.fetch_user(user_id)
+        except Exception:
+            user_obj = None
+
+    all_data = load_data()
+    global_cfg = get_global_config(all_data)
+    troll_list = global_cfg["troll_list"]
+    uid_str = str(user_id)
+
+    username = str(user_obj) if user_obj else uid_str
+    avatar_url = str(user_obj.display_avatar.url) if user_obj and user_obj.display_avatar else ""
+    final_account_link = account_link or f"https://discord.com/users/{user_id}"
+
+    if uid_str in troll_list:
+        entry = troll_list[uid_str]
+        entry["username"] = username
+        entry["reason"] = reason
+        entry["account_link"] = final_account_link
+        if avatar_url:
+            entry["avatar_url"] = avatar_url
+    else:
+        troll_list[uid_str] = {
+            "username": username,
+            "user_id": user_id,
+            "avatar_url": avatar_url,
+            "account_link": final_account_link,
+            "reason": reason,
+            "date": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "banned_in": [],
+        }
+
+    save_data(all_data)
+
+    try:
+        await _post_troll_board(all_data, uid_str)
+    except Exception as e:
+        print(f"[荒らし掲示板投稿エラー] {e}")
+
+    return _dashboard_redirect(provided_key, f"ユーザー {username}（ID: {uid_str}）を荒らしリストに追加しました。")
+
+
+async def _admin_user_delete_handler(request):
+    """荒らしユーザーをWebダッシュボードから削除するハンドラー（POST）。"""
+    data = await request.post()
+    provided_key = data.get("key", "")
+    if not _check_dashboard_key_value(provided_key):
+        return _dashboard_not_found()
+
+    user_id_raw = (data.get("user_id") or "").strip()
+
+    all_data = load_data()
+    global_cfg = get_global_config(all_data)
+    troll_list = global_cfg["troll_list"]
+
+    if user_id_raw in troll_list:
+        del troll_list[user_id_raw]
+        save_data(all_data)
+        return _dashboard_redirect(provided_key, f"ユーザー（ID: {user_id_raw}）を荒らしリストから削除しました。")
+
+    return _dashboard_redirect(provided_key, "指定されたユーザーは荒らしリストに見つかりませんでした。", is_error=True)
+
+
+async def _admin_server_add_handler(request):
+    """荒らしサーバー（サーバーブラックリスト）をWebダッシュボードから追加するハンドラー（POST）。"""
+    data = await request.post()
+    provided_key = data.get("key", "")
+    if not _check_dashboard_key_value(provided_key):
+        return _dashboard_not_found()
+
+    server_id_raw = (data.get("server_id") or "").strip()
+    if not server_id_raw.isdigit():
+        return _dashboard_redirect(provided_key, "サーバーIDは数字のみで入力してください。", is_error=True)
+
+    server_id = int(server_id_raw)
+
+    all_data = load_data()
+    global_cfg = get_global_config(all_data)
+    blacklist = global_cfg.setdefault("global_server_blacklist_ids", [])
+
+    if server_id in blacklist:
+        return _dashboard_redirect(provided_key, "そのサーバーIDは既にブラックリストに登録されています。", is_error=True)
+
+    blacklist.append(server_id)
+    save_data(all_data)
+    return _dashboard_redirect(provided_key, f"サーバー（ID: {server_id}）を荒らしサーバーリストに追加しました。")
+
+
+async def _admin_server_delete_handler(request):
+    """荒らしサーバー（サーバーブラックリスト）をWebダッシュボードから削除するハンドラー（POST）。"""
+    data = await request.post()
+    provided_key = data.get("key", "")
+    if not _check_dashboard_key_value(provided_key):
+        return _dashboard_not_found()
+
+    server_id_raw = (data.get("server_id") or "").strip()
+    if not server_id_raw.isdigit():
+        return _dashboard_redirect(provided_key, "不正なサーバーIDです。", is_error=True)
+
+    server_id = int(server_id_raw)
+
+    all_data = load_data()
+    global_cfg = get_global_config(all_data)
+    blacklist = global_cfg.setdefault("global_server_blacklist_ids", [])
+
+    if server_id in blacklist:
+        blacklist.remove(server_id)
+        save_data(all_data)
+        return _dashboard_redirect(provided_key, f"サーバー（ID: {server_id}）を荒らしサーバーリストから削除しました。")
+
+    return _dashboard_redirect(provided_key, "指定されたサーバーIDはブラックリストに見つかりませんでした。", is_error=True)
+
+
+async def _admin_bot_status_handler(request):
+    """BOTのカスタムステータス文言をWebダッシュボードから変更するハンドラー（POST）。"""
+    data = await request.post()
+    provided_key = data.get("key", "")
+    if not _check_dashboard_key_value(provided_key):
+        return _dashboard_not_found()
+
+    global current_custom_status
+    status_text = (data.get("status_text") or "").strip()
+
+    if status_text:
+        current_custom_status = status_text
+        await update_bot_status(bot, text=status_text)
+        return _dashboard_redirect(provided_key, f"ステータス文言を「{status_text}」に変更しました。")
+    else:
+        current_custom_status = None
+        await update_bot_status(bot)
+        return _dashboard_redirect(provided_key, "ステータス文言をデフォルト（サーバー数表示）に戻しました。")
 
 
 async def _start_web_server():
@@ -10228,6 +10667,11 @@ async def _start_web_server():
     app.router.add_get("/complete", _complete_handler)
     app.router.add_get("/terms", _terms_page_handler)
     app.router.add_get("/admin/blacklist", _admin_dashboard_handler)
+    app.router.add_post("/admin/blacklist/user/add", _admin_user_add_handler)
+    app.router.add_post("/admin/blacklist/user/delete", _admin_user_delete_handler)
+    app.router.add_post("/admin/blacklist/server/add", _admin_server_add_handler)
+    app.router.add_post("/admin/blacklist/server/delete", _admin_server_delete_handler)
+    app.router.add_post("/admin/bot/status", _admin_bot_status_handler)
     app.router.add_get("/", lambda req: aiohttp.web.Response(text="Bot is running."))
     runner = aiohttp.web.AppRunner(app)
     await runner.setup()
