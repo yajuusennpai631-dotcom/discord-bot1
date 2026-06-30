@@ -1215,6 +1215,54 @@ def _generate_web_auth_state(guild_id: int, user_id: int) -> str:
     ).decode()
 
 
+GUILD_DASHBOARD_TOKEN_TTL = 1800  # サーバー管理ダッシュボードの個人専用リンクの有効期限（秒）= 30分
+
+
+def _generate_guild_dashboard_token(guild_id: int, user_id: int) -> str:
+    """
+    サーバー管理者向けWebダッシュボード（/dashboard）用の、有効期限付きHMAC署名トークンを生成します。
+    /dashboard スラッシュコマンド実行時点で「サーバー管理者である」ことを確認済みのユーザーに対して、
+    OAuth2ログインを挟まずに個人専用のダッシュボードリンクを発行するための仕組みです。
+    （Webアクセス時にも改めて当人がそのサーバーの管理者であるかを再検証します）
+    """
+    import hmac
+    import hashlib
+    expiry = int(time.time()) + GUILD_DASHBOARD_TOKEN_TTL
+    payload = f"{guild_id}:{user_id}:{expiry}"
+    signature = hmac.new(OAUTH_SECRET_KEY.encode(), payload.encode(), hashlib.sha256).hexdigest()
+    return base64.urlsafe_b64encode(f"{payload}:{signature}".encode()).decode()
+
+
+def _verify_guild_dashboard_token(token: str):
+    """
+    _generate_guild_dashboard_token で発行したトークンを検証し、
+    有効であれば (guild_id, user_id) のタプルを、無効・期限切れなら None を返します。
+    """
+    import hmac
+    import hashlib
+    try:
+        decoded = base64.urlsafe_b64decode(token.encode()).decode()
+        guild_id_str, user_id_str, expiry_str, signature = decoded.split(":")
+        payload = f"{guild_id_str}:{user_id_str}:{expiry_str}"
+        expected_signature = hmac.new(OAUTH_SECRET_KEY.encode(), payload.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(signature, expected_signature):
+            return None
+        if int(time.time()) > int(expiry_str):
+            return None
+        return int(guild_id_str), int(user_id_str)
+    except Exception:
+        return None
+
+
+def _build_guild_dashboard_url(guild_id: int, user_id: int) -> str:
+    """指定ユーザー専用の、サーバー管理ダッシュボード（/dashboard）への秘密リンクを生成します。"""
+    parsed = urllib.parse.urlparse(OAUTH_REDIRECT_URI)
+    base = f"{parsed.scheme}://{parsed.netloc}"
+    token = _generate_guild_dashboard_token(guild_id, user_id)
+    query = urllib.parse.urlencode({"token": token})
+    return f"{base}/dashboard?{query}"
+
+
 class VerifyBlacklistButtonView(discord.ui.View):
     """サーバーブラックリスト認証パネル用のボタンビューです。"""
     def __init__(self):
@@ -10672,6 +10720,8 @@ async def _start_web_server():
     app.router.add_post("/admin/blacklist/server/add", _admin_server_add_handler)
     app.router.add_post("/admin/blacklist/server/delete", _admin_server_delete_handler)
     app.router.add_post("/admin/bot/status", _admin_bot_status_handler)
+    app.router.add_get("/dashboard", _guild_dashboard_handler)
+    app.router.add_post("/dashboard/toggle", _guild_dashboard_toggle_handler)
     app.router.add_get("/", lambda req: aiohttp.web.Response(text="Bot is running."))
     runner = aiohttp.web.AppRunner(app)
     await runner.setup()
@@ -11321,6 +11371,410 @@ async def _post_troll_board(all_data: dict, uid_str: str):
             await channel.send(embed=embed)
         except Exception:
             pass
+
+
+# ====================================================================
+# セクション 16: サーバー管理者向けダッシュボード（Discordコマンド + Webパネル）
+# ====================================================================
+# サーバーオーナー専用の /admin/blacklist とは別に、各サーバーの「管理者権限を持つ
+# メンバー」が自分のサーバーの統計・設定状況をひと目で確認し、主要機能をその場で
+# ON/OFF切り替えできるダッシュボードです。
+#   ・/dashboard スラッシュコマンド … Discord内Embed + ボタンでの簡易ダッシュボード
+#   ・Web版（/dashboard?token=...） … ブラウザでの詳細ダッシュボード
+# Web版はOAuth2ログインの代わりに、/dashboard コマンド実行時点（Discord上で
+# 管理者権限を確認済み）に発行する有効期限付き署名トークンでアクセスを許可します。
+# Webアクセス時にも当人がそのサーバーの管理者であることを毎回再確認します。
+# --------------------------------------------------------------------
+
+DASHBOARD_TOGGLE_KEYS = {
+    "automod_spam_enabled":     "AutoMod（スパム対策）",
+    "automod_invite_enabled":   "AutoMod（招待リンクブロック）",
+    "automod_ng_words_enabled": "AutoMod（NGワード）",
+    "server_blacklist_enabled": "サーバーブラックリスト自動BAN",
+    "troll_autoban_enabled":    "荒らしリスト自動BAN",
+    "economy_enabled":          "経済システム（コイン）",
+    "alt_check_enabled":        "複垢（垢ban逃れ）チェック",
+    "iplogger_check_enabled":   "IPロガーリンク検知",
+}
+
+
+def _collect_guild_dashboard_stats(guild: discord.Guild, cfg: dict) -> dict:
+    """ダッシュボードに表示するサーバー統計値をまとめて取得します。"""
+    member_count = guild.member_count or 0
+    bot_count = sum(1 for m in guild.members if m.bot)
+    human_count = member_count - bot_count
+    try:
+        online_count = sum(
+            1 for m in guild.members
+            if not m.bot and m.status != discord.Status.offline
+        )
+    except Exception:
+        online_count = 0
+
+    warnings_total = sum(len(v) for v in cfg.get("warnings", {}).values())
+    economy_total = sum(cfg.get("economy_balances", {}).values()) if cfg.get("economy_balances") else 0
+
+    return {
+        "member_count": member_count,
+        "human_count": human_count,
+        "bot_count": bot_count,
+        "online_count": online_count,
+        "warnings_total": warnings_total,
+        "economy_total": economy_total,
+        "ng_words_count": len(cfg.get("ng_words", [])),
+        "custom_commands_count": len(cfg.get("custom_commands", {})),
+        "role_shop_count": len(cfg.get("role_shop", [])),
+        "vending_items_count": len(cfg.get("vending_items", [])),
+        "blacklist_servers_count": len(cfg.get("server_blacklist_ids", [])),
+    }
+
+
+def _build_dashboard_embed(guild: discord.Guild, cfg: dict) -> discord.Embed:
+    """/dashboard コマンド用のサーバー状況Embedを作成します。"""
+    stats = _collect_guild_dashboard_stats(guild, cfg)
+
+    embed = discord.Embed(
+        title=f" {guild.name} 管理ダッシュボード",
+        description="サーバーの統計・主要設定の状況です。下のボタンから機能をON/OFFできます。",
+        color=discord.Color.blurple()
+    )
+    if guild.icon:
+        embed.set_thumbnail(url=guild.icon.url)
+
+    embed.add_field(
+        name=" サーバー統計",
+        value=(
+            f"メンバー数: **{stats['member_count']:,}人**（人間: {stats['human_count']:,} / Bot: {stats['bot_count']:,}）\n"
+            f"オンライン: **{stats['online_count']:,}人**\n"
+            f"警告総数: **{stats['warnings_total']:,}件**\n"
+            f"経済システム総流通量: **{stats['economy_total']:,} {cfg.get('economy_currency_name', 'コイン')}**"
+        ),
+        inline=False
+    )
+
+    def chip(enabled: bool) -> str:
+        return "🟢 ON" if enabled else "⚪ OFF"
+
+    settings_lines = [f"{label}: {chip(cfg.get(key, False))}" for key, label in DASHBOARD_TOGGLE_KEYS.items()]
+    embed.add_field(name=" 主要機能の状態", value="\n".join(settings_lines), inline=False)
+
+    extra_lines = []
+    extra_lines.append(f"モデレーションログ: {'設定済み' if cfg.get('mod_log_channel_id') else '未設定'}")
+    extra_lines.append(f"ウェルカムメッセージ: {'設定済み' if cfg.get('welcome_channel_id') else '未設定'}")
+    extra_lines.append(f"認証ロール: {'設定済み' if cfg.get('verify_role') else '未設定'}")
+    extra_lines.append(f"NGワード登録数: {stats['ng_words_count']}件")
+    extra_lines.append(f"カスタムコマンド数: {stats['custom_commands_count']}件")
+    extra_lines.append(f"ロールショップ商品数: {stats['role_shop_count']}件 / 自販機商品数: {stats['vending_items_count']}件")
+    embed.add_field(name=" その他の設定状況", value="\n".join(extra_lines), inline=False)
+
+    embed.set_footer(text="ボタンはこのメッセージを送信した本人のみ操作できます（30分間有効）")
+    return embed
+
+
+class GuildDashboardView(discord.ui.View):
+    """
+    /dashboard コマンドのクイック切り替えパネルです。
+    各トグルボタンを押すと、対応する機能のON/OFFを即座に切り替えてEmbedを更新します。
+    """
+    def __init__(self, guild_id: int, author_id: int):
+        super().__init__(timeout=GUILD_DASHBOARD_TOKEN_TTL)
+        self.guild_id = guild_id
+        self.author_id = author_id
+
+        toggle_definitions = [
+            ("automod_spam_enabled", " AutoModスパム", discord.ButtonStyle.secondary),
+            ("automod_invite_enabled", " 招待リンク", discord.ButtonStyle.secondary),
+            ("automod_ng_words_enabled", " NGワード", discord.ButtonStyle.secondary),
+            ("server_blacklist_enabled", " 鯖ブラックリスト", discord.ButtonStyle.secondary),
+            ("troll_autoban_enabled", " 荒らし自動BAN", discord.ButtonStyle.secondary),
+            ("economy_enabled", " 経済システム", discord.ButtonStyle.secondary),
+        ]
+        for key, label, style in toggle_definitions:
+            button = discord.ui.Button(label=label, style=style, custom_id=f"dash_toggle_{key}")
+            button.callback = self._make_toggle_callback(key)
+            self.add_item(button)
+
+        web_url = _build_guild_dashboard_url(guild_id, author_id) if OAUTH_REDIRECT_URI else None
+        if web_url:
+            self.add_item(discord.ui.Button(label="🌐 詳細をWebで開く（本人専用リンク）", style=discord.ButtonStyle.link, url=web_url))
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message(
+                "このダッシュボードはコマンドを実行した本人のみ操作できます。自分で `/dashboard` を実行してください。",
+                ephemeral=True
+            )
+            return False
+        return True
+
+    def _make_toggle_callback(self, key: str):
+        async def callback(interaction: discord.Interaction):
+            all_data = load_data()
+            cfg = get_guild_config(all_data, str(self.guild_id))
+            cfg[key] = not cfg.get(key, False)
+            save_data(all_data)
+
+            guild = interaction.guild or bot.get_guild(self.guild_id)
+            embed = _build_dashboard_embed(guild, cfg)
+            await interaction.response.edit_message(embed=embed, view=self)
+        return callback
+
+
+@bot.tree.command(name="dashboard", description="【管理者専用】サーバーの統計・設定状況をまとめて確認できる管理ダッシュボードを表示します")
+async def dashboard_command(interaction: discord.Interaction):
+    """
+    サーバー管理者向けの統合ダッシュボードを表示します。
+    ・サーバー統計（メンバー数、オンライン数、警告数、経済流通量など）
+    ・主要機能のON/OFF状況の一覧
+    ・ボタンによるクイック切り替え
+    ・詳細設定用Webダッシュボードへの本人専用リンク
+    """
+    if not await is_guild_admin(interaction):
+        return
+    if not interaction.guild:
+        return
+
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(interaction.guild.id))
+    embed = _build_dashboard_embed(interaction.guild, cfg)
+    view = GuildDashboardView(interaction.guild.id, interaction.user.id)
+    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+
+# --------------------------------------------------------------------
+# Web版ダッシュボード（/dashboard?token=...）
+# --------------------------------------------------------------------
+
+def _guild_dashboard_html(
+    guild: discord.Guild,
+    cfg: dict,
+    token: str,
+    flash_message: str = None,
+    flash_is_error: bool = False,
+) -> str:
+    """サーバー管理者向けWebダッシュボードのHTMLを生成します（統計 + 設定概要 + クイック切り替え）。"""
+    color_bg, color_card, color_main = "#23272A", "#2C2F33", "#5865F2"
+    color_text, color_sub, color_box = "#FFFFFF", "#B9BBBE", "#1E2124"
+    color_green, color_danger = "#3BA55D", "#ED4245"
+
+    def esc(value) -> str:
+        return html.escape(str(value), quote=True)
+
+    token_esc = esc(token)
+    stats = _collect_guild_dashboard_stats(guild, cfg)
+
+    if flash_message:
+        flash_cls = "flash-error" if flash_is_error else "flash-ok"
+        flash_html = f'<div class="flash {flash_cls}">{esc(flash_message)}</div>'
+    else:
+        flash_html = ""
+
+    stat_cards = "".join(f'''
+        <div class="stat-card">
+          <div class="stat-num">{value:,}</div>
+          <div class="stat-label">{esc(label)}</div>
+        </div>''' for label, value in [
+        ("メンバー数", stats["member_count"]),
+        ("オンライン", stats["online_count"]),
+        ("Bot数", stats["bot_count"]),
+        ("警告総数", stats["warnings_total"]),
+        (f"{cfg.get('economy_currency_name', 'コイン')}総流通量", stats["economy_total"]),
+    ])
+
+    toggle_rows = "".join(f'''
+        <div class="toggle-row">
+          <div class="toggle-info">
+            <div class="toggle-name">{esc(label)}</div>
+          </div>
+          <form method="post" action="/dashboard/toggle" class="inline-form">
+            <input type="hidden" name="token" value="{token_esc}">
+            <input type="hidden" name="setting" value="{esc(key)}">
+            <button type="submit" class="toggle-btn {'on' if cfg.get(key, False) else 'off'}">
+              {'🟢 ON' if cfg.get(key, False) else '⚪ OFF'}
+            </button>
+          </form>
+        </div>''' for key, label in DASHBOARD_TOGGLE_KEYS.items())
+
+    overview_rows = "".join(f'''
+        <tr><td>{esc(label)}</td><td class="mono">{esc(value)}</td></tr>''' for label, value in [
+        ("モデレーションログ", "設定済み" if cfg.get("mod_log_channel_id") else "未設定"),
+        ("ウェルカムメッセージ", "設定済み" if cfg.get("welcome_channel_id") else "未設定"),
+        ("認証ロール", "設定済み" if cfg.get("verify_role") else "未設定"),
+        ("NGワード登録数", f"{stats['ng_words_count']}件"),
+        ("カスタムコマンド数", f"{stats['custom_commands_count']}件"),
+        ("カスタムトリガー数", len(cfg.get("custom_triggers", []))),
+        ("ロールショップ商品数", f"{stats['role_shop_count']}件"),
+        ("自販機商品数", f"{stats['vending_items_count']}件"),
+        ("サーバーブラックリスト登録数", f"{stats['blacklist_servers_count']}件"),
+        ("経済システム通貨名", cfg.get("economy_currency_name", "コイン")),
+        ("メッセージ報酬", f"{cfg.get('economy_reward_min')}〜{cfg.get('economy_reward_max')} / {cfg.get('economy_cooldown_seconds')}秒毎"),
+        ("/work 報酬", f"{cfg.get('economy_work_reward_min')}〜{cfg.get('economy_work_reward_max')} / {cfg.get('economy_work_cooldown_seconds')}秒毎"),
+    ])
+
+    guild_icon_html = (
+        f'<img src="{esc(guild.icon.url)}" class="guild-icon" alt="">' if guild.icon else
+        '<div class="guild-icon guild-icon-fallback"></div>'
+    )
+
+    return f"""<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="robots" content="noindex, nofollow">
+  <title>{esc(guild.name)} - 管理ダッシュボード</title>
+  <style>
+    * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+    body {{
+      background: {color_bg}; color: {color_text};
+      font-family: "Helvetica Neue", Arial, "Hiragino Kaku Gothic ProN", "Meiryo", sans-serif;
+      padding: 32px 20px 64px;
+    }}
+    .wrap {{ max-width: 920px; margin: 0 auto; }}
+    .header {{ display: flex; align-items: center; gap: 14px; margin-bottom: 6px; }}
+    .guild-icon {{ width: 48px; height: 48px; border-radius: 50%; object-fit: cover; }}
+    .guild-icon-fallback {{ background: #4a4e54; }}
+    h1 {{ font-size: 22px; font-weight: 700; }}
+    .caption {{ font-size: 13px; color: {color_sub}; margin: 6px 0 28px; }}
+    .stats {{ display: flex; gap: 16px; margin-bottom: 32px; flex-wrap: wrap; }}
+    .stat-card {{ background: {color_card}; border-radius: 12px; padding: 18px 24px; min-width: 150px; box-shadow: 0 4px 16px rgba(0,0,0,0.3); }}
+    .stat-num {{ font-size: 26px; font-weight: 700; color: {color_main}; }}
+    .stat-label {{ font-size: 12px; color: {color_sub}; margin-top: 4px; }}
+    .card {{ background: {color_card}; border-radius: 12px; padding: 24px; margin-bottom: 24px; box-shadow: 0 4px 16px rgba(0,0,0,0.3); }}
+    h2 {{ font-size: 16px; font-weight: 700; margin-bottom: 16px; }}
+    .toggle-row {{ display: flex; align-items: center; justify-content: space-between; padding: 10px 0; border-bottom: 1px solid #34383e; }}
+    .toggle-row:last-child {{ border-bottom: none; }}
+    .toggle-name {{ font-size: 13px; font-weight: 700; }}
+    .toggle-btn {{
+      border: none; border-radius: 20px; padding: 7px 16px; font-size: 12px; font-weight: 700;
+      cursor: pointer; min-width: 80px; color: {color_text};
+    }}
+    .toggle-btn.on {{ background: {color_green}; }}
+    .toggle-btn.off {{ background: #4a4e54; }}
+    .inline-form {{ display: inline-block; }}
+    table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
+    td {{ padding: 9px 4px; border-bottom: 1px solid #34383e; }}
+    td:first-child {{ color: {color_sub}; }}
+    td:last-child {{ text-align: right; font-weight: 700; }}
+    .mono {{ font-family: "SFMono-Regular", Consolas, monospace; }}
+    .flash {{ border-radius: 8px; padding: 10px 14px; font-size: 13px; font-weight: 700; margin-bottom: 20px; }}
+    .flash-ok {{ background: rgba(59, 165, 93, 0.15); border: 1px solid {color_green}; color: #8fe3ac; }}
+    .flash-error {{ background: rgba(237, 66, 69, 0.15); border: 1px solid {color_danger}; color: #ff9a9c; }}
+    .warn-banner {{
+      background: rgba(237, 66, 69, 0.12); border: 1px solid {color_danger}; color: #ff9a9c;
+      border-radius: 8px; padding: 10px 14px; font-size: 12px; margin-bottom: 24px;
+    }}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    {flash_html}
+    <div class="header">
+      {guild_icon_html}
+      <div>
+        <h1>{esc(guild.name)} 管理ダッシュボード</h1>
+      </div>
+    </div>
+    <p class="caption">このリンクはあなた専用です（発行から30分間有効）。第三者に共有しないでください。</p>
+    <div class="warn-banner">このリンクを知っている人は誰でもこのサーバーの設定を変更できます。Discord上で再度 <code>/dashboard</code> を実行すると新しいリンクが発行されます。</div>
+
+    <div class="stats">{stat_cards}</div>
+
+    <div class="card">
+      <h2> クイック切り替えパネル</h2>
+      {toggle_rows}
+    </div>
+
+    <div class="card">
+      <h2> 設定概要</h2>
+      <table>{overview_rows}</table>
+    </div>
+  </div>
+</body>
+</html>"""
+
+
+def _dashboard_redirect_with_token(token: str, message: str, is_error: bool = False):
+    """Webダッシュボードのトグル操作後、結果メッセージ付きで同じダッシュボードへリダイレクトします（PRGパターン）。"""
+    query = urllib.parse.urlencode({"token": token, "msg": message, "err": "1" if is_error else "0"})
+    return aiohttp.web.HTTPSeeOther(location=f"/dashboard?{query}")
+
+
+def _resolve_dashboard_access(guild_id: int, user_id: int):
+    """
+    トークンに含まれる guild_id / user_id について、現在もそのサーバーに在籍し、
+    かつ管理者権限（Administrator）を持っているかを再検証します。
+    戻り値は (guild, error_message) のタプルで、問題なければ error_message は None です。
+    """
+    guild = bot.get_guild(guild_id)
+    if guild is None:
+        return None, "Botがこのサーバーから退出しているため、ダッシュボードを表示できません。"
+    member = guild.get_member(user_id)
+    if member is None:
+        return None, "あなたはこのサーバーのメンバーではないため、ダッシュボードにアクセスできません。"
+    if not member.guild_permissions.administrator:
+        return None, "あなたはこのサーバーの管理者ではないため、ダッシュボードにアクセスできません。"
+    return guild, None
+
+
+async def _guild_dashboard_handler(request):
+    """サーバー管理者向けWebダッシュボードの表示エンドポイント（GET /dashboard?token=...）。"""
+    token = request.rel_url.query.get("token", "")
+    result = _verify_guild_dashboard_token(token)
+    if result is None:
+        return aiohttp.web.Response(
+            text="このリンクは無効か、有効期限（発行から30分）が切れています。Discordで `/dashboard` を再実行してください。",
+            status=403,
+            content_type="text/plain"
+        )
+    guild_id, user_id = result
+
+    guild, error_message = _resolve_dashboard_access(guild_id, user_id)
+    if guild is None:
+        return aiohttp.web.Response(text=error_message, status=403, content_type="text/plain")
+
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(guild_id))
+
+    flash_message = request.rel_url.query.get("msg") or None
+    flash_is_error = request.rel_url.query.get("err") == "1"
+
+    return aiohttp.web.Response(
+        text=_guild_dashboard_html(guild, cfg, token, flash_message, flash_is_error),
+        content_type="text/html"
+    )
+
+
+async def _guild_dashboard_toggle_handler(request):
+    """Webダッシュボードのクイック切り替えパネルからの設定変更を処理します（POST /dashboard/toggle）。"""
+    data = await request.post()
+    token = data.get("token", "")
+    setting_key = data.get("setting", "")
+
+    result = _verify_guild_dashboard_token(token)
+    if result is None:
+        return aiohttp.web.Response(
+            text="このリンクは無効か、有効期限が切れています。Discordで `/dashboard` を再実行してください。",
+            status=403,
+            content_type="text/plain"
+        )
+    guild_id, user_id = result
+
+    guild, error_message = _resolve_dashboard_access(guild_id, user_id)
+    if guild is None:
+        return aiohttp.web.Response(text=error_message, status=403, content_type="text/plain")
+
+    if setting_key not in DASHBOARD_TOGGLE_KEYS:
+        return _dashboard_redirect_with_token(token, "不正な設定項目です。", is_error=True)
+
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(guild_id))
+    cfg[setting_key] = not cfg.get(setting_key, False)
+    save_data(all_data)
+
+    new_state = "ON" if cfg[setting_key] else "OFF"
+    label = DASHBOARD_TOGGLE_KEYS[setting_key]
+    return _dashboard_redirect_with_token(token, f"「{label}」を {new_state} にしました。")
 
 
 # ====================================================================
