@@ -1168,6 +1168,17 @@ def _build_terms_url(state: str) -> str:
     return f"{base}/terms?{query}"
 
 
+def _build_complete_url(token: str) -> str:
+    """
+    OAUTH_REDIRECT_URI のスキーム・ホストを基に、認証完了確定ページ（/complete）のURLを生成します。
+    Discord OAuth2 認証が済んだあと、ユーザーが「認証完了」ボタンを押すことでロール付与等を確定させるためのURLです。
+    """
+    parsed = urllib.parse.urlparse(OAUTH_REDIRECT_URI)
+    base = f"{parsed.scheme}://{parsed.netloc}"
+    query = urllib.parse.urlencode({"token": token})
+    return f"{base}/complete?{query}"
+
+
 def _generate_web_auth_state(guild_id: int, user_id: int) -> str:
     """
     ウェブ認証用の HMAC署名付き state トークンを生成します。
@@ -9368,27 +9379,15 @@ async def _terms_page_handler(request):
     return aiohttp.web.Response(text=_terms_page_html(state, oauth_url), content_type="text/html")
 
 
-async def _oauth2_callback_handler(request):
-    """
-    Discord OAuth2 コールバックエンドポイント。
-    ユーザーが認証を完了したときにここへリダイレクトされる。
-    stateを検証し、ユーザーの参加サーバー一覧を取得してBL照合を行う。
-    """
-    import hmac
-    import hashlib
-
-    code = request.rel_url.query.get("code")
-    state = request.rel_url.query.get("state")
-
-    def _html_page(title: str, message: str, sub: str = "", ok: bool = True) -> aiohttp.web.Response:
-        """認証結果ページのHTMLを生成して返します。"""
-        color_main = "#5865F2" if ok else "#ED4245"
-        color_bg   = "#23272A"
-        color_card = "#2C2F33"
-        color_text = "#FFFFFF"
-        color_sub  = "#B9BBBE"
-        icon = "&#10003;" if ok else "&#10007;"
-        html = f"""<!DOCTYPE html>
+def _result_page_html(title: str, message: str, sub: str = "", ok: bool = True) -> aiohttp.web.Response:
+    """認証結果ページのHTMLを生成して返します。（モジュール共通: コールバック / 完了確定ページの両方から利用）"""
+    color_main = "#5865F2" if ok else "#ED4245"
+    color_bg   = "#23272A"
+    color_card = "#2C2F33"
+    color_text = "#FFFFFF"
+    color_sub  = "#B9BBBE"
+    icon = "&#10003;" if ok else "&#10007;"
+    html = f"""<!DOCTYPE html>
 <html lang="ja">
 <head>
   <meta charset="UTF-8">
@@ -9451,7 +9450,127 @@ async def _oauth2_callback_handler(request):
   </div>
 </body>
 </html>"""
-        return aiohttp.web.Response(text=html, content_type="text/html")
+    return aiohttp.web.Response(text=html, content_type="text/html")
+
+
+def _confirm_complete_page_html(complete_url: str) -> str:
+    """
+    Discord OAuth2 認証は完了したが、まだロール付与が確定していない状態のページ。
+    ユーザーが「認証完了」ボタンを押すことで、初めてロール付与等が確定します。
+    """
+    color_bg   = "#23272A"
+    color_card = "#2C2F33"
+    color_main = "#5865F2"
+    color_text = "#FFFFFF"
+    color_sub  = "#B9BBBE"
+    return f"""<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>認証完了の確定</title>
+  <style>
+    * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+    body {{
+      background: {color_bg}; color: {color_text};
+      font-family: "Helvetica Neue", Arial, "Hiragino Kaku Gothic ProN", "Meiryo", sans-serif;
+      display: flex; align-items: center; justify-content: center; min-height: 100vh; padding: 24px;
+    }}
+    .card {{
+      background: {color_card}; border-radius: 12px; padding: 48px 40px;
+      max-width: 440px; width: 100%; text-align: center; box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+    }}
+    .icon {{
+      width: 72px; height: 72px; border-radius: 50%; background: {color_main};
+      display: flex; align-items: center; justify-content: center; font-size: 36px; margin: 0 auto 24px;
+    }}
+    h1 {{ font-size: 22px; font-weight: 700; margin-bottom: 12px; }}
+    p {{ font-size: 14px; color: {color_sub}; line-height: 1.6; margin-bottom: 28px; }}
+    .btn {{
+      display: block; width: 100%; text-align: center; padding: 14px;
+      border-radius: 8px; background: {color_main}; color: #fff; font-weight: 700;
+      text-decoration: none; font-size: 15px;
+    }}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="icon">&#10003;</div>
+    <h1>Discordアカウントの確認が完了しました</h1>
+    <p>あと一歩です。下のボタンを押して認証を完了してください。</p>
+    <a class="btn" href="{complete_url}">認証完了</a>
+  </div>
+</body>
+</html>"""
+
+
+async def _complete_handler(request):
+    """
+    「認証完了」ボタンが押されたときの最終確定エンドポイント。
+    ここで初めて認証完了ロールの付与を行い、完了ページを表示します。
+    """
+    import hmac
+    import hashlib
+
+    token = request.rel_url.query.get("token")
+    if not token:
+        return _result_page_html(
+            title="認証エラー",
+            message="無効なリクエストです",
+            sub="このページを閉じて、Discordのパネルから再度お試しください。",
+            ok=False
+        )
+
+    try:
+        decoded = base64.urlsafe_b64decode(token.encode()).decode()
+        parts = decoded.split(":")
+        if len(parts) != 3:
+            raise ValueError("token フォーマット不正")
+        guild_id_str, user_id_str, sig = parts
+        guild_id = int(guild_id_str)
+        user_id = int(user_id_str)
+        expected_sig = hmac.new(
+            OAUTH_SECRET_KEY.encode(),
+            f"{guild_id_str}:{user_id_str}".encode(),
+            hashlib.sha256
+        ).hexdigest()
+        if not hmac.compare_digest(sig, expected_sig):
+            raise ValueError("署名不一致")
+    except Exception as e:
+        print(f"[認証完了確定] token検証エラー: {e}")
+        return _result_page_html(
+            title="認証エラー",
+            message="認証トークンが無効です",
+            sub="リンクの有効期限が切れている可能性があります。Discordのパネルから再度お試しください。",
+            ok=False
+        )
+
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(guild_id))
+    await _grant_verified_role(bot, guild_id, user_id, cfg)
+
+    return _result_page_html(
+        title="認証完了",
+        message="認証完了",
+        sub="このページを閉じてサーバーをお楽しみください。"
+    )
+
+
+async def _oauth2_callback_handler(request):
+    """
+    Discord OAuth2 コールバックエンドポイント。
+    ユーザーが認証を完了したときにここへリダイレクトされる。
+    stateを検証し、ユーザーの参加サーバー一覧を取得してBL照合を行う。
+    BL照合をクリアした場合は、ここではロールを確定付与せず、
+    ユーザーが「認証完了」ボタンを押した時点（/complete）で確定させます。
+    """
+    import hmac
+    import hashlib
+
+    code = request.rel_url.query.get("code")
+    state = request.rel_url.query.get("state")
+
+    _html_page = _result_page_html
 
     if not code or not state:
         return _html_page(
@@ -9616,12 +9735,12 @@ async def _oauth2_callback_handler(request):
     # ② サーバーブラックリスト照合 — server_blacklist_enabled がONの場合のみ
     # =========================================================
     if not cfg.get("server_blacklist_enabled", True):
-        # 機能が無効になっていれば認証OKとして終了（ロール付与のみ実行）
-        await _grant_verified_role(bot, guild_id, user_id, cfg)
-        return _html_page(
-            title="認証完了",
-            message="認証完了",
-            sub="このページを閉じてサーバーをお楽しみください。"
+        # 機能が無効になっていれば認証OK。ロール付与は「認証完了」ボタン押下時に確定させる
+        complete_token = _generate_web_auth_state(guild_id, user_id)
+        complete_url = _build_complete_url(complete_token)
+        return aiohttp.web.Response(
+            text=_confirm_complete_page_html(complete_url),
+            content_type="text/html"
         )
 
     # BL対象IDは全サーバー共通リストから取得
@@ -9694,13 +9813,14 @@ async def _oauth2_callback_handler(request):
             ok=False
         )
     else:
-        # ブラックリスト対象サーバーに参加していない -> 認証OK
+        # ブラックリスト対象サーバーに参加していない -> 認証OK。
+        # ロール付与は「認証完了」ボタン押下時に確定させる
         print(f"[サーバーBL] ユーザー {user_id} はBL対象サーバーに在籍なし -> 認証OK")
-        await _grant_verified_role(bot, guild_id, user_id, cfg)
-        return _html_page(
-            title="認証完了",
-            message="認証完了",
-            sub="このページを閉じてサーバーをお楽しみください。"
+        complete_token = _generate_web_auth_state(guild_id, user_id)
+        complete_url = _build_complete_url(complete_token)
+        return aiohttp.web.Response(
+            text=_confirm_complete_page_html(complete_url),
+            content_type="text/html"
         )
 
 
@@ -9708,6 +9828,7 @@ async def _start_web_server():
     """aiohttp による OAuth2 コールバック受け取り用 Webサーバーを起動します。"""
     app = aiohttp.web.Application()
     app.router.add_get("/callback", _oauth2_callback_handler)
+    app.router.add_get("/complete", _complete_handler)
     app.router.add_get("/terms", _terms_page_handler)
     app.router.add_get("/", lambda req: aiohttp.web.Response(text="Bot is running."))
     runner = aiohttp.web.AppRunner(app)
