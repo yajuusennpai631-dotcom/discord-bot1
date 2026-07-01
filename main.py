@@ -66,8 +66,10 @@ intents.dm_messages = True      # DMメッセージの受信を有効化（on_me
 # JSONデータファイルのパス設定 (Railway用の永続化パス '/app/data' の存在チェック)
 if os.path.exists("/app/data"):
     JSON_FILE = "/app/data/allowed_users.json"
+    SERVER_BOARD_JSON_FILE = "/app/data/server_board.json"
 else:
     JSON_FILE = "allowed_users.json"
+    SERVER_BOARD_JSON_FILE = "server_board.json"
 
 # Botのカスタムステータステキスト保存用変数
 current_custom_status = None
@@ -101,6 +103,62 @@ def save_data(data: dict):
             json.dump(data, f, ensure_ascii=False, indent=4)
     except Exception as e:
         print(f"[JSON保存エラー] {e}")
+
+
+# --------------------------------------------------------------------
+# サーバー掲示板（グローバル・複数サーバー間の宣伝掲示板機能）
+# DISBOARDのように、このBotを導入している全サーバー同士がお互いを
+# 宣伝し合うための仕組みです。allowed_users.json とは独立した専用
+# ファイル（server_board.json）でデータを管理します。
+# --------------------------------------------------------------------
+
+SERVER_BOARD_BUMP_COOLDOWN_SECONDS = 3600  # bump間隔 = 1時間
+
+
+def load_server_board_data() -> dict:
+    """サーバー掲示板データ（server_board.json）を読み込みます。"""
+    if os.path.exists(SERVER_BOARD_JSON_FILE):
+        try:
+            with open(SERVER_BOARD_JSON_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"[掲示板JSON読み込みエラー] {e}")
+            return {}
+    return {}
+
+
+def save_server_board_data(data: dict):
+    """サーバー掲示板データ（server_board.json）を書き込みます。"""
+    try:
+        dir_name = os.path.dirname(SERVER_BOARD_JSON_FILE)
+        if dir_name and not os.path.exists(dir_name):
+            os.makedirs(dir_name, exist_ok=True)
+        with open(SERVER_BOARD_JSON_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=4)
+    except Exception as e:
+        print(f"[掲示板JSON保存エラー] {e}")
+
+
+def get_board_entry(board_data: dict, guild_id_str: str) -> dict | None:
+    """指定サーバーの掲示板登録情報を取得します。未登録ならNoneを返します。"""
+    return board_data.get("entries", {}).get(guild_id_str)
+
+
+def ensure_board_entry(board_data: dict, guild_id_str: str) -> dict:
+    """指定サーバーの掲示板登録情報を取得し、無ければデフォルト値で新規作成します。"""
+    if "entries" not in board_data:
+        board_data["entries"] = {}
+    if guild_id_str not in board_data["entries"]:
+        board_data["entries"][guild_id_str] = {
+            "description": "",
+            "tags": [],
+            "invite_url": "",
+            "registered_at": int(time.time()),
+            "last_bumped_at": 0,
+            "bump_count": 0,
+            "bumped_by": None,
+        }
+    return board_data["entries"][guild_id_str]
 
 
 def get_guild_config(all_data: dict, guild_id_str: str) -> dict:
@@ -1263,6 +1321,61 @@ def _build_guild_dashboard_url(guild_id: int, user_id: int) -> str:
     token = _generate_guild_dashboard_token(guild_id, user_id)
     query = urllib.parse.urlencode({"token": token})
     return f"{base}/dashboard?{query}"
+
+
+# --------------------------------------------------------------------
+# サーバー掲示板（グローバル掲示板）管理用トークン
+# /dashboard と同じHMAC署名付きトークン方式を流用し、OAuth2ログインを
+# 挟まずに「実行時点で管理者であることを確認済みの本人専用リンク」を発行します。
+# --------------------------------------------------------------------
+
+BOARD_MANAGE_TOKEN_TTL = 1800  # サーバー掲示板・管理ページの個人専用リンクの有効期限（秒）= 30分
+
+
+def _generate_board_manage_token(guild_id: int, user_id: int) -> str:
+    """サーバー掲示板の管理ページ（/board/manage）用の、有効期限付きHMAC署名トークンを生成します。"""
+    import hmac
+    import hashlib
+    expiry = int(time.time()) + BOARD_MANAGE_TOKEN_TTL
+    payload = f"board:{guild_id}:{user_id}:{expiry}"
+    signature = hmac.new(OAUTH_SECRET_KEY.encode(), payload.encode(), hashlib.sha256).hexdigest()
+    return base64.urlsafe_b64encode(f"{payload}:{signature}".encode()).decode()
+
+
+def _verify_board_manage_token(token: str):
+    """_generate_board_manage_token で発行したトークンを検証します。"""
+    import hmac
+    import hashlib
+    try:
+        decoded = base64.urlsafe_b64decode(token.encode()).decode()
+        tag, guild_id_str, user_id_str, expiry_str, signature = decoded.split(":")
+        if tag != "board":
+            return None
+        payload = f"{tag}:{guild_id_str}:{user_id_str}:{expiry_str}"
+        expected_signature = hmac.new(OAUTH_SECRET_KEY.encode(), payload.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(signature, expected_signature):
+            return None
+        if int(time.time()) > int(expiry_str):
+            return None
+        return int(guild_id_str), int(user_id_str)
+    except Exception:
+        return None
+
+
+def _build_board_manage_url(guild_id: int, user_id: int) -> str:
+    """指定ユーザー専用の、サーバー掲示板管理ページ（/board/manage）への秘密リンクを生成します。"""
+    parsed = urllib.parse.urlparse(OAUTH_REDIRECT_URI)
+    base = f"{parsed.scheme}://{parsed.netloc}"
+    token = _generate_board_manage_token(guild_id, user_id)
+    query = urllib.parse.urlencode({"token": token})
+    return f"{base}/board/manage?{query}"
+
+
+def _build_board_url() -> str:
+    """サーバー掲示板の一覧ページ（誰でも閲覧可）のURLを生成します。"""
+    parsed = urllib.parse.urlparse(OAUTH_REDIRECT_URI)
+    base = f"{parsed.scheme}://{parsed.netloc}"
+    return f"{base}/board"
 
 
 class VerifyBlacklistButtonView(discord.ui.View):
@@ -10725,6 +10838,9 @@ async def _start_web_server():
     app.router.add_post("/admin/bot/status", _admin_bot_status_handler)
     app.router.add_get("/dashboard", _guild_dashboard_handler)
     app.router.add_post("/dashboard/toggle", _guild_dashboard_toggle_handler)
+    app.router.add_get("/board", _board_list_handler)
+    app.router.add_get("/board/manage", _board_manage_handler)
+    app.router.add_post("/board/manage/save", _board_manage_save_handler)
     app.router.add_get("/", lambda req: aiohttp.web.Response(text="Bot is running."))
     runner = aiohttp.web.AppRunner(app)
     await runner.setup()
@@ -11778,6 +11894,502 @@ async def _guild_dashboard_toggle_handler(request):
     new_state = "ON" if cfg[setting_key] else "OFF"
     label = DASHBOARD_TOGGLE_KEYS[setting_key]
     return _dashboard_redirect_with_token(token, f"「{label}」を {new_state} にしました。")
+
+
+# ====================================================================
+# セクション 17: サーバー掲示板（グローバル・複数サーバー間の宣伝掲示板）
+# ====================================================================
+# DISBOARDのように、このBotを導入している全サーバーが互いに宣伝し合う
+# ための機能です。
+#   ・一覧ページ（Web） /board            … 誰でも閲覧可。メンバー数の多い順に表示
+#   ・管理ページ（Web） /board/manage     … サーバー管理者のみ（本人専用リンク）
+#   ・/board_manage スラッシュコマンド    … 管理ページへの本人専用リンクをDiscord上で発行
+#   ・/bump スラッシュコマンド            … 誰でも実行可。1時間に1回、サーバーを最新（上位）に上げる
+# bump後1時間経過すると、実行者にDiscord DMで「そろそろbumpできます」と通知します。
+# --------------------------------------------------------------------
+
+def _board_entry_display_name(guild: discord.Guild | None, guild_id_str: str) -> str:
+    """掲示板表示用のサーバー名を取得します（Botが既に退出済みの場合はIDを表示）。"""
+    return guild.name if guild is not None else f"(不明なサーバー: {guild_id_str})"
+
+
+def _collect_board_ranking(board_data: dict) -> list[dict]:
+    """
+    掲示板登録済みの全サーバーを、現在のメンバー数が多い順に並べたリストを作成します。
+    Botが既に退出しているサーバーはランキングから除外します。
+    各要素: {"guild": discord.Guild, "guild_id": int, "entry": dict, "member_count": int}
+    """
+    entries = board_data.get("entries", {})
+    ranking = []
+    for guild_id_str, entry in entries.items():
+        try:
+            guild_id = int(guild_id_str)
+        except ValueError:
+            continue
+        guild = bot.get_guild(guild_id)
+        if guild is None:
+            # Botが導入されていないサーバーは掲示板に出さない
+            continue
+        ranking.append({
+            "guild": guild,
+            "guild_id": guild_id,
+            "entry": entry,
+            "member_count": guild.member_count or 0,
+        })
+    ranking.sort(key=lambda item: item["member_count"], reverse=True)
+    return ranking
+
+
+async def _board_bump_reminder_task(user_id: int, guild_id: int, guild_name: str):
+    """bumpから1時間後に、実行者へ「そろそろbumpできます」とDM通知するバックグラウンドタスクです。"""
+    await asyncio.sleep(SERVER_BOARD_BUMP_COOLDOWN_SECONDS)
+    try:
+        user = await bot.fetch_user(user_id)
+        embed = discord.Embed(
+            title="⏰ そろそろbumpできます！",
+            description=(
+                f"**{guild_name}** のbumpクールダウンが終了しました。\n"
+                f"サーバー内で `/bump` を実行して、サーバー掲示板の上位に上げましょう！"
+            ),
+            color=discord.Color.blurple(),
+        )
+        await user.send(embed=embed)
+    except Exception as e:
+        print(f"[サーバー掲示板] bumpリマインダーDM送信失敗: {e}")
+
+
+@bot.tree.command(name="board_manage", description="【管理者専用】サーバー掲示板の登録・編集ページへの本人専用リンクを発行します")
+@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@app_commands.allowed_installs(guilds=True, users=False)
+async def board_manage_command(interaction: discord.Interaction):
+    """サーバー掲示板の登録・編集用Webページへの、本人専用の秘密リンクを発行します。"""
+    if not await is_guild_admin(interaction):
+        return
+    if not interaction.guild:
+        return
+
+    if not (DISCORD_CLIENT_ID and DISCORD_CLIENT_SECRET and OAUTH_REDIRECT_URI):
+        await interaction.response.send_message(
+            "サーバー掲示板機能を利用するには、Bot側でWebサーバー用の環境変数が設定されている必要があります。Botの管理者にお問い合わせください。",
+            ephemeral=True
+        )
+        return
+
+    url = _build_board_manage_url(interaction.guild.id, interaction.user.id)
+    embed = discord.Embed(
+        title="📋 サーバー掲示板 管理ページ",
+        description=(
+            f"以下のリンクから、**{interaction.guild.name}** の掲示板情報（説明・タグ・招待リンク）を"
+            f"登録・編集できます。\n\n"
+            f"[管理ページを開く]({url})\n\n"
+            f"⚠️ このリンクはあなた専用です（発行から30分間有効）。第三者に共有しないでください。"
+        ),
+        color=discord.Color.blurple(),
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="board", description="サーバー掲示板の一覧ページのURLを表示します")
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=False)
+async def board_command(interaction: discord.Interaction):
+    """サーバー掲示板の一覧ページ（誰でも閲覧可）のURLを表示します。"""
+    if not (DISCORD_CLIENT_ID and DISCORD_CLIENT_SECRET and OAUTH_REDIRECT_URI):
+        await interaction.response.send_message(
+            "サーバー掲示板機能は現在利用できません（Bot側の設定が未完了です）。",
+            ephemeral=True
+        )
+        return
+    url = _build_board_url()
+    embed = discord.Embed(
+        title="📋 サーバー掲示板",
+        description=f"導入中の全サーバーの宣伝一覧はこちらから閲覧できます。\n\n[サーバー掲示板を開く]({url})",
+        color=discord.Color.blurple(),
+    )
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="bump", description="このサーバーをサーバー掲示板の上位に上げます（1時間に1回）")
+@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@app_commands.allowed_installs(guilds=True, users=False)
+async def bump_command(interaction: discord.Interaction):
+    """
+    サーバーを掲示板の最新（実質的な上位）に上げます。誰でも実行可能ですが、
+    サーバーごとに1時間のクールダウンがあります。
+    実行1時間後、実行者にDMで「そろそろbumpできます」と通知します。
+    """
+    if not interaction.guild:
+        await interaction.response.send_message("このコマンドはサーバー内でのみ使用できます。", ephemeral=True)
+        return
+
+    board_data = load_server_board_data()
+    guild_id_str = str(interaction.guild.id)
+    entry = get_board_entry(board_data, guild_id_str)
+
+    if entry is None:
+        await interaction.response.send_message(
+            "このサーバーはまだサーバー掲示板に登録されていません。管理者が `/board_manage` から登録してください。",
+            ephemeral=True
+        )
+        return
+
+    now = int(time.time())
+    last_bumped_at = entry.get("last_bumped_at", 0)
+    elapsed = now - last_bumped_at
+    if elapsed < SERVER_BOARD_BUMP_COOLDOWN_SECONDS:
+        remaining = SERVER_BOARD_BUMP_COOLDOWN_SECONDS - elapsed
+        minutes, seconds = divmod(remaining, 60)
+        await interaction.response.send_message(
+            f"⏳ まだbumpできません。次のbumpまで **{minutes}分{seconds}秒** お待ちください。",
+            ephemeral=True
+        )
+        return
+
+    entry["last_bumped_at"] = now
+    entry["bump_count"] = entry.get("bump_count", 0) + 1
+    entry["bumped_by"] = interaction.user.id
+    save_server_board_data(board_data)
+
+    embed = discord.Embed(
+        title="✅ bumpしました！",
+        description=(
+            f"**{interaction.guild.name}** をサーバー掲示板の最新に上げました。\n"
+            f"1時間後、あなたにDMで再bumpのタイミングをお知らせします。"
+        ),
+        color=discord.Color.green(),
+    )
+    await interaction.response.send_message(embed=embed)
+
+    asyncio.create_task(
+        _board_bump_reminder_task(interaction.user.id, interaction.guild.id, interaction.guild.name)
+    )
+
+
+# --------------------------------------------------------------------
+# Web版サーバー掲示板
+# --------------------------------------------------------------------
+
+def _board_list_html(ranking: list[dict], flash_message: str = None, flash_is_error: bool = False) -> str:
+    """サーバー掲示板の一覧ページのHTMLを生成します（誰でも閲覧可）。"""
+    color_bg, color_card, color_main = "#23272A", "#2C2F33", "#5865F2"
+    color_text, color_sub = "#FFFFFF", "#B9BBBE"
+    color_green, color_danger = "#3BA55D", "#ED4245"
+
+    def esc(value) -> str:
+        return html.escape(str(value), quote=True)
+
+    if flash_message:
+        flash_cls = "flash-error" if flash_is_error else "flash-ok"
+        flash_html = f'<div class="flash {flash_cls}">{esc(flash_message)}</div>'
+    else:
+        flash_html = ""
+
+    if not ranking:
+        rows_html = '<p class="empty">まだ登録されているサーバーがありません。</p>'
+    else:
+        cards = []
+        now = int(time.time())
+        for rank, item in enumerate(ranking, start=1):
+            guild = item["guild"]
+            entry = item["entry"]
+            member_count = item["member_count"]
+
+            icon_html = (
+                f'<img src="{esc(guild.icon.url)}" class="server-icon" alt="">' if guild.icon else
+                '<div class="server-icon server-icon-fallback"></div>'
+            )
+
+            description = entry.get("description") or "（説明文は未設定です）"
+            tags = entry.get("tags") or []
+            tags_html = "".join(f'<span class="tag">{esc(tag)}</span>' for tag in tags)
+
+            invite_url = entry.get("invite_url") or ""
+            if invite_url:
+                invite_html = f'<a class="invite-btn" href="{esc(invite_url)}" target="_blank" rel="noopener noreferrer">サーバーに参加する</a>'
+            else:
+                invite_html = '<span class="invite-btn invite-btn-disabled">招待リンク未設定</span>'
+
+            last_bumped_at = entry.get("last_bumped_at", 0)
+            if last_bumped_at:
+                elapsed_min = max(0, (now - last_bumped_at) // 60)
+                bump_info = f"{elapsed_min}分前にbump"
+            else:
+                bump_info = "まだbumpされていません"
+
+            cards.append(f'''
+        <div class="server-card">
+          <div class="rank">#{rank}</div>
+          {icon_html}
+          <div class="server-body">
+            <div class="server-name-row">
+              <span class="server-name">{esc(guild.name)}</span>
+              <span class="member-count">👥 {member_count:,}人</span>
+            </div>
+            <p class="server-desc">{esc(description)}</p>
+            <div class="tags">{tags_html}</div>
+            <div class="server-footer">
+              <span class="bump-info">{esc(bump_info)}（累計bump {entry.get("bump_count", 0)}回）</span>
+              {invite_html}
+            </div>
+          </div>
+        </div>''')
+        rows_html = "".join(cards)
+
+    return f"""<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>サーバー掲示板</title>
+  <style>
+    * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+    body {{
+      background: {color_bg}; color: {color_text};
+      font-family: "Helvetica Neue", Arial, "Hiragino Kaku Gothic ProN", "Meiryo", sans-serif;
+      padding: 32px 20px 64px;
+    }}
+    .wrap {{ max-width: 760px; margin: 0 auto; }}
+    h1 {{ font-size: 24px; font-weight: 700; margin-bottom: 4px; }}
+    .caption {{ font-size: 13px; color: {color_sub}; margin-bottom: 28px; }}
+    .flash {{ border-radius: 8px; padding: 10px 14px; font-size: 13px; font-weight: 700; margin-bottom: 20px; }}
+    .flash-ok {{ background: rgba(59, 165, 93, 0.15); border: 1px solid {color_green}; color: #8fe3ac; }}
+    .flash-error {{ background: rgba(237, 66, 69, 0.15); border: 1px solid {color_danger}; color: #ff9a9c; }}
+    .empty {{ color: {color_sub}; font-size: 14px; padding: 40px 0; text-align: center; }}
+    .server-card {{
+      background: {color_card}; border-radius: 12px; padding: 18px 20px; margin-bottom: 16px;
+      display: flex; align-items: flex-start; gap: 14px; box-shadow: 0 4px 16px rgba(0,0,0,0.3);
+    }}
+    .rank {{ font-size: 15px; font-weight: 700; color: {color_main}; min-width: 32px; padding-top: 6px; }}
+    .server-icon {{ width: 56px; height: 56px; border-radius: 50%; object-fit: cover; flex-shrink: 0; }}
+    .server-icon-fallback {{ background: #4a4e54; }}
+    .server-body {{ flex: 1; min-width: 0; }}
+    .server-name-row {{ display: flex; align-items: baseline; justify-content: space-between; gap: 10px; flex-wrap: wrap; }}
+    .server-name {{ font-size: 16px; font-weight: 700; }}
+    .member-count {{ font-size: 12px; color: {color_sub}; white-space: nowrap; }}
+    .server-desc {{ font-size: 13px; color: {color_sub}; margin: 8px 0; white-space: pre-wrap; word-break: break-word; }}
+    .tags {{ display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }}
+    .tag {{ background: #34383e; color: {color_sub}; border-radius: 12px; padding: 3px 10px; font-size: 11px; }}
+    .server-footer {{ display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }}
+    .bump-info {{ font-size: 11px; color: {color_sub}; }}
+    .invite-btn {{
+      background: {color_main}; color: #fff; text-decoration: none; font-size: 12px; font-weight: 700;
+      padding: 7px 16px; border-radius: 20px; white-space: nowrap;
+    }}
+    .invite-btn-disabled {{ background: #4a4e54; color: {color_sub}; }}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    {flash_html}
+    <h1>📋 サーバー掲示板</h1>
+    <p class="caption">導入中のサーバー一覧です（メンバー数が多い順）。サーバー内で <code>/bump</code> を実行すると最新の状態に更新されます。</p>
+    {rows_html}
+  </div>
+</body>
+</html>"""
+
+
+async def _board_list_handler(request):
+    """サーバー掲示板の一覧ページ（GET /board）。誰でも閲覧可能です。"""
+    board_data = load_server_board_data()
+    ranking = _collect_board_ranking(board_data)
+    flash_message = request.rel_url.query.get("msg") or None
+    flash_is_error = request.rel_url.query.get("err") == "1"
+    return aiohttp.web.Response(
+        text=_board_list_html(ranking, flash_message, flash_is_error),
+        content_type="text/html"
+    )
+
+
+def _board_manage_html(guild: discord.Guild, entry: dict, token: str, flash_message: str = None, flash_is_error: bool = False) -> str:
+    """サーバー掲示板の登録・編集ページのHTMLを生成します（管理者専用）。"""
+    color_bg, color_card, color_main = "#23272A", "#2C2F33", "#5865F2"
+    color_text, color_sub = "#FFFFFF", "#B9BBBE"
+    color_green, color_danger = "#3BA55D", "#ED4245"
+
+    def esc(value) -> str:
+        return html.escape(str(value), quote=True)
+
+    if flash_message:
+        flash_cls = "flash-error" if flash_is_error else "flash-ok"
+        flash_html = f'<div class="flash {flash_cls}">{esc(flash_message)}</div>'
+    else:
+        flash_html = ""
+
+    description = entry.get("description", "")
+    tags_str = ", ".join(entry.get("tags", []))
+    invite_url = entry.get("invite_url", "")
+
+    guild_icon_html = (
+        f'<img src="{esc(guild.icon.url)}" class="guild-icon" alt="">' if guild.icon else
+        '<div class="guild-icon guild-icon-fallback"></div>'
+    )
+
+    return f"""<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="robots" content="noindex, nofollow">
+  <title>{esc(guild.name)} - サーバー掲示板 管理</title>
+  <style>
+    * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+    body {{
+      background: {color_bg}; color: {color_text};
+      font-family: "Helvetica Neue", Arial, "Hiragino Kaku Gothic ProN", "Meiryo", sans-serif;
+      padding: 32px 20px 64px;
+    }}
+    .wrap {{ max-width: 560px; margin: 0 auto; }}
+    .header {{ display: flex; align-items: center; gap: 14px; margin-bottom: 6px; }}
+    .guild-icon {{ width: 48px; height: 48px; border-radius: 50%; object-fit: cover; }}
+    .guild-icon-fallback {{ background: #4a4e54; }}
+    h1 {{ font-size: 20px; font-weight: 700; }}
+    .caption {{ font-size: 13px; color: {color_sub}; margin: 6px 0 24px; }}
+    .flash {{ border-radius: 8px; padding: 10px 14px; font-size: 13px; font-weight: 700; margin-bottom: 20px; }}
+    .flash-ok {{ background: rgba(59, 165, 93, 0.15); border: 1px solid {color_green}; color: #8fe3ac; }}
+    .flash-error {{ background: rgba(237, 66, 69, 0.15); border: 1px solid {color_danger}; color: #ff9a9c; }}
+    .card {{ background: {color_card}; border-radius: 12px; padding: 24px; box-shadow: 0 4px 16px rgba(0,0,0,0.3); }}
+    label {{ display: block; font-size: 12px; font-weight: 700; color: {color_sub}; margin-bottom: 6px; margin-top: 18px; }}
+    label:first-of-type {{ margin-top: 0; }}
+    textarea, input[type="text"], input[type="url"] {{
+      width: 100%; background: #1E2124; color: {color_text}; border: 1px solid #34383e; border-radius: 8px;
+      padding: 10px 12px; font-size: 13px; font-family: inherit; resize: vertical;
+    }}
+    textarea:focus, input:focus {{ outline: none; border-color: {color_main}; }}
+    .hint {{ font-size: 11px; color: {color_sub}; margin-top: 4px; }}
+    button {{
+      margin-top: 24px; width: 100%; background: {color_main}; color: #fff; border: none; border-radius: 8px;
+      padding: 12px; font-size: 14px; font-weight: 700; cursor: pointer;
+    }}
+    button:hover {{ opacity: 0.9; }}
+    .warn-banner {{
+      background: rgba(237, 66, 69, 0.12); border: 1px solid {color_danger}; color: #ff9a9c;
+      border-radius: 8px; padding: 10px 14px; font-size: 12px; margin-bottom: 24px;
+    }}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    {flash_html}
+    <div class="header">
+      {guild_icon_html}
+      <div>
+        <h1>{esc(guild.name)} 掲示板管理</h1>
+      </div>
+    </div>
+    <p class="caption">このリンクはあなた専用です（発行から30分間有効）。第三者に共有しないでください。</p>
+    <div class="warn-banner">保存すると、サーバー掲示板の一覧ページに反映されます。</div>
+
+    <div class="card">
+      <form method="POST" action="/board/manage/save">
+        <input type="hidden" name="token" value="{esc(token)}">
+
+        <label for="description">サーバー説明文</label>
+        <textarea id="description" name="description" rows="4" maxlength="400" placeholder="サーバーの紹介文を入力してください（400文字まで）">{esc(description)}</textarea>
+
+        <label for="tags">タグ（カンマ区切り、最大5個）</label>
+        <input type="text" id="tags" name="tags" value="{esc(tags_str)}" placeholder="例: ゲーム, 雑談, VC">
+
+        <label for="invite_url">招待リンク（Discordの招待URL）</label>
+        <input type="url" id="invite_url" name="invite_url" value="{esc(invite_url)}" placeholder="https://discord.gg/xxxxxxx">
+        <p class="hint">招待リンクの有効期限にご注意ください。無効になった場合は再度この画面から更新してください。</p>
+
+        <button type="submit">保存する</button>
+      </form>
+    </div>
+  </div>
+</body>
+</html>"""
+
+
+def _board_manage_redirect_with_token(token: str, message: str, is_error: bool = False):
+    """掲示板管理ページの保存後、結果メッセージ付きで同じページへリダイレクトします（PRGパターン）。"""
+    query = urllib.parse.urlencode({"token": token, "msg": message, "err": "1" if is_error else "0"})
+    return aiohttp.web.HTTPSeeOther(location=f"/board/manage?{query}")
+
+
+def _resolve_board_manage_access(guild_id: int, user_id: int):
+    """
+    トークンに含まれる guild_id / user_id について、現在もそのサーバーに在籍し、
+    かつ管理者権限（Administrator）を持っているかを再検証します。
+    戻り値は (guild, error_message) のタプルで、問題なければ error_message は None です。
+    """
+    guild = bot.get_guild(guild_id)
+    if guild is None:
+        return None, "Botがこのサーバーから退出しているため、管理ページを表示できません。"
+    member = guild.get_member(user_id)
+    if member is None:
+        return None, "あなたはこのサーバーのメンバーではないため、管理ページにアクセスできません。"
+    if not member.guild_permissions.administrator:
+        return None, "あなたはこのサーバーの管理者ではないため、管理ページにアクセスできません。"
+    return guild, None
+
+
+async def _board_manage_handler(request):
+    """サーバー掲示板の登録・編集ページ（GET /board/manage?token=...）。"""
+    token = request.rel_url.query.get("token", "")
+    result = _verify_board_manage_token(token)
+    if result is None:
+        return aiohttp.web.Response(
+            text="このリンクは無効か、有効期限（発行から30分）が切れています。Discordで `/board_manage` を再実行してください。",
+            status=403,
+            content_type="text/plain"
+        )
+    guild_id, user_id = result
+
+    guild, error_message = _resolve_board_manage_access(guild_id, user_id)
+    if guild is None:
+        return aiohttp.web.Response(text=error_message, status=403, content_type="text/plain")
+
+    board_data = load_server_board_data()
+    entry = ensure_board_entry(board_data, str(guild_id))
+    save_server_board_data(board_data)
+
+    flash_message = request.rel_url.query.get("msg") or None
+    flash_is_error = request.rel_url.query.get("err") == "1"
+
+    return aiohttp.web.Response(
+        text=_board_manage_html(guild, entry, token, flash_message, flash_is_error),
+        content_type="text/html"
+    )
+
+
+async def _board_manage_save_handler(request):
+    """サーバー掲示板の登録・編集フォームの保存を処理します（POST /board/manage/save）。"""
+    data = await request.post()
+    token = data.get("token", "")
+
+    result = _verify_board_manage_token(token)
+    if result is None:
+        return aiohttp.web.Response(
+            text="このリンクは無効か、有効期限が切れています。Discordで `/board_manage` を再実行してください。",
+            status=403,
+            content_type="text/plain"
+        )
+    guild_id, user_id = result
+
+    guild, error_message = _resolve_board_manage_access(guild_id, user_id)
+    if guild is None:
+        return aiohttp.web.Response(text=error_message, status=403, content_type="text/plain")
+
+    description = str(data.get("description", "")).strip()[:400]
+    tags_raw = str(data.get("tags", ""))
+    tags = [t.strip() for t in tags_raw.split(",") if t.strip()][:5]
+    invite_url = str(data.get("invite_url", "")).strip()
+
+    if invite_url and not (invite_url.startswith("https://discord.gg/") or invite_url.startswith("https://discord.com/invite/")):
+        return _board_manage_redirect_with_token(
+            token, "招待リンクは https://discord.gg/ または https://discord.com/invite/ から始まるURLを入力してください。", is_error=True
+        )
+
+    board_data = load_server_board_data()
+    entry = ensure_board_entry(board_data, str(guild_id))
+    entry["description"] = description
+    entry["tags"] = tags
+    entry["invite_url"] = invite_url
+    save_server_board_data(board_data)
+
+    return _board_manage_redirect_with_token(token, "掲示板情報を保存しました。")
 
 
 # ====================================================================
