@@ -1211,11 +1211,23 @@ class VerifyButtonView(discord.ui.View):
             await interaction.response.send_message(f"エラーが発生しました: {e}", ephemeral=True)
 
 
+def _main_oauth_redirect_uri() -> str:
+    """
+    認証パネル（/verify）用のOAuth2リダイレクトURIを、常に「.../callback」に固定して返します。
+    OAUTH_REDIRECT_URI 環境変数のパス部分が誤って別の値（例: 掲示板ログイン用の
+    /board/oauth_callback）に設定されていても、ホスト名だけを使って正しいURIを組み立てるため、
+    設定ミスの影響を受けません（/board/oauth_callback 側は _board_oauth_redirect_uri() で別管理）。
+    """
+    parsed = urllib.parse.urlparse(OAUTH_REDIRECT_URI)
+    base = f"{parsed.scheme}://{parsed.netloc}"
+    return f"{base}/callback"
+
+
 def _build_discord_oauth_url(state: str) -> str:
     """指定された state トークンを用いて Discord OAuth2 認証URLを生成します。"""
     params = urllib.parse.urlencode({
         "client_id": DISCORD_CLIENT_ID,
-        "redirect_uri": OAUTH_REDIRECT_URI,
+        "redirect_uri": _main_oauth_redirect_uri(),
         "response_type": "code",
         "scope": "guilds",
         "state": state,
@@ -10025,7 +10037,7 @@ async def _oauth2_callback_handler(request):
                 "client_secret": DISCORD_CLIENT_SECRET,
                 "grant_type": "authorization_code",
                 "code": code,
-                "redirect_uri": OAUTH_REDIRECT_URI,
+                "redirect_uri": _main_oauth_redirect_uri(),
             },
             headers={"Content-Type": "application/x-www-form-urlencoded"}
         )
