@@ -215,6 +215,11 @@ def get_guild_config(all_data: dict, guild_id_str: str) -> dict:
         ("alt_check_action", "notify"),
         ("iplogger_check_enabled", False),
         ("giveaways", {}),
+        # --- Embedビルダー：Modal付きパネル（送信済み分の永続化用） ---
+        ("embed_response_panels", {}),  # {panel_id_str: {"button_label": str, "modal_title": str,
+                                         #   "title_label": str, "body_label": str,
+                                         #   "response_channel_id": int}}
+        ("embed_response_panel_next_id", 1),
         # --- 経済システム（メッセージ報酬・ロールショップ・自販機） ---
         ("economy_enabled", False),
         ("economy_currency_name", "コイン"),
@@ -3321,6 +3326,23 @@ async def on_ready():
                 bot.add_view(view)
             except Exception as e:
                 print(f"[警告] 面接質問ボタンの再登録に失敗しました（guild={guild_id_str}, record={record_id_str}）: {e}")
+
+    # Embedビルダーの回答フォーム（Modal）付きパネルの永続化View再登録
+    # custom_idにguild_id/panel_idを埋め込んでいるため、message_id指定なしの汎用登録でよい。
+    for guild_id_str, config in all_data.items():
+        if guild_id_str in ("user_apps", "global_config"):
+            continue
+        if not isinstance(config, dict):
+            continue
+        panels = config.get("embed_response_panels", {})
+        for panel_id_str, panel in panels.items():
+            if not isinstance(panel, dict):
+                continue
+            try:
+                view = EmbedResponsePanelView(int(guild_id_str), int(panel_id_str), panel.get("button_label", "回答する"))
+                bot.add_view(view)
+            except Exception as e:
+                print(f"[警告] Embed回答パネルの再登録に失敗しました（guild={guild_id_str}, panel={panel_id_str}）: {e}")
 
     # 設置型サーバーブラックリスト認証パネルの永続化View再登録
     for guild_id_str, config in all_data.items():
@@ -7814,7 +7836,7 @@ async def iplogger_check(interaction: discord.Interaction, 状態: discord.app_c
 
 
 # --------------------------------------------------------------------
-# /embed_builder — GUIでEmbedを作成して送信
+# /embed_builder — GUIでEmbedを作成して送信（任意でModal付き回答パネルにできる）
 # --------------------------------------------------------------------
 
 class EmbedBuilderModal(discord.ui.Modal, title="Embed内容を入力"):
@@ -7888,6 +7910,157 @@ class EmbedColorSelect(discord.ui.Select):
         await interaction.response.edit_message(embed=self.parent_view.build_preview(), view=self.parent_view)
 
 
+class EmbedModalConfigModal(discord.ui.Modal, title="回答フォーム（Modal）の設定"):
+    """Embedに添える「回答する」ボタン＆回答用Modalの文言を設定するモーダル。"""
+    button_label = discord.ui.TextInput(
+        label="ボタンのラベル",
+        placeholder="例: 回答する",
+        default="回答する",
+        max_length=80,
+        required=True
+    )
+    modal_title = discord.ui.TextInput(
+        label="Modalのタイトル",
+        placeholder="例: 回答フォーム",
+        default="回答フォーム",
+        max_length=45,
+        required=True
+    )
+    title_field_label = discord.ui.TextInput(
+        label="入力欄1のラベル（タイトル）",
+        placeholder="例: お名前",
+        default="タイトル",
+        max_length=45,
+        required=True
+    )
+    body_field_label = discord.ui.TextInput(
+        label="入力欄2のラベル（本文）",
+        placeholder="例: お問い合わせ内容",
+        default="本文",
+        max_length=45,
+        required=True
+    )
+
+    def __init__(self, parent_view: "EmbedBuilderView"):
+        super().__init__()
+        self.parent_view = parent_view
+
+    async def on_submit(self, interaction: discord.Interaction):
+        pv = self.parent_view
+        pv.modal_config["button_label"] = self.button_label.value or "回答する"
+        pv.modal_config["modal_title"] = self.modal_title.value or "回答フォーム"
+        pv.modal_config["title_field_label"] = self.title_field_label.value or "タイトル"
+        pv.modal_config["body_field_label"] = self.body_field_label.value or "本文"
+        await interaction.response.edit_message(embed=pv.build_preview(), view=pv)
+
+
+class EmbedResponseSubmitModal(discord.ui.Modal):
+    """ユーザーが「回答する」ボタンを押した際に開く、固定2項目（タイトル・本文）の回答フォーム。"""
+
+    def __init__(self, guild_id: int, panel_id: int, modal_title: str, title_label: str, body_label: str):
+        super().__init__(title=modal_title[:45] or "回答フォーム")
+        self.guild_id = guild_id
+        self.panel_id = panel_id
+        self.title_input = discord.ui.TextInput(
+            label=title_label[:45] or "タイトル",
+            max_length=256,
+            required=True
+        )
+        self.body_input = discord.ui.TextInput(
+            label=body_label[:45] or "本文",
+            style=discord.TextStyle.paragraph,
+            max_length=4000,
+            required=True
+        )
+        self.add_item(self.title_input)
+        self.add_item(self.body_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await _handle_embed_response_submit(
+            interaction, self.guild_id, self.panel_id,
+            self.title_input.value, self.body_input.value
+        )
+
+
+class EmbedResponseButton(discord.ui.Button):
+    """送信済みEmbedに添える「回答する」ボタン。custom_idにguild_id/panel_idを埋め込み、
+    Bot再起動後も汎用登録（message_id指定なし）で反応できるようにする。"""
+
+    def __init__(self, guild_id: int, panel_id: int, label: str):
+        super().__init__(
+            label=label[:80] if label else "回答する",
+            style=discord.ButtonStyle.primary,
+            custom_id=f"embedpanel_answer_{guild_id}_{panel_id}"
+        )
+        self.guild_id = guild_id
+        self.panel_id = panel_id
+
+    async def callback(self, interaction: discord.Interaction):
+        all_data = load_data()
+        cfg = get_guild_config(all_data, str(self.guild_id))
+        panels = cfg.get("embed_response_panels", {})
+        panel = panels.get(str(self.panel_id))
+        if panel is None:
+            await interaction.response.send_message("このパネルの設定が見つかりませんでした。管理者にお問い合わせください。", ephemeral=True)
+            return
+        modal = EmbedResponseSubmitModal(
+            self.guild_id, self.panel_id,
+            panel.get("modal_title", "回答フォーム"),
+            panel.get("title_field_label", "タイトル"),
+            panel.get("body_field_label", "本文"),
+        )
+        await interaction.response.send_modal(modal)
+
+
+class EmbedResponsePanelView(discord.ui.View):
+    """Modal付きEmbedに添えるView（「回答する」ボタンのみ）。timeout=Noneで永続化。"""
+
+    def __init__(self, guild_id: int, panel_id: int, label: str):
+        super().__init__(timeout=None)
+        self.add_item(EmbedResponseButton(guild_id, panel_id, label))
+
+
+async def _handle_embed_response_submit(interaction: discord.Interaction, guild_id: int, panel_id: int, title_value: str, body_value: str):
+    """回答Modal送信時の処理。回答送信先チャンネルへEmbed形式で内容を送信する。"""
+    guild = bot.get_guild(guild_id)
+    if guild is None:
+        await interaction.response.send_message("サーバー情報を取得できませんでした。", ephemeral=True)
+        return
+
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(guild_id))
+    panels = cfg.get("embed_response_panels", {})
+    panel = panels.get(str(panel_id))
+    if panel is None:
+        await interaction.response.send_message("このパネルの設定が見つかりませんでした。管理者にお問い合わせください。", ephemeral=True)
+        return
+
+    response_channel_id = panel.get("response_channel_id")
+    response_channel = guild.get_channel(response_channel_id) if response_channel_id else None
+    if response_channel is None:
+        await interaction.response.send_message("回答送信先チャンネルが見つかりませんでした。管理者にお問い合わせください。", ephemeral=True)
+        return
+
+    result_embed = discord.Embed(
+        title=title_value[:256],
+        description=body_value[:4000],
+        color=discord.Color.blurple(),
+        timestamp=discord.utils.utcnow()
+    )
+    result_embed.set_footer(text=f"回答者: {interaction.user}（ID: {interaction.user.id}）")
+
+    try:
+        await response_channel.send(embed=result_embed)
+    except discord.Forbidden:
+        await interaction.response.send_message("回答送信先チャンネルへの送信権限がBotにありません。管理者にお問い合わせください。", ephemeral=True)
+        return
+    except discord.HTTPException as e:
+        await interaction.response.send_message(f"送信エラー: {e}", ephemeral=True)
+        return
+
+    await interaction.response.send_message("[OK] 回答を送信しました。ご協力ありがとうございました。", ephemeral=True)
+
+
 class EmbedBuilderView(discord.ui.View):
     """Embed作成GUIビュー。"""
 
@@ -7903,6 +8076,15 @@ class EmbedBuilderView(discord.ui.View):
             "image_url": None,
             "thumbnail_url": None,
             "fields": [],   # [{"name": str, "value": str, "inline": bool}]
+        }
+        # Modal（回答フォーム）を付けるかどうかの設定。response_channel が None のままなら付けない。
+        self.modal_config: dict = {
+            "enabled": False,
+            "response_channel_id": None,
+            "button_label": "回答する",
+            "modal_title": "回答フォーム",
+            "title_field_label": "タイトル",
+            "body_field_label": "本文",
         }
         self.add_item(EmbedColorSelect(self))
 
@@ -7922,6 +8104,19 @@ class EmbedBuilderView(discord.ui.View):
         if self.embed_data.get("thumbnail_url"):
             embed.set_thumbnail(url=self.embed_data["thumbnail_url"])
         embed.timestamp = discord.utils.utcnow()
+
+        if self.modal_config.get("enabled") and self.modal_config.get("response_channel_id"):
+            mc = self.modal_config
+            embed.add_field(
+                name="[Modal設定]",
+                value=(
+                    f"ボタン: 「{mc['button_label']}」\n"
+                    f"Modalタイトル: {mc['modal_title']}\n"
+                    f"入力欄: 「{mc['title_field_label']}」「{mc['body_field_label']}」\n"
+                    f"回答送信先: <#{mc['response_channel_id']}>"
+                ),
+                inline=False
+            )
         return embed
 
     @discord.ui.button(label="[NOTE] 内容を編集", style=discord.ButtonStyle.primary, row=0)
@@ -7966,14 +8161,80 @@ class EmbedBuilderView(discord.ui.View):
         await interaction.response.edit_message(embed=self.build_preview(), view=self)
         await interaction.followup.send(f"フィールド「{removed['name']}」を削除しました。", ephemeral=True)
 
-    @discord.ui.button(label="[OK] このチャンネルに送信", style=discord.ButtonStyle.success, row=2)
+    @discord.ui.button(label="[Modal] 回答フォームを設定", style=discord.ButtonStyle.secondary, row=0)
+    async def configure_modal(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.author.id:
+            await interaction.response.send_message("このパネルはあなた専用です。", ephemeral=True)
+            return
+        modal = EmbedModalConfigModal(self)
+        modal.button_label.default = self.modal_config.get("button_label", "回答する")
+        modal.modal_title.default = self.modal_config.get("modal_title", "回答フォーム")
+        modal.title_field_label.default = self.modal_config.get("title_field_label", "タイトル")
+        modal.body_field_label.default = self.modal_config.get("body_field_label", "本文")
+        self.modal_config["enabled"] = True
+        await interaction.response.send_modal(modal)
+
+    @discord.ui.select(
+        placeholder="回答送信先チャンネル（Modalを付ける場合に選択）",
+        cls=discord.ui.ChannelSelect,
+        channel_types=[discord.ChannelType.text],
+        row=2,
+        min_values=0,
+        max_values=1
+    )
+    async def select_response_channel(self, interaction: discord.Interaction, select: discord.ui.ChannelSelect):
+        if interaction.user.id != self.author.id:
+            await interaction.response.send_message("このパネルはあなた専用です。", ephemeral=True)
+            return
+        if select.values:
+            self.modal_config["response_channel_id"] = select.values[0].id
+            self.modal_config["enabled"] = True
+        else:
+            self.modal_config["response_channel_id"] = None
+            self.modal_config["enabled"] = False
+        await interaction.response.edit_message(embed=self.build_preview(), view=self)
+
+    @discord.ui.button(label="[Modal] 回答フォームを解除", style=discord.ButtonStyle.secondary, row=3)
+    async def disable_modal(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.author.id:
+            await interaction.response.send_message("このパネルはあなた専用です。", ephemeral=True)
+            return
+        self.modal_config["enabled"] = False
+        self.modal_config["response_channel_id"] = None
+        await interaction.response.edit_message(embed=self.build_preview(), view=self)
+
+    @discord.ui.button(label="[OK] このチャンネルに送信", style=discord.ButtonStyle.success, row=4)
     async def send_embed(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id != self.author.id:
             await interaction.response.send_message("このパネルはあなた専用です。", ephemeral=True)
             return
+
+        modal_enabled = self.modal_config.get("enabled") and self.modal_config.get("response_channel_id")
+
+        panel_id = None
+        response_view = None
+        if modal_enabled:
+            all_data = load_data()
+            cfg = get_guild_config(all_data, str(interaction.guild.id))
+            panel_id = cfg.get("embed_response_panel_next_id", 1)
+            cfg["embed_response_panel_next_id"] = panel_id + 1
+            panels = cfg.setdefault("embed_response_panels", {})
+            panels[str(panel_id)] = {
+                "button_label": self.modal_config["button_label"],
+                "modal_title": self.modal_config["modal_title"],
+                "title_field_label": self.modal_config["title_field_label"],
+                "body_field_label": self.modal_config["body_field_label"],
+                "response_channel_id": self.modal_config["response_channel_id"],
+            }
+            save_data(all_data)
+            response_view = EmbedResponsePanelView(interaction.guild.id, panel_id, self.modal_config["button_label"])
+
         embed = self.build_preview()
         try:
-            await self.target_channel.send(embed=embed)
+            if response_view is not None:
+                await self.target_channel.send(embed=embed, view=response_view)
+            else:
+                await self.target_channel.send(embed=embed)
         except discord.Forbidden:
             await interaction.response.send_message("送信権限がありません。", ephemeral=True)
             return
@@ -7988,7 +8249,7 @@ class EmbedBuilderView(discord.ui.View):
             view=self
         )
 
-    @discord.ui.button(label="[NG] キャンセル", style=discord.ButtonStyle.danger, row=2)
+    @discord.ui.button(label="[NG] キャンセル", style=discord.ButtonStyle.danger, row=4)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id != self.author.id:
             await interaction.response.send_message("このパネルはあなた専用です。", ephemeral=True)
@@ -8048,11 +8309,14 @@ async def embed_builder(
     view = EmbedBuilderView(author=interaction.user, target_channel=target_ch)
     await interaction.response.send_message(
         f"Embedビルダーを起動しました。送信先: {target_ch.mention}\n"
-        "「[NOTE] 内容を編集」でタイトル・本文・画像URLを入力し、色を選んで「[OK] 送信」を押してください。",
+        "「[NOTE] 内容を編集」でタイトル・本文・画像URLを入力し、色を選んで「[OK] 送信」を押してください。\n"
+        "回答フォーム（Modal）を付ける場合は、下のチャンネル選択で回答送信先を選び、"
+        "「[Modal] 回答フォームを設定」でボタン文言・入力欄ラベルを設定してください（未設定時は付きません）。",
         embed=view.build_preview(),
         view=view,
         ephemeral=True
     )
+
 
 
 # ====================================================================
