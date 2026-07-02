@@ -3303,6 +3303,25 @@ async def on_ready():
             except Exception as e:
                 print(f"[警告] 面接結果パネルの再登録に失敗しました（guild={guild_id_str}, record={record_id_str}）: {e}")
 
+    # 面接の質問回答ボタン（進行中セッション）の永続化View再登録
+    # custom_idにguild_id/record_id/question_indexを埋め込んでいるため、message_id指定なしで
+    # 汎用登録（bot.add_view(view)）すればcustom_id一致で全メッセージに反応する。
+    for guild_id_str, config in all_data.items():
+        if guild_id_str in ("user_apps", "global_config"):
+            continue
+        if not isinstance(config, dict):
+            continue
+        records = config.get("interview_records", {})
+        for record_id_str, record in records.items():
+            if not isinstance(record, dict) or record.get("status") != "in_progress":
+                continue
+            question_index = record.get("current_question_index", 0)
+            try:
+                view = InterviewQuestionView(int(guild_id_str), int(record_id_str), question_index)
+                bot.add_view(view)
+            except Exception as e:
+                print(f"[警告] 面接質問ボタンの再登録に失敗しました（guild={guild_id_str}, record={record_id_str}）: {e}")
+
     # 設置型サーバーブラックリスト認証パネルの永続化View再登録
     for guild_id_str, config in all_data.items():
         if guild_id_str in ("user_apps", "global_config"):
@@ -12927,8 +12946,7 @@ async def _handle_interview_decision(interaction: discord.Interaction, action: s
     有効化="面接機能を有効にするか",
     結果通知先チャンネル="応募内容をEmbedで送る運営用チャンネル",
     実施方式="DMで実施するか、専用チャンネルを作成して実施するか",
-    専用チャンネル作成先カテゴリ="実施方式が「専用チャンネル」の場合のみ使用するカテゴリ（任意）",
-    回答制限時間_秒="1問あたりの回答制限時間（秒）。0を指定すると無制限になります。未指定の場合600秒"
+    専用チャンネル作成先カテゴリ="実施方式が「専用チャンネル」の場合のみ使用するカテゴリ（任意）"
 )
 @discord.app_commands.choices(実施方式=[
     discord.app_commands.Choice(name="DM", value="dm"),
@@ -12939,15 +12957,11 @@ async def interview_setup(
     有効化: bool,
     結果通知先チャンネル: discord.TextChannel,
     実施方式: discord.app_commands.Choice[str],
-    専用チャンネル作成先カテゴリ: discord.CategoryChannel = None,
-    回答制限時間_秒: int = 600
+    専用チャンネル作成先カテゴリ: discord.CategoryChannel = None
 ):
     if not await is_admin_or_allowed(interaction):
         return
     if not interaction.guild:
-        return
-    if 回答制限時間_秒 != 0 and 回答制限時間_秒 < 30:
-        await interaction.response.send_message("回答制限時間は30秒以上、または無制限にする場合は0を指定してください。", ephemeral=True)
         return
 
     all_data = load_data()
@@ -12956,14 +12970,13 @@ async def interview_setup(
     cfg["interview_result_channel_id"] = 結果通知先チャンネル.id
     cfg["interview_mode"] = 実施方式.value
     cfg["interview_category_id"] = 専用チャンネル作成先カテゴリ.id if 専用チャンネル作成先カテゴリ else None
-    cfg["interview_timeout_seconds"] = 回答制限時間_秒
     save_data(all_data)
 
-    timeout_text = "無制限" if 回答制限時間_秒 == 0 else f"{回答制限時間_秒}秒"
     await interaction.response.send_message(
         f"[OK] 面接システムを設定しました。\n"
         f"有効: {'はい' if 有効化 else 'いいえ'} / 方式: {実施方式.name} / "
-        f"結果通知先: {結果通知先チャンネル.mention} / 制限時間: {timeout_text}\n"
+        f"結果通知先: {結果通知先チャンネル.mention}\n"
+        f"質問への回答は埋め込みフォーム（Modal）形式です。\n"
         f"質問がまだの場合は `/interview question add` で登録してください。",
         ephemeral=True
     )
@@ -13111,8 +13124,211 @@ async def interview_panel(interaction: discord.Interaction, タイトル: str = 
     await interaction.response.send_message("[OK] 面接パネルを設置しました。", ephemeral=True)
 
 
+class InterviewAnswerModal(discord.ui.Modal):
+    """1問分の回答を入力するModal（埋め込みフォーム）。
+    送信すると回答を記録し、次の質問があれば続けて質問embed+ボタンを表示、
+    無ければ集計処理へ進む。"""
+
+    def __init__(self, guild_id: int, record_id: int, question_index: int, question_text: str):
+        super().__init__(title=f"質問 {question_index + 1}"[:45])
+        self.guild_id = guild_id
+        self.record_id = record_id
+        self.question_index = question_index
+        self.question_text = question_text
+        self.answer_input = discord.ui.TextInput(
+            label=question_text[:45] if question_text else f"質問{question_index + 1}",
+            style=discord.TextStyle.paragraph,
+            required=True,
+            max_length=1000,
+            placeholder="ここに回答を入力してください"
+        )
+        self.add_item(self.answer_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await _handle_interview_answer_submit(
+            interaction, self.guild_id, self.record_id, self.question_index,
+            self.question_text, self.answer_input.value
+        )
+
+
+class InterviewAnswerButton(discord.ui.Button):
+    """質問embedに添える「回答する」ボタン。押すとModalが開く。
+    custom_idにguild_id/record_id/question_indexを埋め込むため、Bot再起動後も対象を特定できる。"""
+
+    def __init__(self, guild_id: int, record_id: int, question_index: int):
+        super().__init__(
+            label="回答する",
+            style=discord.ButtonStyle.primary,
+            custom_id=f"interview_answer_{guild_id}_{record_id}_{question_index}"
+        )
+        self.guild_id = guild_id
+        self.record_id = record_id
+        self.question_index = question_index
+
+    async def callback(self, interaction: discord.Interaction):
+        all_data = load_data()
+        cfg = get_guild_config(all_data, str(self.guild_id))
+        records = cfg.setdefault("interview_records", {})
+        record = records.get(str(self.record_id))
+        if record is None or record.get("status") != "in_progress":
+            await interaction.response.send_message("この面接は既に終了・中断されています。", ephemeral=True)
+            return
+        if interaction.user.id != record.get("applicant_id"):
+            await interaction.response.send_message("この面接はあなた宛てではありません。", ephemeral=True)
+            return
+        if record.get("current_question_index", 0) != self.question_index:
+            await interaction.response.send_message("この質問は既に回答済みです。", ephemeral=True)
+            return
+
+        questions = cfg.get("interview_questions", [])
+        if self.question_index >= len(questions):
+            await interaction.response.send_message("質問データが見つかりませんでした。", ephemeral=True)
+            return
+
+        question_text = questions[self.question_index]
+        modal = InterviewAnswerModal(self.guild_id, self.record_id, self.question_index, question_text)
+        await interaction.response.send_modal(modal)
+
+
+class InterviewQuestionView(discord.ui.View):
+    """1問分の質問embedに添えるView（「回答する」ボタンのみ）。timeout=Noneで永続化。"""
+
+    def __init__(self, guild_id: int, record_id: int, question_index: int):
+        super().__init__(timeout=None)
+        self.add_item(InterviewAnswerButton(guild_id, record_id, question_index))
+
+
+def _build_interview_question_embed(question_index: int, total: int, question_text: str) -> discord.Embed:
+    embed = discord.Embed(
+        title=f"[面接] 質問 {question_index + 1}/{total}",
+        description=question_text,
+        color=discord.Color.blurple()
+    )
+    embed.set_footer(text="下の「回答する」ボタンを押すと入力フォームが開きます。")
+    return embed
+
+
+async def _send_interview_question(target, guild_id: int, record_id: int, question_index: int, question_text: str, total: int):
+    """指定の質問embed+回答ボタンを送信する共通処理。"""
+    embed = _build_interview_question_embed(question_index, total, question_text)
+    view = InterviewQuestionView(guild_id, record_id, question_index)
+    await target.send(embed=embed, view=view)
+
+
+async def _handle_interview_answer_submit(
+    interaction: discord.Interaction, guild_id: int, record_id: int,
+    question_index: int, question_text: str, answer_text: str
+):
+    """Modal送信時のコールバック本体。回答を記録し、次の質問へ進むか結果送信を行う。"""
+    guild = bot.get_guild(guild_id)
+    if guild is None:
+        await interaction.response.send_message("サーバー情報を取得できませんでした。", ephemeral=True)
+        return
+
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(guild_id))
+    records = cfg.setdefault("interview_records", {})
+    record = records.get(str(record_id))
+    if record is None or record.get("status") != "in_progress":
+        await interaction.response.send_message("この面接は既に終了・中断されています。", ephemeral=True)
+        return
+    if record.get("current_question_index", 0) != question_index:
+        await interaction.response.send_message("この質問は既に回答済みです。", ephemeral=True)
+        return
+
+    answers = record.setdefault("answers", [])
+    answers.append({"question": question_text, "answer": answer_text or "(空の回答)"})
+
+    questions = cfg.get("interview_questions", [])
+    next_index = question_index + 1
+
+    if next_index < len(questions):
+        # 次の質問へ進む
+        record["current_question_index"] = next_index
+        save_data(all_data)
+
+        await interaction.response.send_message("[OK] 回答を受け付けました。次の質問を表示します。", ephemeral=True)
+
+        next_question_text = questions[next_index]
+        target = interaction.channel if record.get("interview_channel_id") else interaction.user
+        try:
+            await _send_interview_question(target, guild_id, record_id, next_index, next_question_text, len(questions))
+        except discord.HTTPException:
+            pass
+        return
+
+    # 全問終了：集計して結果チャンネルへ送信
+    record["status"] = "pending_review"
+    save_data(all_data)
+
+    await interaction.response.send_message(
+        "[OK] 全ての質問への回答が完了しました。ご協力ありがとうございました。結果は追ってお知らせします。", ephemeral=True
+    )
+
+    result_channel_id = cfg.get("interview_result_channel_id")
+    result_channel = guild.get_channel(result_channel_id) if result_channel_id else None
+
+    applicant_id = record.get("applicant_id")
+    applicant = guild.get_member(applicant_id) if applicant_id else None
+    if applicant is None and applicant_id:
+        try:
+            applicant = await bot.fetch_user(applicant_id)
+        except discord.HTTPException:
+            applicant = None
+
+    if result_channel is None:
+        if applicant is not None:
+            try:
+                await applicant.send("[警告] 結果通知先チャンネルが設定されていないため、運営へ送信できませんでした。管理者にご連絡ください。")
+            except discord.HTTPException:
+                pass
+        return
+
+    result_embed = discord.Embed(
+        title=f"[面接] 応募結果 #{record_id:04d}",
+        description=f"応募者: <@{applicant_id}>（{applicant if applicant else applicant_id}）\nユーザーID: `{applicant_id}`",
+        color=discord.Color.gold(),
+        timestamp=discord.utils.utcnow()
+    )
+    for i, qa in enumerate(answers, start=1):
+        q_text = qa["question"][:256]
+        a_text = (qa["answer"] or "(未回答)")[:1024]
+        result_embed.add_field(name=f"Q{i}. {q_text}", value=a_text, inline=False)
+    result_embed.set_footer(text="下のボタンで合否を選択してください。")
+
+    result_view = InterviewResultView(guild.id, record_id)
+    try:
+        result_message = await result_channel.send(embed=result_embed, view=result_view)
+    except discord.Forbidden:
+        if applicant is not None:
+            try:
+                await applicant.send("[警告] 結果を運営チャンネルへ送信できませんでした。管理者にご連絡ください。")
+            except discord.HTTPException:
+                pass
+        return
+
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(guild.id))
+    records = cfg.setdefault("interview_records", {})
+    if str(record_id) in records:
+        records[str(record_id)]["result_message_id"] = result_message.id
+        records[str(record_id)]["result_channel_id"] = result_channel.id
+        save_data(all_data)
+
+    interview_channel_id = record.get("interview_channel_id")
+    if interview_channel_id:
+        interview_channel = guild.get_channel(interview_channel_id)
+        if interview_channel is not None:
+            try:
+                await asyncio.sleep(10)
+                await interview_channel.delete(reason="面接完了のため専用チャンネルを削除")
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+
+
 async def _start_interview(interaction: discord.Interaction):
-    """面接開始処理の本体。/面接 コマンドと、パネルの「面接を受ける」ボタンの両方から呼び出される。"""
+    """面接開始処理の本体。/面接 コマンドと、パネルの「面接を受ける」ボタンの両方から呼び出される。
+    最初の質問をembed+「回答する」ボタン形式で送信し、以降はModal経由で1問ずつ進行する。"""
     guild = interaction.guild
     if guild is None:
         await interaction.response.send_message("このコマンドはサーバー内で実行してください。", ephemeral=True)
@@ -13152,7 +13368,6 @@ async def _start_interview(interaction: discord.Interaction):
             return
 
     mode = cfg.get("interview_mode", "dm")
-    timeout_seconds = cfg.get("interview_timeout_seconds", 600)
 
     interview_channel = None
     target = None
@@ -13203,106 +13418,24 @@ async def _start_interview(interaction: discord.Interaction):
         "status": "in_progress",
         "answers": [],
         "interview_channel_id": interview_channel.id if interview_channel else None,
+        "current_question_index": 0,
     }
     save_data(all_data)
 
-    def check(m: discord.Message) -> bool:
-        if m.author.id != interaction.user.id:
-            return False
-        if interview_channel is not None:
-            return m.channel.id == interview_channel.id
-        return isinstance(m.channel, discord.DMChannel) and m.channel.id == target.id
-
-    answers = []
-    aborted = False
-    for idx, question in enumerate(questions, start=1):
-        try:
-            await target.send(f"**質問{idx}/{len(questions)}**\n{question}")
-        except discord.HTTPException:
-            aborted = True
-            break
-        try:
-            wait_timeout = timeout_seconds if timeout_seconds and timeout_seconds > 0 else None
-            msg = await bot.wait_for("message", check=check, timeout=wait_timeout)
-        except asyncio.TimeoutError:
-            try:
-                await target.send("[TIMEOUT] 制限時間内に回答がなかったため、面接を中断しました。")
-            except discord.HTTPException:
-                pass
-            aborted = True
-            break
-        answers.append({"question": question, "answer": msg.content or "(添付ファイルまたは空メッセージ)"})
-
-    # 中断・タイムアウト時は記録を破棄して終了
-    all_data = load_data()
-    cfg = get_guild_config(all_data, str(guild.id))
-    records = cfg.setdefault("interview_records", {})
-
-    if aborted:
+    try:
+        await _send_interview_question(target, guild.id, record_id, 0, questions[0], len(questions))
+    except discord.HTTPException:
+        # 最初の質問送信に失敗した場合は記録を破棄
+        all_data = load_data()
+        cfg = get_guild_config(all_data, str(guild.id))
+        records = cfg.setdefault("interview_records", {})
         records.pop(str(record_id), None)
         save_data(all_data)
         if interview_channel is not None:
             try:
-                await asyncio.sleep(5)
-                await interview_channel.delete(reason="面接が中断されたため削除")
+                await interview_channel.delete(reason="面接質問の送信に失敗したため削除")
             except (discord.Forbidden, discord.HTTPException):
                 pass
-        return
-
-    record = records.get(str(record_id))
-    if record is None:
-        return
-    record["answers"] = answers
-    record["status"] = "pending_review"
-    save_data(all_data)
-
-    try:
-        await target.send("[OK] 全ての質問への回答が完了しました。ご協力ありがとうございました。結果は追ってお知らせします。")
-    except discord.HTTPException:
-        pass
-
-    result_embed = discord.Embed(
-        title=f"[面接] 応募結果 #{record_id:04d}",
-        description=f"応募者: {interaction.user.mention}（{interaction.user}）\nユーザーID: `{interaction.user.id}`",
-        color=discord.Color.gold(),
-        timestamp=discord.utils.utcnow()
-    )
-    for i, qa in enumerate(answers, start=1):
-        q_text = qa["question"][:256]
-        a_text = (qa["answer"] or "(未回答)")[:1024]
-        result_embed.add_field(name=f"Q{i}. {q_text}", value=a_text, inline=False)
-    result_embed.set_footer(text="下のボタンで合否を選択してください。")
-
-    result_view = InterviewResultView(guild.id, record_id)
-    try:
-        result_message = await result_channel.send(embed=result_embed, view=result_view)
-    except discord.Forbidden:
-        try:
-            await target.send("[警告] 結果を運営チャンネルへ送信できませんでした。管理者にご連絡ください。")
-        except discord.HTTPException:
-            pass
-        if interview_channel is not None:
-            try:
-                await asyncio.sleep(10)
-                await interview_channel.delete(reason="面接完了のため専用チャンネルを削除")
-            except (discord.Forbidden, discord.HTTPException):
-                pass
-        return
-
-    all_data = load_data()
-    cfg = get_guild_config(all_data, str(guild.id))
-    records = cfg.setdefault("interview_records", {})
-    if str(record_id) in records:
-        records[str(record_id)]["result_message_id"] = result_message.id
-        records[str(record_id)]["result_channel_id"] = result_channel.id
-        save_data(all_data)
-
-    if interview_channel is not None:
-        try:
-            await asyncio.sleep(10)
-            await interview_channel.delete(reason="面接完了のため専用チャンネルを削除")
-        except (discord.Forbidden, discord.HTTPException):
-            pass
 
 
 # ====================================================================
