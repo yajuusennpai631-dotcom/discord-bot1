@@ -8088,7 +8088,8 @@ class EmbedBuilderView(discord.ui.View):
         }
         self.add_item(EmbedColorSelect(self))
 
-    def build_preview(self) -> discord.Embed:
+    def _build_base_embed(self) -> discord.Embed:
+        """Embedの本体（タイトル・本文・フィールド・色など）だけを組み立てる共通処理。"""
         color = EMBED_COLOR_OPTIONS.get(self.embed_data.get("color", "ブルー"), discord.Color.blue())
         embed = discord.Embed(
             title=self.embed_data.get("title") or "（タイトル未入力）",
@@ -8104,11 +8105,15 @@ class EmbedBuilderView(discord.ui.View):
         if self.embed_data.get("thumbnail_url"):
             embed.set_thumbnail(url=self.embed_data["thumbnail_url"])
         embed.timestamp = discord.utils.utcnow()
+        return embed
 
+    def build_preview(self) -> discord.Embed:
+        """管理者用の編集画面（ephemeral）に表示するプレビュー。Modal設定情報もここでは表示する。"""
+        embed = self._build_base_embed()
         if self.modal_config.get("enabled") and self.modal_config.get("response_channel_id"):
             mc = self.modal_config
             embed.add_field(
-                name="[Modal設定]",
+                name="[Modal設定：この項目は実際の送信時には含まれません]",
                 value=(
                     f"ボタン: 「{mc['button_label']}」\n"
                     f"Modalタイトル: {mc['modal_title']}\n"
@@ -8118,6 +8123,10 @@ class EmbedBuilderView(discord.ui.View):
                 inline=False
             )
         return embed
+
+    def build_final_embed(self) -> discord.Embed:
+        """実際にチャンネルへ送信するEmbed。Modal設定情報などの管理者向け情報は含めない。"""
+        return self._build_base_embed()
 
     @discord.ui.button(label="[NOTE] 内容を編集", style=discord.ButtonStyle.primary, row=0)
     async def edit_content(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -8229,7 +8238,7 @@ class EmbedBuilderView(discord.ui.View):
             save_data(all_data)
             response_view = EmbedResponsePanelView(interaction.guild.id, panel_id, self.modal_config["button_label"])
 
-        embed = self.build_preview()
+        embed = self.build_final_embed()
         try:
             if response_view is not None:
                 await self.target_channel.send(embed=embed, view=response_view)
