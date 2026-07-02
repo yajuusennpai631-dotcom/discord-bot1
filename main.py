@@ -249,6 +249,14 @@ def get_guild_config(all_data: dict, guild_id_str: str) -> dict:
         # --- 荒らしリスト（ブラックリスト）自動BAN ---
         ("troll_autoban_enabled", True),        # 荒らしリスト登録ユーザーの参加時自動BAN ON/OFF ★デフォルトON
         ("server_blacklist_verify_channel_id", None),   # サーバーBL認証チャンネルID（パネルモード用）
+        # --- チケット（問い合わせ）システム ---
+        ("ticket_panel_channel_id", None),   # 設置済みチケットパネルのチャンネルID
+        ("ticket_panel_message_id", None),   # 設置済みチケットパネルのメッセージID
+        ("ticket_category_id", None),        # チケットチャンネルを作成するカテゴリID
+        ("ticket_staff_role_id", None),      # チケットを閲覧できるスタッフロールID
+        ("ticket_log_channel_id", None),     # クローズ時にログを送るチャンネルID
+        ("ticket_next_id", 1),               # チケット番号発行用カウンタ
+        ("ticket_open_channels", {}),        # {channel_id_str: {"user_id": int, "ticket_id": int, "opened_at": int}}
     ]:
         if key not in cfg:
             cfg[key] = default
@@ -328,6 +336,7 @@ customcmd_manage_group = app_commands.Group(name="customcmd_manage", description
 voice_sound_group = app_commands.Group(name="voice_sound", description="ボイス用音源の管理")
 roleshop_group = app_commands.Group(name="roleshop", description="【管理者専用】ロールショップの管理")
 vendingmachine_group = app_commands.Group(name="vendingmachine", description="【管理者専用】自販機の管理")
+ticket_group = app_commands.Group(name="ticket", description="問い合わせチケットシステムの管理")
 
 bot.tree.add_command(owner_trust_group)
 bot.tree.add_command(customtrigger_group)
@@ -335,6 +344,7 @@ bot.tree.add_command(customcmd_manage_group)
 bot.tree.add_command(voice_sound_group)
 bot.tree.add_command(roleshop_group)
 bot.tree.add_command(vendingmachine_group)
+bot.tree.add_command(ticket_group)
 
 async def extract_text_from_image(image_url):
     try:
@@ -3202,6 +3212,8 @@ async def on_ready():
     bot.add_view(VerifyButtonView())
     bot.add_view(VerifyBlacklistButtonView())  # サーバーブラックリスト認証ボタンの永続化
     bot.add_view(GiveawayJoinView())  # プレゼント参加ボタンの永続化
+    bot.add_view(TicketPanelView())  # チケット作成パネルの永続化（custom_idが固定のため全ギルド共通で1回登録すればよい）
+    bot.add_view(TicketCloseView())  # チケットクローズボタンの永続化
     all_data = load_data()
 
     for guild_id_str, config in all_data.items():
@@ -4414,7 +4426,9 @@ async def help_command(interaction: discord.Interaction):
                 "`/server_mention_setup` / `/server_mention_reset` : 自動返信ロールメンションの設定と解除を行います\n"
                 "`/server_stats` : メンバー数などをチャンネル名に反映する統計機能を設定します\n"
                 "`/server_backup` : サーバーのロール・チャンネル・権限をJSONバックアップします\n"
-                "`/server_restore` : バックアップJSONからサーバー構成を復元します"
+                "`/server_restore` : バックアップJSONからサーバー構成を復元します\n"
+                "`/ticket setup` : このチャンネルに問い合わせチケットパネルを設置します\n"
+                "`/ticket close` : 現在のチケットチャンネルをクローズします"
             ),
             inline=False
         )
@@ -12509,6 +12523,253 @@ async def _board_manage_save_handler(request):
     save_server_board_data(board_data)
 
     return _board_manage_redirect(resolved_access_query, "掲示板情報を保存しました。")
+
+
+# ====================================================================
+# セクション 18: チケット（問い合わせ）システム
+# ・ユーザーがパネルのボタンを押すと、本人とスタッフのみ閲覧できる
+#   専用チャンネルが自動作成される
+# ・スタッフまたは作成者本人がクローズボタン／コマンドでチャンネルを削除できる
+# ====================================================================
+
+class TicketCreateButton(discord.ui.Button):
+    """チケットパネルに設置する「問い合わせを作成」ボタン。"""
+
+    def __init__(self):
+        super().__init__(
+            label="問い合わせを作成",
+            style=discord.ButtonStyle.primary,
+            emoji="🎫",
+            custom_id="ticket_create_button"
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        guild = interaction.guild
+        if guild is None:
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        all_data = load_data()
+        cfg = get_guild_config(all_data, str(guild.id))
+        open_channels = cfg.setdefault("ticket_open_channels", {})
+
+        # 既に本人が対応中のチケットを持っていないか確認（1人1チケットまで）
+        for ch_id_str, info in list(open_channels.items()):
+            if info.get("user_id") == interaction.user.id:
+                existing = guild.get_channel(int(ch_id_str))
+                if existing:
+                    await interaction.followup.send(
+                        f"既に対応中のチケットがあります: {existing.mention}", ephemeral=True
+                    )
+                    return
+                else:
+                    # チャンネルが手動削除されていた場合は古い記録を掃除する
+                    open_channels.pop(ch_id_str, None)
+
+        category_id = cfg.get("ticket_category_id")
+        category = guild.get_channel(category_id) if category_id else None
+        if not isinstance(category, discord.CategoryChannel):
+            category = None
+
+        staff_role_id = cfg.get("ticket_staff_role_id")
+        staff_role = guild.get_role(staff_role_id) if staff_role_id else None
+
+        ticket_id = cfg.get("ticket_next_id", 1)
+        cfg["ticket_next_id"] = ticket_id + 1
+
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True),
+            interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
+        }
+        if staff_role:
+            overwrites[staff_role] = discord.PermissionOverwrite(
+                view_channel=True, send_messages=True, read_message_history=True
+            )
+
+        channel_name = f"ticket-{ticket_id:04d}"
+        try:
+            ticket_channel = await guild.create_text_channel(
+                name=channel_name,
+                category=category,
+                overwrites=overwrites,
+                reason=f"チケット作成: {interaction.user}"
+            )
+        except discord.Forbidden:
+            await interaction.followup.send(
+                "チャンネルを作成する権限がBotにありません。管理者に確認してください。", ephemeral=True
+            )
+            return
+        except discord.HTTPException as e:
+            await interaction.followup.send(f"チャンネル作成に失敗しました: {e}", ephemeral=True)
+            return
+
+        open_channels[str(ticket_channel.id)] = {
+            "user_id": interaction.user.id,
+            "ticket_id": ticket_id,
+            "opened_at": int(time.time())
+        }
+        save_data(all_data)
+
+        embed = discord.Embed(
+            title=f"[TICKET] お問い合わせ #{ticket_id:04d}",
+            description=(
+                f"{interaction.user.mention} さんの問い合わせチャンネルです。\n"
+                f"内容をこちらにご記入ください。対応完了後は下のボタン、または `/ticket close` でクローズできます。"
+            ),
+            color=discord.Color.blurple()
+        )
+        await ticket_channel.send(
+            content=f"{interaction.user.mention}" + (f" {staff_role.mention}" if staff_role else ""),
+            embed=embed,
+            view=TicketCloseView()
+        )
+
+        await interaction.followup.send(f"[OK] チケットを作成しました: {ticket_channel.mention}", ephemeral=True)
+
+
+class TicketPanelView(discord.ui.View):
+    """チケットパネル（作成ボタン付き）。custom_idが固定なのでBot起動時に1回登録すれば全パネルで動作する。"""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.add_item(TicketCreateButton())
+
+
+class TicketCloseButton(discord.ui.Button):
+    """チケットチャンネル内に設置する「クローズ」ボタン。"""
+
+    def __init__(self):
+        super().__init__(
+            label="チケットをクローズ",
+            style=discord.ButtonStyle.danger,
+            emoji="🔒",
+            custom_id="ticket_close_button"
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        await _close_ticket_channel(interaction)
+
+
+class TicketCloseView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.add_item(TicketCloseButton())
+
+
+async def _close_ticket_channel(interaction: discord.Interaction):
+    """チケットチャンネルをクローズ（ログ送信後にチャンネル削除）します。"""
+    guild = interaction.guild
+    channel = interaction.channel
+    if guild is None or channel is None:
+        await interaction.response.send_message("このコマンドはサーバー内でのみ使用できます。", ephemeral=True)
+        return
+
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(guild.id))
+    open_channels = cfg.setdefault("ticket_open_channels", {})
+    info = open_channels.get(str(channel.id))
+
+    if info is None:
+        await interaction.response.send_message("このチャンネルはチケットチャンネルではありません。", ephemeral=True)
+        return
+
+    # 権限確認：チケット作成者本人、またはスタッフロール/管理者/許可ユーザー
+    is_owner_of_ticket = interaction.user.id == info.get("user_id")
+    is_staff = bool(getattr(interaction.user, "guild_permissions", None)) and interaction.user.guild_permissions.manage_channels
+    staff_role_id = cfg.get("ticket_staff_role_id")
+    if staff_role_id and any(r.id == staff_role_id for r in getattr(interaction.user, "roles", [])):
+        is_staff = True
+
+    if not (is_owner_of_ticket or is_staff):
+        await interaction.response.send_message("このチケットをクローズする権限がありません。", ephemeral=True)
+        return
+
+    await interaction.response.send_message("[LOCK] 5秒後にこのチケットをクローズします...")
+
+    # ログチャンネルが設定されていれば記録を送信
+    log_channel_id = cfg.get("ticket_log_channel_id")
+    if log_channel_id:
+        log_channel = guild.get_channel(log_channel_id)
+        if log_channel:
+            ticket_user = guild.get_member(info.get("user_id"))
+            log_embed = discord.Embed(
+                title=f"[TICKET] チケット #{info.get('ticket_id', 0):04d} クローズ",
+                description=(
+                    f"作成者: {ticket_user.mention if ticket_user else info.get('user_id')}\n"
+                    f"クローズ実行者: {interaction.user.mention}\n"
+                    f"チャンネル名: {channel.name}"
+                ),
+                color=discord.Color.red(),
+                timestamp=discord.utils.utcnow()
+            )
+            try:
+                await log_channel.send(embed=log_embed)
+            except discord.HTTPException:
+                pass
+
+    open_channels.pop(str(channel.id), None)
+    save_data(all_data)
+
+    await asyncio.sleep(5)
+    try:
+        await channel.delete(reason=f"チケットクローズ（実行者: {interaction.user}）")
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+
+
+@ticket_group.command(name="setup", description="【管理者専用】このチャンネルに問い合わせチケットパネルを設置します")
+@discord.app_commands.describe(
+    タイトル="パネルに表示するタイトル",
+    説明="パネルに表示する説明文",
+    スタッフロール="チケットチャンネルを閲覧できるスタッフロール",
+    チケット作成先カテゴリ="チケットチャンネルを作成するカテゴリ（未指定の場合はカテゴリなしで作成）",
+    ログチャンネル="クローズ時に記録を送るチャンネル（任意）"
+)
+async def ticket_setup(
+    interaction: discord.Interaction,
+    タイトル: str,
+    説明: str,
+    スタッフロール: discord.Role,
+    チケット作成先カテゴリ: discord.CategoryChannel = None,
+    ログチャンネル: discord.TextChannel = None
+):
+    if not await is_admin_or_allowed(interaction):
+        return
+    if not interaction.guild or not isinstance(interaction.channel, discord.TextChannel):
+        await interaction.response.send_message("このコマンドはサーバーのテキストチャンネルでのみ使用できます。", ephemeral=True)
+        return
+
+    embed = discord.Embed(title=タイトル, description=説明, color=discord.Color.blurple())
+    view = TicketPanelView()
+
+    try:
+        message = await interaction.channel.send(embed=embed, view=view)
+    except discord.Forbidden:
+        await interaction.response.send_message("このチャンネルにメッセージを送信する権限がBotにありません。", ephemeral=True)
+        return
+
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(interaction.guild.id))
+    cfg["ticket_panel_channel_id"] = interaction.channel.id
+    cfg["ticket_panel_message_id"] = message.id
+    cfg["ticket_staff_role_id"] = スタッフロール.id
+    cfg["ticket_category_id"] = チケット作成先カテゴリ.id if チケット作成先カテゴリ else None
+    cfg["ticket_log_channel_id"] = ログチャンネル.id if ログチャンネル else None
+    save_data(all_data)
+
+    await interaction.response.send_message(
+        f"[OK] チケットパネルを設置しました。（スタッフロール: {スタッフロール.mention} / "
+        f"カテゴリ: {チケット作成先カテゴリ.name if チケット作成先カテゴリ else 'なし'} / "
+        f"ログ: {ログチャンネル.mention if ログチャンネル else '未設定'}）",
+        ephemeral=True
+    )
+
+
+@ticket_group.command(name="close", description="現在のチャンネルがチケットの場合、クローズします")
+async def ticket_close(interaction: discord.Interaction):
+    await _close_ticket_channel(interaction)
 
 
 # ====================================================================
