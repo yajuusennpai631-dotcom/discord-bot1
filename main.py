@@ -266,6 +266,8 @@ def get_guild_config(all_data: dict, guild_id_str: str) -> dict:
         ("interview_timeout_seconds", 600),  # 1問あたりの回答制限時間（秒）
         ("interview_next_id", 1),            # 面接記録ID発行用カウンタ
         ("interview_records", {}),           # {record_id_str: {...}}
+        ("interview_panel_channel_id", None),  # 設置済み面接パネルのチャンネルID
+        ("interview_panel_message_id", None),  # 設置済み面接パネルのメッセージID
     ]:
         if key not in cfg:
             cfg[key] = default
@@ -3226,6 +3228,7 @@ async def on_ready():
     bot.add_view(GiveawayJoinView())  # プレゼント参加ボタンの永続化
     bot.add_view(TicketPanelView())  # チケット作成パネルの永続化（custom_idが固定のため全ギルド共通で1回登録すればよい）
     bot.add_view(TicketCloseView())  # チケットクローズボタンの永続化
+    bot.add_view(InterviewPanelView())  # 面接パネル（面接を受けるボタン）の永続化
     all_data = load_data()
 
     for guild_id_str, config in all_data.items():
@@ -4461,6 +4464,7 @@ async def help_command(interaction: discord.Interaction):
                 "`/ticket setup` : このチャンネルに問い合わせチケットパネルを設置します\n"
                 "`/ticket close` : 現在のチケットチャンネルをクローズします\n"
                 "`/interview setup` : 面接システムの実施方式・結果通知先などを設定します\n"
+                "`/interview panel` : このチャンネルに「面接を受ける」ボタン付きパネルを設置します\n"
                 "`/interview question add` / `remove` / `list` : 面接の質問リストを管理します"
             ),
             inline=False
@@ -12924,7 +12928,7 @@ async def _handle_interview_decision(interaction: discord.Interaction, action: s
     結果通知先チャンネル="応募内容をEmbedで送る運営用チャンネル",
     実施方式="DMで実施するか、専用チャンネルを作成して実施するか",
     専用チャンネル作成先カテゴリ="実施方式が「専用チャンネル」の場合のみ使用するカテゴリ（任意）",
-    回答制限時間_秒="1問あたりの回答制限時間（秒）。未指定の場合600秒"
+    回答制限時間_秒="1問あたりの回答制限時間（秒）。0を指定すると無制限になります。未指定の場合600秒"
 )
 @discord.app_commands.choices(実施方式=[
     discord.app_commands.Choice(name="DM", value="dm"),
@@ -12942,8 +12946,8 @@ async def interview_setup(
         return
     if not interaction.guild:
         return
-    if 回答制限時間_秒 < 30:
-        await interaction.response.send_message("回答制限時間は30秒以上で指定してください。", ephemeral=True)
+    if 回答制限時間_秒 != 0 and 回答制限時間_秒 < 30:
+        await interaction.response.send_message("回答制限時間は30秒以上、または無制限にする場合は0を指定してください。", ephemeral=True)
         return
 
     all_data = load_data()
@@ -12955,13 +12959,15 @@ async def interview_setup(
     cfg["interview_timeout_seconds"] = 回答制限時間_秒
     save_data(all_data)
 
+    timeout_text = "無制限" if 回答制限時間_秒 == 0 else f"{回答制限時間_秒}秒"
     await interaction.response.send_message(
         f"[OK] 面接システムを設定しました。\n"
         f"有効: {'はい' if 有効化 else 'いいえ'} / 方式: {実施方式.name} / "
-        f"結果通知先: {結果通知先チャンネル.mention} / 制限時間: {回答制限時間_秒}秒\n"
+        f"結果通知先: {結果通知先チャンネル.mention} / 制限時間: {timeout_text}\n"
         f"質問がまだの場合は `/interview question add` で登録してください。",
         ephemeral=True
     )
+
 
 
 @interview_question_group.command(name="add", description="【管理者専用】面接の質問を末尾に追加します")
@@ -13036,6 +13042,77 @@ async def interview_question_list(interaction: discord.Interaction):
 
 @bot.tree.command(name="面接", description="面接（応募）を開始します。質問に順番に回答してください")
 async def interview_start(interaction: discord.Interaction):
+    await _start_interview(interaction)
+
+
+class InterviewStartButton(discord.ui.Button):
+    """面接パネルに設置する「面接を受ける」ボタン。custom_idが固定なので、
+    Bot起動時に1回登録すれば全ギルドのパネルで動作する。"""
+
+    def __init__(self):
+        super().__init__(
+            label="面接を受ける",
+            style=discord.ButtonStyle.primary,
+            custom_id="interview_start_button"
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        await _start_interview(interaction)
+
+
+class InterviewPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.add_item(InterviewStartButton())
+
+
+@interview_group.command(name="panel", description="【管理者専用】このチャンネルに「面接を受ける」ボタン付きパネルを設置します")
+@discord.app_commands.describe(
+    タイトル="パネルに表示するタイトル（未指定の場合は既定文を使用）",
+    説明="パネルに表示する説明文（未指定の場合は既定文を使用）"
+)
+async def interview_panel(interaction: discord.Interaction, タイトル: str = None, 説明: str = None):
+    if not await is_admin_or_allowed(interaction):
+        return
+    if not interaction.guild or not isinstance(interaction.channel, discord.TextChannel):
+        await interaction.response.send_message("このコマンドはサーバーのテキストチャンネルでのみ使用できます。", ephemeral=True)
+        return
+
+    all_data = load_data()
+    cfg = get_guild_config(all_data, str(interaction.guild.id))
+    if not cfg.get("interview_enabled"):
+        await interaction.response.send_message(
+            "面接機能が有効になっていません。先に `/interview setup` で設定してください。", ephemeral=True
+        )
+        return
+    if not cfg.get("interview_questions"):
+        await interaction.response.send_message(
+            "質問が1つも登録されていません。先に `/interview question add` で登録してください。", ephemeral=True
+        )
+        return
+
+    embed = discord.Embed(
+        title=タイトル or "面接（応募）受付",
+        description=説明 or "下のボタンを押すと面接を開始します。質問に順番にお答えください。",
+        color=discord.Color.blurple()
+    )
+    view = InterviewPanelView()
+
+    try:
+        message = await interaction.channel.send(embed=embed, view=view)
+    except discord.Forbidden:
+        await interaction.response.send_message("このチャンネルにメッセージを送信する権限がBotにありません。", ephemeral=True)
+        return
+
+    cfg["interview_panel_channel_id"] = interaction.channel.id
+    cfg["interview_panel_message_id"] = message.id
+    save_data(all_data)
+
+    await interaction.response.send_message("[OK] 面接パネルを設置しました。", ephemeral=True)
+
+
+async def _start_interview(interaction: discord.Interaction):
+    """面接開始処理の本体。/面接 コマンドと、パネルの「面接を受ける」ボタンの両方から呼び出される。"""
     guild = interaction.guild
     if guild is None:
         await interaction.response.send_message("このコマンドはサーバー内で実行してください。", ephemeral=True)
@@ -13145,7 +13222,8 @@ async def interview_start(interaction: discord.Interaction):
             aborted = True
             break
         try:
-            msg = await bot.wait_for("message", check=check, timeout=timeout_seconds)
+            wait_timeout = timeout_seconds if timeout_seconds and timeout_seconds > 0 else None
+            msg = await bot.wait_for("message", check=check, timeout=wait_timeout)
         except asyncio.TimeoutError:
             try:
                 await target.send("[TIMEOUT] 制限時間内に回答がなかったため、面接を中断しました。")
