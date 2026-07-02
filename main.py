@@ -218,7 +218,8 @@ def get_guild_config(all_data: dict, guild_id_str: str) -> dict:
         # --- Embedビルダー：Modal付きパネル（送信済み分の永続化用） ---
         ("embed_response_panels", {}),  # {panel_id_str: {"button_label": str, "modal_title": str,
                                          #   "title_label": str, "body_label": str,
-                                         #   "response_channel_id": int}}
+                                         #   "response_channel_id": int,
+                                         #   "mention_role_id": int | None}}
         ("embed_response_panel_next_id", 1),
         # --- 経済システム（メッセージ報酬・ロールショップ・自販機） ---
         ("economy_enabled", False),
@@ -8049,8 +8050,12 @@ async def _handle_embed_response_submit(interaction: discord.Interaction, guild_
     )
     result_embed.set_footer(text=f"回答者: {interaction.user}（ID: {interaction.user.id}）")
 
+    mention_role_id = panel.get("mention_role_id")
+    mention_content = f"<@&{mention_role_id}>" if mention_role_id else None
+    allowed_mentions = discord.AllowedMentions(roles=True) if mention_role_id else discord.AllowedMentions.none()
+
     try:
-        await response_channel.send(embed=result_embed)
+        await response_channel.send(content=mention_content, embed=result_embed, allowed_mentions=allowed_mentions)
     except discord.Forbidden:
         await interaction.response.send_message("回答送信先チャンネルへの送信権限がBotにありません。管理者にお問い合わせください。", ephemeral=True)
         return
@@ -8085,6 +8090,7 @@ class EmbedBuilderView(discord.ui.View):
             "modal_title": "回答フォーム",
             "title_field_label": "タイトル",
             "body_field_label": "本文",
+            "mention_role_id": None,  # Modal送信時にメンションするロール（1つのみ、任意）
         }
         self.add_item(EmbedColorSelect(self))
 
@@ -8112,6 +8118,8 @@ class EmbedBuilderView(discord.ui.View):
         embed = self._build_base_embed()
         if self.modal_config.get("enabled") and self.modal_config.get("response_channel_id"):
             mc = self.modal_config
+            mention_role_id = mc.get("mention_role_id")
+            mention_line = f"\nメンションロール: <@&{mention_role_id}>" if mention_role_id else ""
             embed.add_field(
                 name="[Modal設定：この項目は実際の送信時には含まれません]",
                 value=(
@@ -8119,6 +8127,7 @@ class EmbedBuilderView(discord.ui.View):
                     f"Modalタイトル: {mc['modal_title']}\n"
                     f"入力欄: 「{mc['title_field_label']}」「{mc['body_field_label']}」\n"
                     f"回答送信先: <#{mc['response_channel_id']}>"
+                    f"{mention_line}"
                 ),
                 inline=False
             )
@@ -8170,7 +8179,7 @@ class EmbedBuilderView(discord.ui.View):
         await interaction.response.edit_message(embed=self.build_preview(), view=self)
         await interaction.followup.send(f"フィールド「{removed['name']}」を削除しました。", ephemeral=True)
 
-    @discord.ui.button(label="[Modal] 回答フォームを設定", style=discord.ButtonStyle.secondary, row=0)
+    @discord.ui.button(label="[Modal] 回答フォームを設定", style=discord.ButtonStyle.secondary, row=4)
     async def configure_modal(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id != self.author.id:
             await interaction.response.send_message("このパネルはあなた専用です。", ephemeral=True)
@@ -8203,13 +8212,31 @@ class EmbedBuilderView(discord.ui.View):
             self.modal_config["enabled"] = False
         await interaction.response.edit_message(embed=self.build_preview(), view=self)
 
-    @discord.ui.button(label="[Modal] 回答フォームを解除", style=discord.ButtonStyle.secondary, row=3)
+    @discord.ui.select(
+        placeholder="メンションするロール（Modal送信時に通知する場合に選択）",
+        cls=discord.ui.RoleSelect,
+        row=3,
+        min_values=0,
+        max_values=1
+    )
+    async def select_mention_role(self, interaction: discord.Interaction, select: discord.ui.RoleSelect):
+        if interaction.user.id != self.author.id:
+            await interaction.response.send_message("このパネルはあなた専用です。", ephemeral=True)
+            return
+        if select.values:
+            self.modal_config["mention_role_id"] = select.values[0].id
+        else:
+            self.modal_config["mention_role_id"] = None
+        await interaction.response.edit_message(embed=self.build_preview(), view=self)
+
+    @discord.ui.button(label="[Modal] 回答フォームを解除", style=discord.ButtonStyle.secondary, row=4)
     async def disable_modal(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id != self.author.id:
             await interaction.response.send_message("このパネルはあなた専用です。", ephemeral=True)
             return
         self.modal_config["enabled"] = False
         self.modal_config["response_channel_id"] = None
+        self.modal_config["mention_role_id"] = None
         await interaction.response.edit_message(embed=self.build_preview(), view=self)
 
     @discord.ui.button(label="[OK] このチャンネルに送信", style=discord.ButtonStyle.success, row=4)
@@ -8234,6 +8261,7 @@ class EmbedBuilderView(discord.ui.View):
                 "title_field_label": self.modal_config["title_field_label"],
                 "body_field_label": self.modal_config["body_field_label"],
                 "response_channel_id": self.modal_config["response_channel_id"],
+                "mention_role_id": self.modal_config.get("mention_role_id"),
             }
             save_data(all_data)
             response_view = EmbedResponsePanelView(interaction.guild.id, panel_id, self.modal_config["button_label"])
