@@ -8006,11 +8006,22 @@ class EmbedResponseSubmitModal(discord.ui.Modal):
         def _check(m: discord.Message) -> bool:
             return m.author.id == interaction.user.id and m.channel.id == interaction.channel.id
 
-        attachment = None
+        file_to_send = None
+        is_image = False
         try:
             msg = await bot.wait_for("message", timeout=60.0, check=_check)
             if msg.attachments:
                 attachment = msg.attachments[0]
+                # メッセージを削除する前に、その場でファイルの中身をダウンロードして
+                # メモリ（BytesIO）に確保しておく。添付ファイルはメッセージに紐づいた
+                # CDN URLのため、msg.delete()後にattachment.to_file()を呼ぶと
+                # ダウンロードに失敗する（＝画像が空になる）ことがあるため。
+                try:
+                    file_bytes = await attachment.read()
+                    file_to_send = discord.File(io.BytesIO(file_bytes), filename=attachment.filename)
+                    is_image = bool(attachment.content_type and attachment.content_type.startswith("image/"))
+                except (discord.HTTPException, discord.NotFound):
+                    file_to_send = None
             try:
                 await msg.delete()
             except (discord.Forbidden, discord.HTTPException):
@@ -8024,7 +8035,7 @@ class EmbedResponseSubmitModal(discord.ui.Modal):
         await _handle_embed_response_submit(
             interaction, self.guild_id, self.panel_id,
             self.title_input.value, self.body_input.value,
-            attachment=attachment, use_followup=True
+            file_to_send=file_to_send, is_image=is_image, use_followup=True
         )
 
 
@@ -8073,11 +8084,13 @@ async def _handle_embed_response_submit(
     panel_id: int,
     title_value: str,
     body_value: str,
-    attachment: discord.Attachment = None,
+    file_to_send: discord.File = None,
+    is_image: bool = False,
     use_followup: bool = False,
 ):
     """回答Modal送信時の処理。回答送信先チャンネルへEmbed形式で内容を送信する。
-    attachment が指定されている場合は、回答Embedにファイルを添付して送信する。
+    file_to_send が指定されている場合は、回答Embedにファイルを添付して送信する。
+    （呼び出し側で元メッセージ削除前にダウンロード済みのファイルを渡す想定）
     use_followup=True の場合、既にinteractionへ応答済み（ファイル添付待ちの案内を送信済み）
     のため、以降のメッセージは interaction.followup 経由で送る。"""
 
@@ -8118,15 +8131,10 @@ async def _handle_embed_response_submit(
     mention_content = f"<@&{mention_role_id}>" if mention_role_id else None
     allowed_mentions = discord.AllowedMentions(roles=True) if mention_role_id else discord.AllowedMentions.none()
 
-    # 添付ファイルがある場合はDiscord添付として引き継ぎ、画像であればEmbedにも表示する
-    file_to_send = None
-    if attachment is not None:
-        try:
-            file_to_send = await attachment.to_file()
-        except discord.HTTPException:
-            file_to_send = None
-        if file_to_send is not None and attachment.content_type and attachment.content_type.startswith("image/"):
-            result_embed.set_image(url=f"attachment://{attachment.filename}")
+    # 添付ファイルは呼び出し側で（元メッセージ削除前に）ダウンロード済みのものを受け取る。
+    # 画像であればEmbedにも表示する。
+    if file_to_send is not None and is_image:
+        result_embed.set_image(url=f"attachment://{file_to_send.filename}")
 
     try:
         if file_to_send is not None:
